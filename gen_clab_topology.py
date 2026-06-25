@@ -65,6 +65,10 @@ def main():
     ap.add_argument("--name", default="clos-fabric", help="lab name")
     ap.add_argument("--plan", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "address_plan.json"))
     ap.add_argument("--out", default="fabric", help="output filename prefix for vars/map")
+    ap.add_argument("--mgmt-subnet", default=None,
+                    help="override the management subnet from the address plan (e.g. "
+                         "172.30.0.0/22) to avoid colliding with other containerlab labs "
+                         "already using the planned subnet")
     ap.add_argument("--max-leaf-ports", type=int, default=128)
     ap.add_argument("--mrc-nic", action="store_true",
                     help="emit a per-GPU MRC virtual-NIC profile.json (full EV-set of uSID "
@@ -105,6 +109,8 @@ def main():
             ap.error("--gpus must be >= 0")
     with open(a.plan) as f:
         plan = json.load(f)
+    if a.mgmt_subnet:
+        plan.setdefault("mgmt", {})["subnet"] = a.mgmt_subnet
 
     HP, RID = plan["hostname_prefixes"], plan["role_ids"]
     lp, pp, gp_, sv, mg = plan["loopback"], plan["p2p"], plan["gpu"], plan["srv6"], plan["mgmt"]

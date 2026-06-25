@@ -60,6 +60,7 @@
           --leaves {{ leaves }} --spines {{ spines }} --planes {{ planes }}
           --name {{ fabric_name }} --plan {{ proj }}/address_plan.json --out {{ proj }}/fabric
           --frr-linux --seg6 {{ seg6_mode | default("frr") }}
+          {{ ('--mgmt-subnet ' ~ mgmt_subnet) if (mgmt_subnet is defined) else '' }}
           {{ '--mrc-nic' if (mrc_nic | default(false) | bool) else '' }}
           {{ '--spec-mode' if (spec_mode | default(false) | bool) else '' }}
         chdir: "{{ proj }}"

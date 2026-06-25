@@ -244,9 +244,15 @@ prio-50 localsid rule, the `End.DT6` route in table 100, and the
 `fcbb:bb00::/32` carrier-block route. The NIC installs all three; if one is
 missing, `doctor` shows which.
 
-**containerlab: "Subnet ... already in use".**
-Another lab is using the default management subnet. Destroy the other lab, or set
-a different mgmt subnet in the generated `srv6lab.clab.yml`.
+**containerlab: "Subnet ... already in use" / "overlap an existing Docker network".**
+Another containerlab lab is holding a subnet inside the fabric's `172.20.20.0/22`
+management range. Either remove the other lab's network
+(`docker network rm <name>`), or deploy the fabric on a different mgmt subnet:
+
+```bash
+ansible-playbook site-frr.yml -e gpus_per_leaf=2 -e leaves=2 -e spines=2 \
+  -e mgmt_subnet=172.30.0.0/22
+```
 
 **A `spec_mode=true` deploy is slow to come up.**
 Expected on first boot — `debian:bookworm` GPU hosts install iproute2/python3 on
