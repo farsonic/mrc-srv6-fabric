@@ -19,7 +19,7 @@ do_deploy: true          # containerlab deploy (needs sudo: run with -K if promp
 # (leaf/spine/gpu), piped to your local Wireshark via the cshargextcap plugin.
 # It's a host service that introspects all container namespaces — not part of the
 # .clab.yml topology. Toggle on/off independently of the lab.
-do_edgeshark: true        # bring Edgeshark up with the lab (and down on -e do_edgeshark=false + destroy)
+do_edgeshark: false       # optional Edgeshark capture UI; enable with -e do_edgeshark=true (needs docker compose v2)
 edgeshark_port: 5001      # web UI port on this host
 
 # ===== device config knobs =====

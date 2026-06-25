@@ -178,17 +178,41 @@
         - do_edgeshark | bool
         - (edgeshark_port | int) != 5001
 
-    - name: Edgeshark — bring up (docker compose)
+    - name: Edgeshark — detect docker compose flavour (v2 plugin vs classic binary)
+      ansible.builtin.shell: >
+        if docker compose version >/dev/null 2>&1; then echo "docker compose";
+        elif command -v docker-compose >/dev/null 2>&1; then echo "docker-compose";
+        else echo "none"; fi
+      register: es_compose
+      changed_when: false
+      when: do_edgeshark | bool
+
+    - name: Edgeshark — bring up (uses whichever compose is available)
       ansible.builtin.command:
-        cmd: "docker compose -f {{ es_run }} -p edgeshark up -d"
+        cmd: "{{ es_compose.stdout }} -f {{ es_run }} -p edgeshark up -d"
       become: true
       register: es_up
       changed_when: true
-      when: do_edgeshark | bool
+      failed_when: false
+      when:
+        - do_edgeshark | bool
+        - es_compose.stdout != "none"
+
+    - name: Edgeshark — note if no compose is installed (non-fatal)
+      ansible.builtin.debug:
+        msg: >
+          Edgeshark was requested but neither 'docker compose' (v2 plugin) nor
+          'docker-compose' is installed. Skipping the capture UI; the fabric is
+          unaffected. Install with: sudo apt-get install -y docker-compose-plugin
+      when:
+        - do_edgeshark | bool
+        - es_compose.stdout == "none"
 
     - name: Edgeshark — tear down when disabled (-e do_edgeshark=false)
-      ansible.builtin.command:
-        cmd: "docker compose -p edgeshark down"
+      ansible.builtin.shell: >
+        if docker compose version >/dev/null 2>&1; then docker compose -p edgeshark down;
+        elif command -v docker-compose >/dev/null 2>&1; then docker-compose -p edgeshark down;
+        fi
       become: true
       failed_when: false
       changed_when: true
@@ -201,4 +225,6 @@
           - "Capture any interface on any node (leaf/spine/gpu), pipe to local Wireshark."
           - "One-time on your laptop: install the cshargextcap plugin + packetflix:// handler"
           - "  (see https://containerlab.dev/manual/wireshark/#edgeshark-integration)."
-      when: do_edgeshark | bool
+      when:
+        - do_edgeshark | bool
+        - es_compose.stdout | default("none") != "none"
