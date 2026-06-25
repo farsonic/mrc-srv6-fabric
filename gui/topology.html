@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MRC SRv6 Fabric — Topology</title>
+<style>
+  :root{
+    --bg:#0b1016; --panel:#111a24; --ink:#dce6f0; --dim:#7c8ea0;
+    --rule:#22303d; --spine:#f0a830; --leaf:#3fb6d3; --gpu:#8a7cf0;
+    --link:#33485a; --link-hot:#5fd0a0; --accent:#1f6fb2;
+    --p1:#1d3b5c; --p2:#3a2456; --p3:#0f4d3a; --p4:#5c2030;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:
+      radial-gradient(1200px 600px at 70% -10%, #13202c 0%, transparent 60%),
+      var(--bg);
+    color:var(--ink);
+    font:14px/1.45 ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    -webkit-font-smoothing:antialiased;
+  }
+  header{
+    display:flex;align-items:baseline;gap:16px;
+    padding:16px 22px;border-bottom:1px solid var(--rule);
+    background:linear-gradient(180deg,#0e151d,#0b1016);
+    position:sticky;top:0;z-index:5;
+  }
+  header h1{font-size:15px;letter-spacing:.14em;text-transform:uppercase;margin:0;font-weight:600}
+  header h1 b{color:var(--spine)}
+  header .sub{color:var(--dim);font-size:12px;letter-spacing:.04em}
+  header .spacer{flex:1}
+  .stat{color:var(--dim);font-size:12px}
+  .stat b{color:var(--ink);font-weight:600}
+  .wrap{display:flex;height:calc(100vh - 53px)}
+  .stage{flex:1;overflow:auto;padding:26px}
+  svg{display:block;margin:0 auto}
+  /* nodes */
+  .node rect,.node circle{stroke-width:1.5}
+  .node text{font-size:11px;fill:var(--ink);text-anchor:middle;dominant-baseline:central;pointer-events:none}
+  .node .sub{font-size:8.5px;fill:var(--dim)}
+  .node{cursor:pointer}
+  .node:hover rect,.node:hover circle{stroke:#fff}
+  .spine rect{fill:#241a0c;stroke:var(--spine)}
+  .leaf  rect{fill:#0c2630;stroke:var(--leaf)}
+  .gpu   rect{fill:#1a1630;stroke:var(--gpu)}
+  .planeband{fill-opacity:.32;stroke-opacity:.5;stroke-width:1}
+  .planelabel{fill:var(--dim);font-size:11px;letter-spacing:.18em;text-transform:uppercase}
+  .edge{stroke:var(--link);stroke-width:1.4;fill:none}
+  .edge.gpu{stroke:var(--gpu);stroke-opacity:.45}
+  .edge.hot{stroke:var(--link-hot);stroke-width:2.4}
+  .dim{opacity:.12;transition:opacity .15s}
+  .node,.edge{transition:opacity .15s}
+  /* side panel */
+  aside{
+    width:320px;border-left:1px solid var(--rule);background:var(--panel);
+    padding:18px 18px 28px;overflow:auto
+  }
+  aside h2{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin:0 0 12px}
+  .empty{color:var(--dim);font-size:12px;line-height:1.7}
+  .card{border:1px solid var(--rule);border-radius:7px;padding:13px 14px;margin-bottom:12px;background:#0d141c}
+  .card .name{font-size:15px;font-weight:600;margin-bottom:2px}
+  .pill{display:inline-block;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+        padding:2px 8px;border-radius:20px;margin-top:4px}
+  .pill.spine{background:#241a0c;color:var(--spine);border:1px solid var(--spine)}
+  .pill.leaf{background:#0c2630;color:var(--leaf);border:1px solid var(--leaf)}
+  .pill.gpu{background:#1a1630;color:var(--gpu);border:1px solid var(--gpu)}
+  .kv{display:grid;grid-template-columns:88px 1fr;gap:4px 10px;margin-top:11px;font-size:12px}
+  .kv .k{color:var(--dim)}
+  .kv .v{color:var(--ink);word-break:break-all}
+  .links-list{margin-top:6px;font-size:11.5px;color:var(--dim)}
+  .links-list div{padding:3px 0;border-top:1px solid var(--rule)}
+  .links-list b{color:var(--ink);font-weight:600}
+  .legend{display:flex;gap:16px;align-items:center;margin-top:14px;font-size:11px;color:var(--dim)}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+  .controls{display:flex;gap:8px;align-items:center}
+  .controls button{
+    background:#16212c;color:var(--ink);border:1px solid var(--rule);
+    border-radius:6px;padding:5px 11px;font:inherit;font-size:12px;cursor:pointer
+  }
+  .controls button:hover{border-color:var(--accent)}
+  .filedrop{color:var(--dim);font-size:11px}
+  .filedrop input{display:none}
+  .filedrop label{color:var(--leaf);cursor:pointer;text-decoration:underline}
+  .err{color:#ff8e8e;font-size:12px;padding:20px}
+</style>
+</head>
+<body>
+<header>
+  <h1>MRC <b>SRv6</b> Fabric</h1>
+  <span class="sub" id="fabricName">loading…</span>
+  <div class="spacer"></div>
+  <span class="stat" id="counts"></span>
+  <div class="controls">
+    <span class="filedrop">data:
+      <label for="file">load fabric_vars.json</label>
+      <input type="file" id="file" accept=".json">
+    </span>
+    <button id="fit">Fit</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="stage" id="stage">
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+  </div>
+  <aside>
+    <h2>Inspector</h2>
+    <div id="panel" class="empty">
+      Hover a node to highlight its links.<br>Click to pin its details here.
+      <div class="legend">
+        <span><i style="background:#f0a830"></i>spine</span>
+        <span><i style="background:#3fb6d3"></i>leaf</span>
+        <span><i style="background:#8a7cf0"></i>gpu</span>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script>
+const SVGNS="http://www.w3.org/2000/svg";
+let DATA=null, NODES={}, byName={};
+
+// ---------- data loading ----------
+async function boot(){
+  // try to fetch fabric_vars.json sitting next to this file (or one dir up)
+  for(const url of ["fabric_vars.json","../fabric_vars.json"]){
+    try{
+      const r=await fetch(url,{cache:"no-store"});
+      if(r.ok){ render(await r.json()); return; }
+    }catch(e){/* fetch blocked on file:// — fall through to picker */}
+  }
+  document.getElementById("fabricName").textContent="no fabric_vars.json found";
+  document.getElementById("panel").innerHTML=
+    '<div class="empty">Could not auto-load <b>fabric_vars.json</b>.<br><br>'+
+    'If you opened this file directly (file://), the browser blocks local fetch. '+
+    'Use the <b>load fabric_vars.json</b> link in the header, or serve the folder '+
+    '(<code>python3 -m http.server</code>) and reload.</div>';
+}
+document.getElementById("file").addEventListener("change",ev=>{
+  const f=ev.target.files[0]; if(!f) return;
+  const rd=new FileReader();
+  rd.onload=()=>{ try{ render(JSON.parse(rd.result)); }
+    catch(e){ document.getElementById("panel").innerHTML='<div class="err">Bad JSON: '+e.message+'</div>'; } };
+  rd.readAsText(f);
+});
+
+// ---------- layout + render ----------
+const NODE_W=92, NODE_H=34, GPU_R=20;
+const COL_GAP=34, PLANE_GAP=46, ROW_GAP=70, PAD=40;
+
+function render(data){
+  DATA=data; byName={};
+  const svg=document.getElementById("svg");
+  svg.innerHTML="";
+  document.getElementById("fabricName").textContent=data.name||"fabric";
+
+  const nodes=data.nodes||{};
+  const planes={};   // plane -> {spine:[],leaf:[]}
+  const gpus=[];
+  for(const [name,nd] of Object.entries(nodes)){
+    nd._name=name;
+    if(nd.role==="gpu"){ gpus.push(nd); continue; }
+    const p=nd.plane||1;
+    (planes[p]=planes[p]||{spine:[],leaf:[]})[nd.role].push(nd);
+  }
+  const planeIds=Object.keys(planes).map(Number).sort((a,b)=>a-b);
+  // sort within rows by index
+  const byIndex=(a,b)=>(a.index||0)-(b.index||0);
+  planeIds.forEach(p=>{planes[p].spine.sort(byIndex);planes[p].leaf.sort(byIndex);});
+  gpus.sort(byIndex);
+
+  // width is driven by the widest plane row (spines or leaves), and by gpus
+  const widest=Math.max(
+    1,
+    ...planeIds.map(p=>Math.max(planes[p].spine.length,planes[p].leaf.length)),
+    gpus.length
+  );
+  const planeW=widest*NODE_W+(widest-1)*COL_GAP;
+  const totalW=planeW*planeIds.length+PLANE_GAP*(planeIds.length-1)+PAD*2;
+
+  // vertical: each plane has spine row + leaf row; gpus sit in a shared row below all planes
+  const planeRowsH=2*NODE_H+ROW_GAP;           // spine row, gap, leaf row
+  const planeBandTop=PAD+24;                    // leave room for plane label
+  const gpuRowY=planeBandTop+planeRowsH+ROW_GAP+30;
+  const totalH=gpuRowY+GPU_R*2+PAD;
+
+  svg.setAttribute("viewBox",`0 0 ${totalW} ${totalH}`);
+  svg.setAttribute("width",totalW); svg.setAttribute("height",totalH);
+
+  const planeColors=["var(--p1)","var(--p2)","var(--p3)","var(--p4)"];
+  const pos={}; // name -> {x,y,r?}
+
+  // place plane bands + nodes
+  planeIds.forEach((p,pi)=>{
+    const ox=PAD+pi*(planeW+PLANE_GAP);
+    // band
+    const band=el("rect",{x:ox-14,y:planeBandTop-22,width:planeW+28,
+      height:planeRowsH+34,rx:12,class:"planeband",
+      fill:planeColors[pi%4],stroke:planeColors[pi%4]});
+    svg.appendChild(band);
+    svg.appendChild(el("text",{x:ox+planeW/2,y:planeBandTop-30,
+      "text-anchor":"middle",class:"planelabel"},`plane ${p}`));
+
+    const spineY=planeBandTop+NODE_H/2;
+    const leafY=planeBandTop+NODE_H+ROW_GAP+NODE_H/2;
+    rowPlace(planes[p].spine,ox,planeW,spineY,pos);
+    rowPlace(planes[p].leaf, ox,planeW,leafY, pos);
+  });
+  // gpus shared row, centered across whole canvas
+  rowPlace(gpus,PAD,totalW-2*PAD,gpuRowY+GPU_R,pos,true);
+
+  // edges first (under nodes)
+  const edgeLayer=el("g",{}); svg.appendChild(edgeLayer);
+  const edges=[];
+  (data.links||[]).forEach(l=>{
+    const a=l.a.split(":")[0], b=l.b.split(":")[0];
+    if(!pos[a]||!pos[b]) return;
+    const isGpu=(nodes[a]&&nodes[a].role==="gpu")||(nodes[b]&&nodes[b].role==="gpu");
+    const path=el("path",{class:"edge"+(isGpu?" gpu":""),
+      d:curve(pos[a],pos[b])});
+    path.dataset.a=a; path.dataset.b=b;
+    edgeLayer.appendChild(path);
+    edges.push({a,b,el:path});
+  });
+
+  // nodes
+  const nodeLayer=el("g",{}); svg.appendChild(nodeLayer);
+  for(const [name,nd] of Object.entries(nodes)){
+    const p=pos[name]; if(!p) continue;
+    const g=el("g",{class:"node "+nd.role}); g.dataset.name=name;
+    if(nd.role==="gpu"){
+      g.appendChild(el("rect",{x:p.x-GPU_R,y:p.y-GPU_R,width:GPU_R*2,height:GPU_R*2,rx:10}));
+      g.appendChild(el("text",{x:p.x,y:p.y},shortName(name)));
+    }else{
+      g.appendChild(el("rect",{x:p.x-NODE_W/2,y:p.y-NODE_H/2,width:NODE_W,height:NODE_H,rx:7}));
+      g.appendChild(el("text",{x:p.x,y:p.y-3},shortName(name)));
+      if(nd.loopback)
+        g.appendChild(el("text",{x:p.x,y:p.y+9,class:"sub"},loStr(nd.loopback)));
+    }
+    g.addEventListener("mouseenter",()=>highlight(name,edges));
+    g.addEventListener("mouseleave",()=>{ if(!pinned) clearHi(edges); });
+    g.addEventListener("click",()=>{ pinned=name; showInfo(name,nodes); highlight(name,edges); });
+    nodeLayer.appendChild(g);
+    byName[name]=g;
+  }
+
+  // counts
+  const ns=Object.values(nodes);
+  document.getElementById("counts").innerHTML=
+    `<b>${planeIds.length}</b> plane${planeIds.length>1?"s":""} · `+
+    `<b>${ns.filter(n=>n.role==="spine").length}</b> spine · `+
+    `<b>${ns.filter(n=>n.role==="leaf").length}</b> leaf · `+
+    `<b>${gpus.length}</b> gpu · <b>${(data.links||[]).length}</b> links`;
+
+  window._fit=()=>fit(svg);
+  fit(svg);
+}
+
+let pinned=null;
+
+function rowPlace(arr,ox,width,y,pos,isGpu){
+  const n=arr.length; if(!n) return;
+  const unit=isGpu?GPU_R*2:NODE_W;
+  const gap=isGpu?Math.max(COL_GAP,(width-n*unit)/(n+1)):COL_GAP;
+  const rowW=n*unit+(n-1)*gap;
+  let x=ox+(width-rowW)/2+unit/2;
+  arr.forEach(nd=>{ pos[nd._name]={x,y}; x+=unit+gap; });
+}
+
+function curve(a,b){
+  const my=(a.y+b.y)/2;
+  return `M${a.x},${a.y} C${a.x},${my} ${b.x},${my} ${b.x},${b.y}`;
+}
+
+function highlight(name,edges){
+  const touch=new Set([name]);
+  edges.forEach(e=>{ if(e.a===name||e.b===name){touch.add(e.a);touch.add(e.b);} });
+  edges.forEach(e=>{
+    const on=e.a===name||e.b===name;
+    e.el.classList.toggle("hot",on);
+    e.el.classList.toggle("dim",!on);
+  });
+  Object.entries(byName).forEach(([n,g])=>g.classList.toggle("dim",!touch.has(n)));
+}
+function clearHi(edges){
+  pinned=null;
+  edges.forEach(e=>{e.el.classList.remove("hot","dim");});
+  Object.values(byName).forEach(g=>g.classList.remove("dim"));
+  document.getElementById("panel").className="empty";
+  document.getElementById("panel").innerHTML=
+    'Hover a node to highlight its links.<br>Click to pin its details here.';
+}
+
+function showInfo(name,nodes){
+  const nd=nodes[name]; if(!nd) return;
+  const links=(DATA.links||[]).filter(l=>l.a.split(":")[0]===name||l.b.split(":")[0]===name)
+    .map(l=>{
+      const me=l.a.split(":")[0]===name?l:{a:l.b,b:l.a};
+      const myIf=me.a.split(":")[1]||"", peer=me.b.split(":")[0], peerIf=me.b.split(":")[1]||"";
+      return `<div><b>${myIf}</b> → ${peer} <span style="color:var(--dim)">${peerIf}</span></div>`;
+    }).join("");
+  const kv=[];
+  kv.push(["role",nd.role]);
+  if(nd.plane) kv.push(["plane",nd.plane]);
+  if(nd.index!=null) kv.push(["index",nd.index]);
+  if(nd.mgmt) kv.push(["mgmt",nd.mgmt]);
+  if(nd.loopback) kv.push(["loopback",nd.loopback]);
+  if(nd.srv6&&nd.srv6.locator) kv.push(["locator",nd.srv6.locator]);
+  if(nd.kind) kv.push(["kind",nd.kind]);
+  const p=document.getElementById("panel"); p.className="";
+  p.innerHTML=
+    `<div class="card">
+       <div class="name">${name}</div>
+       <span class="pill ${nd.role}">${nd.role}</span>
+       <div class="kv">${kv.map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join("")}</div>
+     </div>
+     <h2>Links (${links?(DATA.links||[]).filter(l=>l.a.split(":")[0]===name||l.b.split(":")[0]===name).length:0})</h2>
+     <div class="links-list">${links||'<div style="color:var(--dim)">none</div>'}</div>`;
+}
+
+// ---------- helpers ----------
+function el(tag,attrs,text){
+  const e=document.createElementNS(SVGNS,tag);
+  for(const k in attrs) e.setAttribute(k,attrs[k]);
+  if(text!=null) e.textContent=text;
+  return e;
+}
+function shortName(n){ return n.replace(/-p\d+$/,""); }
+function loStr(lo){ return lo.replace(/::1$/,"::").replace(/^fd00:/,""); }
+function fit(svg){
+  const stage=document.getElementById("stage");
+  const vb=svg.viewBox.baseVal;
+  const sx=(stage.clientWidth-40)/vb.width, sy=(stage.clientHeight-40)/vb.height;
+  const s=Math.min(1,sx,sy);
+  svg.setAttribute("width",vb.width*s);
+  svg.setAttribute("height",vb.height*s);
+}
+document.getElementById("fit").addEventListener("click",()=>window._fit&&window._fit());
+window.addEventListener("resize",()=>window._fit&&window._fit());
+boot();
+</script>
+</body>
+</html>
