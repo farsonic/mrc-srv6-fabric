@@ -1,0 +1,47 @@
+---
+# Configure the SONiC switch through FRR (vtysh runs directly in the node on this
+# FRR 10.5 build). Base config and SRv6 static-sids are applied separately so a
+# SID issue can't wedge the base. NOTE: vtysh wraps piped input at the terminal
+# width and silently truncates long lines, so we widen COLUMNS before piping.
+
+- name: Render base FRR config (lo, interfaces, static routes, SRv6 locator)
+  ansible.builtin.template:
+    src: frr_base.conf.j2
+    dest: /tmp/frr_base.conf
+    mode: "0644"
+
+- name: Apply base FRR config
+  ansible.builtin.shell: >
+    export COLUMNS=512;
+    { echo 'configure terminal'; cat /tmp/frr_base.conf; echo 'end';
+      echo 'write memory'; } | vtysh
+  changed_when: true
+
+- name: Render SRv6 static-sids
+  ansible.builtin.template:
+    src: frr_sids.conf.j2
+    dest: /tmp/frr_sids.conf
+    mode: "0644"
+  when: configure_srv6_sids | default(true) | bool
+
+- name: Apply SRv6 static-sids (wide COLUMNS so long uA lines aren't truncated)
+  ansible.builtin.shell: >
+    export COLUMNS=512;
+    { echo 'configure terminal'; cat /tmp/frr_sids.conf; echo 'end';
+      echo 'write memory'; } | vtysh 2>&1
+  register: sid_apply
+  changed_when: true
+  failed_when: false
+  when: configure_srv6_sids | default(true) | bool
+
+- name: Verify routes + SRv6 SIDs
+  ansible.builtin.shell: |
+    export COLUMNS=512
+    echo '=== ipv6 route static ==='; vtysh -c 'show ipv6 route static' | head -25
+    echo '=== srv6 sids ==='; vtysh -c 'show segment-routing srv6 sid' 2>/dev/null || true
+  register: frr_verify
+  changed_when: false
+
+- name: Show verification
+  ansible.builtin.debug:
+    var: frr_verify.stdout_lines

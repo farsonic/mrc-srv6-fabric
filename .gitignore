@@ -1,0 +1,15 @@
+# generated artifacts
+*.clab.yml
+fabric_vars.json
+fabric_address_map.txt
+clab-*/
+.clab/
+mrc-nic/          # generated per-deploy profile dir (the binary lives in nic/)
+__pycache__/
+*.pyc
+*.tgz
+# editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/

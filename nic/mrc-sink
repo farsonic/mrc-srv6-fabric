@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""
+mrc-sink — UDP receiver paired with mrc-probe.
+
+Decodes the 28-byte header on each packet, groups by EV, and tracks per-EV:
+  - packets / bytes received
+  - losses (declared via a reorder-tolerant scoreboard, not raw seq gaps)
+  - out-of-order arrivals (arrival-order regressions)
+  - recovered  (a declared-lost seq that later arrived — ARQ worked)
+  - dup        (an already-delivered seq that arrived again — redundant retx;
+                this is the receiver-side fingerprint of Go-Back-N waste)
+  - latency: rolling avg, p50, p95 over the recent window
+
+ARQ / NAK channel
+-----------------
+When the scoreboard declares a sequence lost (missing for longer than the
+reorder window), the sink emits a NAK packet back to the sender on the NAK
+port (default 5210). mrc-probe listens there and retransmits — Go-Back-N in
+`none` mode, selective in the MRC modes. NAKs are rate-capped per EV so a
+burst of loss can't turn into a NAK storm.
+
+Reorder tolerance is what makes this correct under STACK-style high-entropy
+spraying: a single logical flow sprayed across many paths arrives heavily
+reordered but NOT lost, so we must wait `--reorder-window-ms` before calling
+a gap a loss. Without that, every reordered packet would look like a NAK.
+
+Writes a JSON snapshot to /run/mrc-sink.json every 1s for the agent to pick up.
+Also serves the same JSON over HTTP on :9811 for ad-hoc inspection.
+"""
+import argparse, json, os, socket, struct, sys, threading, time
+import http.server
+from collections import deque
+
+# Data packet header (from mrc-probe): magic|nonce|ev_id|flow_idx|seq|send_ns
+HDR_FMT  = ">4sIHHQQ"
+HDR_SIZE = struct.calcsize(HDR_FMT)
+MAGIC    = b"MRC1"
+MAGIC_LEGACY = b"MRCp"            # discarded — different seq space
+
+# NAK packet (sink -> probe): magic|nonce|ev_id|flow_idx|expected_seq|received_seq
+# Intentionally the same 28-byte shape as the data header.
+NAK_FMT   = ">4sIHHQQ"
+NAK_SIZE  = struct.calcsize(NAK_FMT)
+NAK_MAGIC = b"NAK1"
+
+# ACK packet (sink -> probe), shares the NAK channel/port. Carries the cumulative
+# in-order seq, the echoed send_ns of the triggering packet (for the RTT sample),
+# a CE-marked flag (ECN congestion seen since the last ACK), and the cumulative
+# received-byte count (the NSCC ack-clock, cf. spec 8.3.1/8.4). This is the
+# feedback the requestor's congestion window is driven by.
+ACK_FMT   = ">4sIHHQQBxxxQ"   # magic|nonce|ev|flow|cum_seq|echo_ns|ce|pad3|rcvd_bytes
+ACK_SIZE  = struct.calcsize(ACK_FMT)
+ACK_MAGIC = b"ACK1"
+
+STATE_PATH_DEFAULT = "/run/mrc-sink.json"
+HTTP_PORT_DEFAULT  = 9811
+NAK_PORT_DEFAULT   = 5210
+
+# Scoreboard safety bounds.
+GAP_FILL_CAP   = 65536      # max gap we'll enumerate in one jump (desync guard)
+MISSING_MAX    = 200000     # hard cap on tracked missing seqs per EV
+MISSING_MAX_AGE = 5.0       # seconds; a missing seq older than this ages out (lost-unrecovered)
+
+# ---------------------------------------------------------------------------
+class EVStats:
+    """Reorder-tolerant per-EV scoreboard.
+
+    Sender stamps a monotonically increasing seq per (ev_id, session_nonce).
+    The receiver maintains an in-order frontier `cum` (every seq <= cum has
+    been seen), a small reorder buffer `seen_above` of arrived seqs beyond the
+    frontier, and a `missing` table of gaps with the time each was first
+    noticed. A gap older than `reorder_window` is declared lost (→ NAK).
+    """
+    __slots__ = ("ev","nonce","pkts","bytes","naks","ooo","recovered","dup",
+                 "lost","resets","cum","hi_seq","seen_above","missing",
+                 "prev_arrival_seq","lat_window","first_ts","last_rx_ts",
+                 "last_src","src_ports","nak_tokens","nak_tok_ts","base_seq",
+                 "ce","ce_since_ack","last_send_ns","last_ack_mono")
+
+    def __init__(self, ev, nonce=0):
+        self.ev = ev
+        self.nonce = nonce
+        self.resets = 0
+        self.lat_window = deque(maxlen=4096)
+        self._reset_counters()
+        self.first_ts = time.time()
+        self.last_rx_ts = self.first_ts
+        self.last_src = None
+        self.nak_tokens = None     # lazily seeded to a full bucket on first sweep
+        self.nak_tok_ts = time.monotonic()
+
+    def _reset_counters(self):
+        self.pkts = 0; self.bytes = 0
+        self.naks = 0; self.ooo = 0
+        self.recovered = 0; self.dup = 0; self.lost = 0
+        self.cum = None            # in-order frontier (None until first pkt)
+        self.base_seq = None       # first seq seen this session (join point)
+        self.hi_seq = 0
+        self.seen_above = set()    # arrived seqs > cum
+        self.missing = {}          # seq -> [first_mono, naked_bool, nak_count]
+        self.prev_arrival_seq = 0
+        self.src_ports = set()     # distinct UDP source ports seen this session
+                                   # (STACK entropy spray width); bounded in record()
+        self.ce = 0                # ECN CE-marked packets seen this session
+        self.ce_since_ack = False  # any CE since the last ACK was emitted
+        self.last_send_ns = 0      # send_ns of the most recent packet (echoed in ACK)
+        self.last_ack_mono = 0.0   # monotonic time of the last ACK emitted
+        self.lat_window.clear()
+
+    def reset_for_new_session(self, nonce):
+        self.nonce = nonce
+        self.resets += 1
+        self._reset_counters()
+        self.first_ts = time.time()
+        self.last_rx_ts = self.first_ts
+
+    # -- packet ingest -------------------------------------------------------
+    def record(self, seq, send_ns, n_bytes, rx_ns, now_mono, src=None, ecn=0):
+        self.pkts += 1
+        self.bytes += n_bytes
+        self.last_rx_ts = rx_ns / 1e9
+        self.last_send_ns = send_ns
+        # ECN: low 2 bits of the IPv6 Traffic Class / IPv4 ToS. 0b11 == CE
+        # (Congestion Experienced) — a switch RED/codel qdisc set it under queue
+        # buildup. This is NSCC's leading congestion signal (spec 8.2).
+        if (ecn & 0x3) == 0x3:
+            self.ce += 1
+            self.ce_since_ack = True
+        if src is not None:
+            self.last_src = src
+            # Track the spread of source ports for this EV. In udp/stev mode a
+            # single EV is sprayed across N ephemeral source ports
+            # (--entropy-ports); the EV id (carried in the payload header) stays
+            # constant, so this set is the only place the realised spray width
+            # is visible. Bounded so a pathological port range can't grow it
+            # without limit; 8192 comfortably covers any sane --entropy-ports.
+            if len(self.src_ports) < 8192:
+                self.src_ports.add(src[1])   # AF_INET6 addr = (host, port, fi, scope)
+        lat_ns = rx_ns - send_ns
+        if 0 < lat_ns < 60_000_000_000:
+            self.lat_window.append(lat_ns)
+
+        # arrival-order regression (independent of the loss scoreboard)
+        if self.prev_arrival_seq and seq < self.prev_arrival_seq:
+            self.ooo += 1
+        self.prev_arrival_seq = seq
+
+        if self.cum is None:                 # baseline: join at first seq seen
+            self.cum = seq; self.base_seq = seq; self.hi_seq = seq
+            return
+
+        if seq < self.base_seq:               # arrived before our join point
+            return                             # neither dup nor recovery — ignore
+
+        if seq <= self.cum:
+            if seq in self.missing:          # a gap we'd noticed now filled
+                meta = self.missing.pop(seq)
+                if meta[1]:                  # had been NAK'd → genuine recovery
+                    self.recovered += 1
+            else:
+                self.dup += 1                # already delivered → redundant
+            return
+
+        # seq > cum
+        if seq in self.seen_above:
+            self.dup += 1
+            return
+
+        if seq in self.missing:              # filled a gap that's still ahead
+            meta = self.missing.pop(seq)
+            if meta[1]:
+                self.recovered += 1
+            self.seen_above.add(seq)
+        elif seq == self.cum + 1:
+            self.cum = seq
+        else:
+            # gap: everything in (cum, seq) not yet seen becomes missing
+            self.seen_above.add(seq)
+            lo = self.cum + 1
+            if seq - lo > GAP_FILL_CAP:      # pathological jump → resync
+                self.lost += (seq - lo)
+                self.cum = seq - 1
+                lo = self.cum + 1
+            for s in range(lo, seq):
+                if s not in self.seen_above and s not in self.missing:
+                    if len(self.missing) >= MISSING_MAX:
+                        break
+                    self.missing[s] = [now_mono, False, 0]
+
+        if seq > self.hi_seq:
+            self.hi_seq = seq
+        self._advance(now_mono)
+
+    def _advance(self, now_mono):
+        # slide the frontier over any contiguous arrived seqs
+        while (self.cum + 1) in self.seen_above:
+            self.seen_above.discard(self.cum + 1)
+            self.cum += 1
+
+    # -- loss detection ------------------------------------------------------
+    def sweep(self, now_mono, reorder_window, nak_rate):
+        """Return a list of seqs to NAK (rate-capped), age out stale gaps."""
+        to_nak = []
+        # token-bucket refill for NAK rate cap (lazy full-bucket on first call;
+        # clamp dt so a non-monotonic clock or fresh session can't zero us out)
+        if self.nak_tokens is None:
+            self.nak_tokens = nak_rate
+            self.nak_tok_ts = now_mono
+        dt = now_mono - self.nak_tok_ts
+        if dt < 0: dt = 0.0
+        self.nak_tok_ts = now_mono
+        self.nak_tokens = min(nak_rate, self.nak_tokens + dt * nak_rate)
+
+        if self.missing:
+            for seq in list(self.missing.keys()):
+                meta = self.missing[seq]
+                first, naked, ncount = meta
+                age = now_mono - first
+                if age >= MISSING_MAX_AGE:           # give up; count as lost
+                    del self.missing[seq]
+                    self.lost += 1
+                    continue
+                # declare lost on first crossing of the window, then re-NAK
+                # with linear backoff (window, 2*window, ...) until recovered.
+                due = (not naked) or (age >= reorder_window * (ncount + 1))
+                if age >= reorder_window and due and self.nak_tokens >= 1.0:
+                    if not naked:
+                        self.naks += 1                # count distinct losses once
+                    meta[1] = True
+                    meta[2] = ncount + 1
+                    self.nak_tokens -= 1.0
+                    to_nak.append(seq)
+            # drain frontier in case aged-out gaps unblocked it
+            self._advance(now_mono)
+        return to_nak
+
+    def snapshot(self):
+        lat = sorted(self.lat_window) if self.lat_window else None
+        out = {
+            "ev": self.ev,
+            "nonce": f"0x{self.nonce:08x}",
+            "resets": self.resets,
+            "pkts": self.pkts,
+            "bytes": self.bytes,
+            "naks": self.naks,           # declared losses (NAKs emitted)
+            "ooo":  self.ooo,            # arrival-order regressions
+            "recovered": self.recovered, # lost-then-arrived (ARQ recovery)
+            "dup":  self.dup,            # redundant arrivals (GBN waste signal)
+            "lost": self.lost,           # declared lost, never recovered
+            "inflight_gaps": len(self.missing),
+            "last_seq": self.cum or 0,
+            "ce": self.ce,              # ECN CE-marked packets
+            "ce_pct": round(100.0 * self.ce / self.pkts, 2) if self.pkts else 0.0,
+            "first_ts": self.first_ts,
+            "last_rx_ts": self.last_rx_ts,
+            "spray_ports": len(self.src_ports),   # realised STACK entropy width
+        }
+        if lat:
+            n = len(lat)
+            out["lat_us_avg"] = sum(lat) / n / 1000.0
+            out["lat_us_p50"] = lat[n//2] / 1000.0
+            out["lat_us_p95"] = lat[min(n*95//100, n-1)] / 1000.0
+        return out
+
+# ---------------------------------------------------------------------------
+class Sink:
+    def __init__(self, args):
+        self.args = args
+        self.lock = threading.Lock()
+        self.evs = {}
+        self.total_rx = 0
+        self.total_bad = 0
+        self.naks_sent = 0
+        self.started = time.time()
+        self.reorder_window = args.reorder_window_ms / 1000.0
+        # dedicated socket for emitting NAKs back to senders
+        self.nak_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        try: self.nak_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except Exception: pass
+
+    def _send_naks(self, s, seqs):
+        if not (self.args.nak and seqs and s.last_src):
+            return
+        ip = s.last_src[0]
+        for seq in seqs:
+            pkt = struct.pack(NAK_FMT, NAK_MAGIC, s.nonce & 0xFFFFFFFF,
+                              s.ev & 0xFFFF, 0, seq & 0xFFFFFFFFFFFFFFFF, 0)
+            try:
+                self.nak_sock.sendto(pkt, (ip, self.args.nak_port))
+                self.naks_sent += 1
+            except OSError:
+                pass
+
+    def _send_ack(self, s, now_mono):
+        """Coalesced ACK back to the sender: carries the cumulative in-order seq,
+        the echoed send_ns (RTT sample), a CE flag (ECN congestion seen since the
+        last ACK), and cumulative received bytes (the NSCC ack-clock). Rate-limited
+        to one ACK per ack_interval per EV so it never becomes an ACK storm. Only
+        emitted when --ack is on; harmless to a sender not running congestion
+        control (its listener ignores ACKs)."""
+        if not (self.args.ack and s.last_src and s.cum is not None):
+            return
+        if (now_mono - s.last_ack_mono) < self.args.ack_interval_ms / 1000.0:
+            return
+        s.last_ack_mono = now_mono
+        ce = 1 if s.ce_since_ack else 0
+        s.ce_since_ack = False
+        pkt = struct.pack(ACK_FMT, ACK_MAGIC, s.nonce & 0xFFFFFFFF,
+                          s.ev & 0xFFFF, 0, (s.cum or 0) & 0xFFFFFFFFFFFFFFFF,
+                          s.last_send_ns & 0xFFFFFFFFFFFFFFFF, ce,
+                          s.bytes & 0xFFFFFFFFFFFFFFFF)
+        try:
+            self.nak_sock.sendto(pkt, (s.last_src[0], self.args.nak_port))
+        except OSError:
+            pass
+
+    def _on_packet(self, data, addr, ecn=0):
+        if len(data) < HDR_SIZE:
+            self.total_bad += 1; return
+        if data[:4] == MAGIC_LEGACY:
+            self.total_bad += 1; return
+        try:
+            magic, nonce, ev_id, flow_idx, seq, send_ns = struct.unpack(HDR_FMT, data[:HDR_SIZE])
+        except struct.error:
+            self.total_bad += 1; return
+        if magic != MAGIC:
+            self.total_bad += 1; return
+        rx_ns = time.time_ns()
+        now_mono = time.monotonic()
+        emit = None; ev_obj = None
+        with self.lock:
+            s = self.evs.get(ev_id)
+            if s is None:
+                s = EVStats(ev_id, nonce); self.evs[ev_id] = s
+                print(f"[sink] EV {ev_id}: first session nonce 0x{nonce:08x}", file=sys.stderr)
+            elif s.nonce != nonce:
+                print(f"[sink] EV {ev_id}: new session nonce 0x{s.nonce:08x} → "
+                      f"0x{nonce:08x}, resetting (prev pkts={s.pkts}, naks={s.naks})",
+                      file=sys.stderr)
+                s.reset_for_new_session(nonce)
+            s.record(seq, send_ns, len(data), rx_ns, now_mono, src=addr, ecn=ecn)
+            self.total_rx += 1
+            emit = s.sweep(now_mono, self.reorder_window, self.args.nak_rate)
+            ev_obj = s
+        if emit:
+            self._send_naks(ev_obj, emit)
+        if ev_obj is not None:
+            self._send_ack(ev_obj, now_mono)
+
+    def sweep_loop(self):
+        """Background sweep so quiescent flows still get their NAKs/age-outs."""
+        while True:
+            time.sleep(0.01)
+            now_mono = time.monotonic()
+            pending = []
+            acks = []
+            with self.lock:
+                for s in self.evs.values():
+                    seqs = s.sweep(now_mono, self.reorder_window, self.args.nak_rate)
+                    if seqs:
+                        pending.append((s, seqs))
+                    acks.append(s)
+            for s, seqs in pending:
+                self._send_naks(s, seqs)
+            for s in acks:
+                self._send_ack(s, now_mono)
+
+    def snapshot(self):
+        with self.lock:
+            now = time.time()
+            evs = []
+            for ev_id, s in sorted(self.evs.items()):
+                snap = s.snapshot()
+                if now - snap["last_rx_ts"] > self.args.idle_prune:
+                    continue
+                evs.append(snap)
+            return {
+                "ts": now,
+                "uptime_s": now - self.started,
+                "total_rx": self.total_rx,
+                "total_bad": self.total_bad,
+                "naks_sent": self.naks_sent,
+                "evs": evs,
+            }
+
+    def loop_writer(self):
+        path = self.args.state; tmp = path + ".tmp"
+        while True:
+            time.sleep(1.0)
+            try:
+                snap = self.snapshot()
+                with open(tmp, "w") as f:
+                    json.dump(snap, f, separators=(",", ":"))
+                os.replace(tmp, path)
+            except Exception as e:
+                print(f"[sink] state-write err: {e}", file=sys.stderr)
+
+    def serve_v6(self):
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try: s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except Exception: pass
+        s.bind(("::", self.args.port))
+        try: s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 << 20)
+        except Exception: pass
+        # Ask the kernel to deliver the received Traffic Class / ToS as ancillary
+        # data so we can read the ECN bits per packet (recvmsg cmsg). Best-effort:
+        # if the platform lacks the option we fall back to ecn=0 (no CE seen).
+        have_tclass = False
+        try:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_RECVTCLASS, 1)
+            have_tclass = True
+        except Exception: pass
+        try: s.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
+        except Exception: pass
+        nak = "on" if self.args.nak else "off"
+        ack = "on" if self.args.ack else "off"
+        print(f"[sink] listening UDP :{self.args.port} (dual-stack)  "
+              f"NAK={nak}→:{self.args.nak_port}  ACK={ack}  ECN-read={'on' if have_tclass else 'off'}  "
+              f"reorder-window={self.args.reorder_window_ms}ms")
+        ancbufsize = socket.CMSG_SPACE(4)
+        while True:
+            try:
+                data, ancdata, _flags, addr = s.recvmsg(65535, ancbufsize)
+                ecn = 0
+                for clevel, ctype, cdata in ancdata:
+                    # IPv6 Traffic Class or IPv4 ToS: the byte's low 2 bits are ECN
+                    if (clevel == socket.IPPROTO_IPV6 and ctype == socket.IPV6_TCLASS) or \
+                       (clevel == socket.IPPROTO_IP and ctype == getattr(socket, "IP_TOS", -1)):
+                        if cdata:
+                            ecn = cdata[0] & 0x3
+                        break
+                self._on_packet(data, addr, ecn)
+            except OSError:
+                time.sleep(0.05)
+
+    def serve_http(self):
+        sink_ref = self
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a, **kw): pass
+            def do_GET(self):
+                if self.path in ("/", "/stats"):
+                    body = json.dumps(sink_ref.snapshot(), indent=2).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers(); self.wfile.write(body)
+                else:
+                    self.send_response(404); self.end_headers()
+        srv = http.server.ThreadingHTTPServer(("", self.args.http_port), H)
+        print(f"[sink] http stats on :{self.args.http_port}")
+        srv.serve_forever()
+
+def main():
+    ap = argparse.ArgumentParser(prog="mrc-sink", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port",       type=int, default=5202, help="UDP listen port")
+    ap.add_argument("--http-port",  type=int, default=HTTP_PORT_DEFAULT, help="HTTP stats port")
+    ap.add_argument("--state",      default=STATE_PATH_DEFAULT, help="path for periodic JSON snapshot")
+    ap.add_argument("--idle-prune", type=float, default=10.0, help="prune EV stats idle for N seconds")
+    ap.add_argument("--nak", action=argparse.BooleanOptionalAction, default=True,
+                    help="send NAK packets to the sender on declared loss (default: ON)")
+    ap.add_argument("--nak-port", type=int, default=NAK_PORT_DEFAULT,
+                    help=f"UDP port to send NAKs to on the sender (default {NAK_PORT_DEFAULT})")
+    ap.add_argument("--nak-rate", type=float, default=4000.0,
+                    help="max NAKs/sec per EV (token-bucket cap, default 4000)")
+    ap.add_argument("--ack", action=argparse.BooleanOptionalAction, default=True,
+                    help="send coalesced ACKs (cum seq + RTT echo + CE flag + rcvd "
+                         "bytes) back to the sender; drives the sender's congestion "
+                         "window. Harmless to a sender not running CC. (default: ON)")
+    ap.add_argument("--ack-interval-ms", type=float, default=4.0,
+                    help="min spacing between coalesced ACKs per EV (default 4ms)")
+    ap.add_argument("--reorder-window-ms", type=float, default=30.0,
+                    help="how long a gap may persist before it's declared lost "
+                         "(default 30ms). Larger tolerates more reordering from "
+                         "high-entropy spraying at the cost of slower loss detection.")
+    args = ap.parse_args()
+
+    s = Sink(args)
+    threading.Thread(target=s.loop_writer, daemon=True).start()
+    threading.Thread(target=s.serve_http,  daemon=True).start()
+    threading.Thread(target=s.sweep_loop,  daemon=True).start()
+    try:
+        s.serve_v6()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,72 @@
+{
+  "_comment": "MRC virtual-NIC profile for gpu1 (tenant fd00:9:1:101::2). Generated; one block per peer GPU, EVs = pinned uSID carriers.",
+  "tenant": "fd00:9:1:101::2",
+  "underlay": "eth1",
+  "profiles": [
+    {
+      "mode": "srv6",
+      "flow": {
+        "src": "gpu1",
+        "dst": "gpu2"
+      },
+      "active_dst": "fd00:9:1:102::2",
+      "active_evs": [
+        {
+          "entropy": 49001,
+          "usid": "fc00:0:2101:fff6::",
+          "plane": 1,
+          "spine": null,
+          "path": "gpu1->gpu2 same-leaf leaf1 End.DT6"
+        }
+      ]
+    },
+    {
+      "mode": "srv6",
+      "flow": {
+        "src": "gpu1",
+        "dst": "gpu3"
+      },
+      "active_dst": "fd00:9:1:201::2",
+      "active_evs": [
+        {
+          "entropy": 49001,
+          "usid": "fc00:0:1101:e002:2102:fff6::",
+          "plane": 1,
+          "spine": "spine1",
+          "path": "gpu1->gpu3 via spine1 -> leaf2"
+        },
+        {
+          "entropy": 49002,
+          "usid": "fc00:0:1102:e002:2102:fff6::",
+          "plane": 1,
+          "spine": "spine2",
+          "path": "gpu1->gpu3 via spine2 -> leaf2"
+        }
+      ]
+    },
+    {
+      "mode": "srv6",
+      "flow": {
+        "src": "gpu1",
+        "dst": "gpu4"
+      },
+      "active_dst": "fd00:9:1:202::2",
+      "active_evs": [
+        {
+          "entropy": 49001,
+          "usid": "fc00:0:1101:e002:2102:fff6::",
+          "plane": 1,
+          "spine": "spine1",
+          "path": "gpu1->gpu4 via spine1 -> leaf2"
+        },
+        {
+          "entropy": 49002,
+          "usid": "fc00:0:1102:e002:2102:fff6::",
+          "plane": 1,
+          "spine": "spine2",
+          "path": "gpu1->gpu4 via spine2 -> leaf2"
+        }
+      ]
+    }
+  ]
+}

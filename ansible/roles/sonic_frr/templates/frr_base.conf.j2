@@ -1,0 +1,30 @@
+#jinja2: trim_blocks:True, lstrip_blocks:True
+{% set step = sonic_port_step | default(4) %}
+hostname {{ inventory_hostname }}
+!
+interface lo
+ ipv6 address {{ node.loopback }}/128
+exit
+{% for i in node.interfaces %}
+interface Ethernet{{ (i.name[3:] | int - 1) * step }}
+ description to-{{ i.peer }}
+ ipv6 address {{ i.ipv6 }}
+ no shutdown
+exit
+{% endfor %}
+{% for r in node.routes %}
+{% for nh in r.nexthops %}
+ipv6 route {{ r.dest }} {{ nh }}
+{% endfor %}
+{% endfor %}
+{% if configure_srv6_locator | default(true) and node.srv6 is defined %}
+segment-routing
+ srv6
+  locators
+   locator MAIN
+    prefix {{ node.srv6.locator }} block-len 32 node-len 16 func-bits 16
+   exit
+  exit
+ exit
+exit
+{% endif %}

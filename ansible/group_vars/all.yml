@@ -1,0 +1,54 @@
+---
+# ===== fabric shape (drives gen_clab_topology.py) =====
+fabric_name: srv6lab
+sonic_image: docker-sonic-vs:latest
+switch_image: quay.io/frrouting/frr:10.6.1   # FRR 10.6.1 = native uSID static-sids
+gpu_image: ghcr.io/hellt/network-multitool:latest
+gpus: 4
+gpus_per_leaf: 2        # HOMED: K GPUs per leaf (cross-leaf traffic transits a spine). 0/unset = legacy mesh.
+leaves: 2
+spines: 2
+planes: 1               # single plane (2 leaf x 2 spine, 4 GPU homed 2/leaf)
+
+# ===== lifecycle toggles =====
+do_generate: true        # run the topology generator on localhost
+do_deploy: true          # containerlab deploy (needs sudo: run with -K if prompted)
+
+# ===== packet capture (Edgeshark) =====
+# Edgeshark = web UI (port 5001 on this host) to capture ANY interface on ANY node
+# (leaf/spine/gpu), piped to your local Wireshark via the cshargextcap plugin.
+# It's a host service that introspects all container namespaces — not part of the
+# .clab.yml topology. Toggle on/off independently of the lab.
+do_edgeshark: true        # bring Edgeshark up with the lab (and down on -e do_edgeshark=false + destroy)
+edgeshark_port: 5001      # web UI port on this host
+
+# ===== device config knobs =====
+sonic_port_step: 4               # clab ethN -> SONiC Ethernet{(N-1)*step}
+configure_srv6_locator: true
+configure_srv6_sids: true
+
+# Cold-boot determinism: deploy SONiC nodes in waves instead of all at once.
+stagger_deploy: true      # false = single-shot 'containerlab deploy --reconfigure'
+deploy_wave_size: 2       # switches booted per wave; lower if host is CPU-tight
+
+# SRv6 SID programming for the all-Linux FRR fabric (site-frr.yml):
+#   frr    = FRR static-sids program the kernel natively (needs FRR >= 9.1; 10.6.1 does
+#            true uSID 'flavors next-csid'). Preferred.
+#   kernel = direct 'ip seg6local' via bind-mounted seg6.sh (works on ANY FRR, incl 8.4).
+seg6_mode: frr
+
+# --- MRC virtual NIC layer ---------------------------------------------------
+# When true, the generator emits a per-GPU profile.json (full EV-set of uSID
+# carriers) and each GPU runs the standalone mrc-nic as a standing SR source
+# (per-EV fwmark-pinned seg6 encap + its own End.DT6 decap). Additive on top of
+# the proven fc00:0 switch dataplane. Toggle with -e mrc_nic=true if not set here.
+mrc_nic: true
+
+# --- MRC spec cutover (NIC-only decap) --------------------------------------
+# false (default) = proven fc00:0 fabric, decap at the leaf (End.DT6 on leaves).
+# true  = MRC-faithful rebuild: fcbb:bb00 /32 block, leaves carry NO End.DT6,
+#         each GPU decaps its own decap uSID (block:900N::), carriers name the
+#         GPU. Implies mrc_nic. WARNING: if NIC-side End.DT6 doesn't fire on the
+#         kernel, spec-mode packets reach the GPU and are dropped (no decap).
+#         Validate on the wire before trusting at scale. Toggle: -e spec_mode=true
+spec_mode: false

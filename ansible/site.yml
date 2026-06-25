@@ -1,0 +1,80 @@
+---
+# 100% Ansible-driven: generate -> deploy -> register hosts -> configure.
+
+- name: Generate topology, deploy the lab, and register hosts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    proj: "{{ playbook_dir }}/.."
+    fabric_vars_path: "{{ playbook_dir }}/../fabric_vars.json"
+  tasks:
+    - name: Generate topology + position-encoded addressing
+      ansible.builtin.command:
+        cmd: >
+          python3 {{ proj }}/gen_clab_topology.py
+          --image {{ sonic_image }} --gpu-image {{ gpu_image }}
+          --gpus {{ gpus }} --leaves {{ leaves }} --spines {{ spines }} --planes {{ planes }}
+          --name {{ fabric_name }} --plan {{ proj }}/address_plan.json --out {{ proj }}/fabric
+        chdir: "{{ proj }}"
+      when: do_generate | bool
+
+    - name: Deploy containerlab topology (staggered waves — avoids cold-boot port race)
+      ansible.builtin.command:
+        cmd: >
+          bash {{ proj }}/deploy_staggered.sh
+          -t {{ fabric_name }}.clab.yml -v {{ proj }}/fabric_vars.json
+          -w {{ deploy_wave_size | default(2) }} --fresh
+        chdir: "{{ proj }}"
+      become: true
+      when: do_deploy | bool and (stagger_deploy | default(true) | bool)
+
+    - name: Deploy containerlab topology (single-shot — all nodes at once)
+      ansible.builtin.command:
+        cmd: containerlab deploy -t {{ fabric_name }}.clab.yml --reconfigure
+        chdir: "{{ proj }}"
+      become: true
+      when: do_deploy | bool and not (stagger_deploy | default(true) | bool)
+
+    - name: Load generated fabric_vars.json
+      ansible.builtin.set_fact:
+        fabric: "{{ lookup('file', fabric_vars_path) | from_json }}"
+
+    - name: Register every node as an in-memory host (group by role)
+      ansible.builtin.add_host:
+        name: "{{ item.key }}"
+        groups: >-
+          {{ 'spines,switches' if item.value.role == 'spine'
+             else 'leaves,switches' if item.value.role == 'leaf'
+             else 'gpus' }}
+        ansible_connection: community.docker.docker
+        ansible_host: "clab-{{ fabric.name }}-{{ item.key }}"
+        ansible_python_interpreter: "{{ '/usr/bin/python3' if item.value.role in ['spine','leaf'] else omit }}"
+        node: "{{ item.value }}"
+      loop: "{{ fabric.nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value.role }})"
+
+- name: Configure SONiC switches via FRR
+  hosts: switches
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for SONiC to create Ethernet ports
+      ansible.builtin.raw: "ls /sys/class/net | grep -c '^Ethernet' || true"
+      register: pc
+      retries: 20
+      delay: 6
+      until: pc.stdout is defined and (pc.stdout | trim | int) > 0
+      changed_when: false
+      failed_when: false
+    - name: Skip switches that never created ports (wedged cold-boot)
+      ansible.builtin.meta: end_host
+      when: not (pc.stdout is defined and (pc.stdout | trim | int) > 0)
+  roles:
+    - sonic_frr
+
+- name: Configure GPU hosts (plain Linux networking)
+  hosts: gpus
+  gather_facts: false
+  roles:
+    - gpu_host

@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""
+mrc-probe — MRC-aware synthetic UDP packet generator.
+
+Pairs with mrc-agent. Reads the local agent state file to learn the active
+mode and EVs, then emits UDP packets to the peer with source ports chosen
+per-mode so the underlay's L4 hash spreads them across the controller's
+selected paths:
+
+  mode=none    one stream, ephemeral src port, no MRC encoding
+  mode=udp     one stream per EV, src port = EV value
+  mode=stev    one stream per EV, src port = STEV-encoded (path bits + flow id)
+  mode=srv6    one stream per EV (kernel does the encap); src port irrelevant
+
+ARQ (retransmission)
+--------------------
+mrc-sink sends a NAK packet back (port 5210) when it declares a sequence lost.
+The probe listens for NAKs and retransmits, mode-aware:
+  mode=none                  -> Go-Back-N: resend every packet from the lost
+                                seq onward (mirrors RC-IB-over-RoCEv2 in-order
+                                delivery — one drop, a big retx burst)
+  mode in udp|stev|srv6      -> Selective: resend just the lost packet
+Retx is bounded by a per-stream token bucket (--ring packets/sec). Enabled by
+default in --bytes file-transfer mode, off in streaming mode (override with
+--enable-retx / --no-enable-retx).
+
+STACK-style spraying
+--------------------
+--entropy-ports N spreads each logical flow across N source ports (N sockets,
+round-robin). This is the STACK contrast to MRC source routing: in `none` mode
+a single flow sprayed across 128 ports statistically balances across the
+fabric's paths (with collision variance), where SRv6 pins each EV to a path
+deterministically. Spraying overrides the per-EV encoded src port.
+
+Usage:
+  mrc-probe --dst gpu001 [--target-mbps 400] [--entropy-ports 128] [--enable-retx]
+  mrc-probe --peer <addr> [--port 5202] [--rate 5000] [--size 1024]
+"""
+
+import argparse, json, os, signal, socket, struct, sys, threading, time
+from collections import deque
+from pathlib import Path
+
+DEFAULT_STATE = "/run/mrc-agent.json"
+FALLBACK_STATE = "/tmp/mrc-agent.json"
+DEFAULT_PORT  = 5202
+NAK_PORT_DEFAULT = 5210
+
+MAGIC    = b"MRC1"
+HDR_FMT  = ">4sIHHQQ"            # magic, nonce, ev_id, flow_idx, seq, send_ns
+HDR_SIZE = struct.calcsize(HDR_FMT)
+NAK_FMT   = ">4sIHHQQ"           # magic, nonce, ev_id, flow_idx, expected, received
+NAK_SIZE  = struct.calcsize(NAK_FMT)
+NAK_MAGIC = b"NAK1"
+
+# ACK packet (sink -> probe), shares the NAK channel. Drives the congestion
+# window: cumulative seq, echoed send_ns (RTT sample), CE flag (ECN congestion),
+# and cumulative received bytes (the NSCC ack-clock).
+ACK_FMT   = ">4sIHHQQBxxxQ"      # magic, nonce, ev, flow, cum_seq, echo_ns, ce, pad, rcvd_bytes
+ACK_SIZE  = struct.calcsize(ACK_FMT)
+ACK_MAGIC = b"ACK1"
+
+# ---- state -----------------------------------------------------------------
+def read_state(path):
+    for p in [path, FALLBACK_STATE]:
+        try:
+            with open(p) as f: return json.load(f)
+        except FileNotFoundError: continue
+        except Exception as e:
+            print(f"[probe] error reading {p}: {e}", file=sys.stderr)
+            return None
+    return None
+
+def stev_encode(ev, flow_idx):
+    """Demo STEV encoding: keep srcport in ephemeral range, encode path-ID
+    from low bits of EV in upper byte, flow index in low byte."""
+    path_id = ev & 0xFF
+    flow_id = flow_idx & 0x1F
+    return 0xC000 | (path_id << 5) | flow_id
+
+def resolve_host_via_controller(name, family, state_path):
+    """Look up a host's tenant address via the controller's /api/topology."""
+    import urllib.request, json as _json
+    state = read_state(state_path) or {}
+    ctrl  = ((state.get("controller") or {}).get("url") or "").rstrip("/")
+    if not ctrl:
+        raise RuntimeError(
+            f"can't resolve --dst {name}: no controller URL in agent state at "
+            f"{state_path}. Either pass --peer <ip> explicitly, or ensure mrc-agent "
+            "has registered with the controller.")
+    url = ctrl + "/api/topology"
+    try:
+        with urllib.request.urlopen(url, timeout=4) as r:
+            topo = _json.loads(r.read())
+    except Exception as e:
+        raise RuntimeError(f"can't reach controller at {url}: {e}")
+    field = "addr_v4" if family == "ipv4" else "addr_v6"
+    for h in topo.get("hosts", []):
+        if h.get("name") == name:
+            addr = h.get(field) or h.get("addr")
+            if not addr:
+                raise RuntimeError(f"host {name!r} has no {field}: {h}")
+            return addr
+    known = [h.get("name") for h in topo.get("hosts", [])]
+    raise RuntimeError(f"host {name!r} not found. Known hosts: {known}")
+
+# ---- sender stream ---------------------------------------------------------
+class Stream(threading.Thread):
+    def __init__(self, mode, ev, label, peer_addr, peer_port, flow_idx,
+                 rate_pps, payload_size, stop, session_nonce,
+                 entropy_ports=1, enable_retx=False, ring=4096, retx_algo="auto",
+                 cc=False, ecn=False, target_qdelay_us=50.0, max_cwnd_pkts=4096):
+        super().__init__(daemon=True)
+        self.mode, self.ev, self.label = mode, ev, label
+        self.peer_addr, self.peer_port = peer_addr, peer_port
+        self.flow_idx, self.rate_pps, self.payload_size = flow_idx, rate_pps, payload_size
+        self.stop = stop
+        self.session_nonce = session_nonce
+        self.entropy_ports = max(1, entropy_ports)
+        self.enable_retx = enable_retx
+        # retx algorithm: "auto" -> GBN in none mode, selective in MRC modes
+        # (the historical behaviour). "gbn"/"selective" force it, so the same
+        # mode can be A/B-compared for file-transfer efficiency.
+        self.retx_algo = retx_algo if retx_algo in ("auto", "gbn", "selective") else "auto"
+        self.ring = max(64, ring)
+        self.pkts = 0; self.bytes = 0; self.errors = 0
+        self.retx_pkts = 0; self.retx_bytes = 0; self.retx_skipped = 0
+        self.highest_sent = 0
+        # ---- congestion control (NSCC-lite, MRC #2) -----------------------
+        # When cc is on, the fixed-rate pacer is replaced by a per-stream
+        # congestion window clocked by the sink's ACKs: we may only have cwnd
+        # bytes in flight, and cwnd is grown/shrunk from the RTT + ECN signal
+        # exactly as in the NSCC quadrant table (spec 8.2). Window accounting is
+        # in payload bytes so it matches the sink's cumulative rcvd_bytes.
+        self.cc = bool(cc)
+        self.ecn = bool(ecn)
+        self._cc_lock = threading.Lock()
+        self.cwnd     = float(payload_size * 10)          # ~10 packets initial
+        self.inflight = 0.0
+        self.prev_rcvd = 0
+        self.base_rtt_ns = None
+        self.last_rtt_ns = None
+        self.last_qdelay_ns = 0
+        self.target_qdelay_ns = max(1.0, target_qdelay_us) * 1000.0
+        self.cwnd_min = float(payload_size * 2)
+        self.cwnd_max = float(payload_size * max(8, max_cwnd_pkts))
+        self.md_factor = 0.80                             # multiplicative decrease
+        self.last_ack_mono = time.monotonic()
+        self.acks_rx = 0; self.ce_acks = 0
+        # retx request queue: deque of [cur, end] inclusive spans
+        self._rlock = threading.Lock()
+        self._retx_spans = deque()
+        self._retx_tokens = float(self.ring)
+        self._retx_tok_ts = time.monotonic()
+        self.socks, self.src_ports = self._open_sockets()
+        self.src_port = self.src_ports[0]
+
+    # -- socket setup --------------------------------------------------------
+    def _mark_sock(self, s):
+        if self.mode == "srv6" and self.ev > 0:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(self.ev))
+            except (PermissionError, OSError) as e:
+                print(f"[probe] {self.label}: SO_MARK={self.ev} not applied ({e}); "
+                      f"using kernel ECMP hash", file=sys.stderr)
+
+    def _pick_src_port(self):
+        if self.mode == "udp":  return int(self.ev)
+        if self.mode == "stev": return stev_encode(int(self.ev), self.flow_idx)
+        return 0   # ephemeral (srv6 / none)
+
+    def _open_sockets(self):
+        family = socket.AF_INET6 if ":" in self.peer_addr else socket.AF_INET
+        bind_addr = "::" if family == socket.AF_INET6 else "0.0.0.0"
+        n = self.entropy_ports
+        # With entropy spraying the per-EV encoded src port is overridden by
+        # ephemeral ports (that IS the high-entropy behaviour we're modelling).
+        encoded = self._pick_src_port()
+        if n > 1 and encoded and self.mode in ("udp", "stev"):
+            print(f"[probe] {self.label}: --entropy-ports {n} overrides "
+                  f"encoded src_port {encoded} with {n} ephemeral ports",
+                  file=sys.stderr)
+        socks, ports = [], []
+        for i in range(n):
+            s = socket.socket(family, socket.SOCK_DGRAM)
+            self._mark_sock(s)
+            # ECN: stamp ECT(0) (the two low ToS/TClass bits = 0b10) so the fabric
+            # is allowed to set CE on this flow under queue buildup. Without ECT,
+            # a RED/codel switch would drop instead of mark, and the sink would
+            # never see congestion to feed back. Only when --ecn is on.
+            if self.ecn:
+                try:
+                    if family == socket.AF_INET6:
+                        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, 0x02)
+                    else:
+                        s.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x02)
+                except OSError:
+                    pass
+            # Non-blocking sends. With blocking sockets, when a path's egress
+            # queue fills (e.g. the shared cross-DC DCI), sendto() BLOCKS the
+            # whole stream thread until the kernel buffer drains. Combined with
+            # the GIL serialising the per-EV threads and the pacing loop's
+            # no-catch-up reset, that let two EVs monopolise while two starved
+            # (the 58/58/19/19 cross-DC skew) even though SRv6 pins each EV to a
+            # path deterministically. Non-blocking turns a full queue into an
+            # EAGAIN we count as a drop and pace past, so all EVs degrade evenly
+            # under congestion instead of two winning the GIL/buffer race.
+            s.setblocking(False)
+            want = 0 if n > 1 else encoded     # only the single-socket case pins the port
+            # SO_REUSEADDR only on the pinned-port case. For the spray case we
+            # bind ephemeral (port 0) *without* it: with SO_REUSEADDR set, UDP
+            # lets the kernel's ephemeral picker hand back a port a sibling
+            # socket already holds, so a 1024-port spray collided down to ~1007
+            # distinct ports. Without it, each bind gets a distinct free port,
+            # so --entropy-ports N realises N distinct ports (up to the
+            # ephemeral range size).
+            if want:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((bind_addr, want))
+            except OSError as e:
+                if want:
+                    print(f"[probe] {self.label}: bind srcport={want} failed ({e}); ephemeral",
+                          file=sys.stderr)
+                s.bind((bind_addr, 0))
+            socks.append(s); ports.append(s.getsockname()[1])
+        return socks, ports
+
+    # -- retx plumbing (called from the NAK-listener thread) -----------------
+    def enqueue_retx(self, expected_seq):
+        if not self.enable_retx:
+            return
+        with self._rlock:
+            lo = max(1, self.highest_sent - self.ring + 1)
+            # resolve the algorithm: explicit override wins, else mode-derived
+            if self.retx_algo == "gbn":        gbn = True
+            elif self.retx_algo == "selective": gbn = False
+            else:                               gbn = (self.mode == "none")
+            if expected_seq < lo:
+                # the NAK'd data has already aged out of the ring — unrecoverable.
+                # Surface it so a too-small ring / too-slow loss detection shows up.
+                self.retx_skipped += 1
+                if not gbn:
+                    return
+            start = max(expected_seq, lo)
+            if gbn:
+                end = self.highest_sent               # Go-Back-N
+            else:
+                end = expected_seq                    # selective
+            if end >= start:
+                self._retx_spans.append([start, end])
+
+    def _drain_retx(self, buf, now):
+        """Emit retx packets subject to the token bucket. Returns count sent."""
+        with self._rlock:
+            if not self._retx_spans:
+                return
+            dt = now - self._retx_tok_ts
+            if dt < 0: dt = 0.0
+            self._retx_tok_ts = now
+            self._retx_tokens = min(float(self.ring), self._retx_tokens + dt * self.ring)
+            sock_n = len(self.socks)
+            lo = max(1, self.highest_sent - self.ring + 1)
+            while self._retx_spans and self._retx_tokens >= 1.0:
+                span = self._retx_spans[0]
+                seq = span[0]
+                if seq > span[1]:
+                    self._retx_spans.popleft(); continue
+                span[0] = seq + 1
+                if seq < lo or seq > self.highest_sent:
+                    self.retx_skipped += 1
+                    continue
+                struct.pack_into(">QQ", buf, 12, seq, time.time_ns())
+                try:
+                    self.socks[seq % sock_n].sendto(bytes(buf), (self.peer_addr, self.peer_port))
+                    self.retx_pkts += 1; self.retx_bytes += len(buf)
+                    self._retx_tokens -= 1.0
+                except OSError:
+                    self.errors += 1
+
+    # -- congestion window (called from the ACK-listener thread) -------------
+    def on_ack(self, cum_seq, echo_ns, ce, rcvd_bytes):
+        """Apply one ACK to the congestion window (NSCC-lite, MRC #2). Decrements
+        inflight by the newly-acked bytes (the ack-clock), takes an RTT sample,
+        and grows/shrinks cwnd per the quadrant table (spec 8.2):
+            ECN clear, RTT < target   -> proportional increase (uncongested)
+            ECN clear, RTT >= target  -> fair increase (easing; additive)
+            ECN set,   RTT >= target  -> multiplicative decrease (congested)
+            ECN set,   RTT < target   -> no change (becoming congested)"""
+        if not self.cc:
+            return
+        now = time.time_ns()
+        with self._cc_lock:
+            self.acks_rx += 1
+            if ce:
+                self.ce_acks += 1
+            self.last_ack_mono = time.monotonic()
+            # newly-acked bytes from the sink's cumulative count (ignore stale/
+            # reordered ACKs where the count goes backwards)
+            if rcvd_bytes >= self.prev_rcvd:
+                newly = rcvd_bytes - self.prev_rcvd
+                self.prev_rcvd = rcvd_bytes
+            else:
+                newly = 0
+            self.inflight = max(0.0, self.inflight - float(newly))
+            # RTT sample + base (min) RTT
+            if echo_ns:
+                rtt = now - echo_ns
+                if 0 < rtt < 60_000_000_000:
+                    self.last_rtt_ns = rtt
+                    if self.base_rtt_ns is None or rtt < self.base_rtt_ns:
+                        self.base_rtt_ns = rtt
+            self._cc_adjust(bool(ce))
+
+    def _cc_adjust(self, ce):
+        mss = float(self.payload_size)
+        if self.base_rtt_ns is None or self.last_rtt_ns is None:
+            self.cwnd = min(self.cwnd_max, self.cwnd + mss)   # warm-up ramp
+            return
+        qdelay = self.last_rtt_ns - self.base_rtt_ns
+        self.last_qdelay_ns = qdelay
+        target = self.target_qdelay_ns
+        if ce:
+            if qdelay >= target:
+                self.cwnd = self.cwnd * self.md_factor        # multiplicative decrease
+            # else: ECN set but low delay -> no change
+        else:
+            if qdelay < target:
+                self.cwnd = self.cwnd + mss                   # proportional (fast) increase
+            else:
+                self.cwnd = self.cwnd + mss * (mss / max(self.cwnd, mss))  # fair (additive)
+        if self.cwnd < self.cwnd_min: self.cwnd = self.cwnd_min
+        if self.cwnd > self.cwnd_max: self.cwnd = self.cwnd_max
+
+    def cc_snapshot(self):
+        with self._cc_lock:
+            return {
+                "ev": int(self.ev), "label": self.label,
+                "cwnd_pkts": round(self.cwnd / max(1, self.payload_size), 1),
+                "inflight_pkts": round(self.inflight / max(1, self.payload_size), 1),
+                "rtt_us": round(self.last_rtt_ns / 1000.0, 1) if self.last_rtt_ns else None,
+                "base_rtt_us": round(self.base_rtt_ns / 1000.0, 1) if self.base_rtt_ns else None,
+                "qdelay_us": round(self.last_qdelay_ns / 1000.0, 1),
+                "acks": self.acks_rx, "ce_acks": self.ce_acks,
+            }
+
+    def run(self):
+        # Tagged payload: 28-byte header + filler.
+        # Header: magic(4)|session_nonce(4)|ev_id(2)|flow_idx(2)|seq(8)|send_ns(8)
+        if self.payload_size < HDR_SIZE:
+            self.payload_size = HDR_SIZE
+        buf = bytearray(self.payload_size)
+        struct.pack_into(">4sIHH", buf, 0, MAGIC, self.session_nonce & 0xFFFFFFFF,
+                         int(self.ev) & 0xFFFF, self.flow_idx & 0xFFFF)
+        for i in range(HDR_SIZE, self.payload_size):
+            buf[i] = i & 0xFF
+        mv = memoryview(buf)          # send without copying the payload each packet
+        seq = 0
+        send_idx = 0
+        sock_n = len(self.socks)
+        # ---- credit-based burst pacer --------------------------------------
+        # The previous design slept `interval` (1/pps) between every packet via
+        # stop.wait(). At demo rates interval is hundreds of microseconds, but
+        # the OS scheduler can only honour sleeps to ~1-15ms granularity, so the
+        # achieved rate became whatever the scheduler happened to grant that run
+        # — the cause of the wild run-to-run aggregate variance (5M vs 49M vs
+        # 107M for the same offered rate). Instead, accumulate a packet "credit"
+        # at the target rate and, each TICK, send exactly as many packets as the
+        # real elapsed time earned. A long scheduler sleep just means a larger
+        # next burst, so the AVERAGE rate tracks the target deterministically,
+        # independent of sleep granularity.
+        TICK = 0.005                          # 5 ms pacing quantum
+        MAX_BURST = max(1, int(self.rate_pps * 0.25))  # cap a single catch-up burst
+        MAX_BURST_CC = 512                    # cap a single window burst (cc mode)
+        credit = 0.0
+        last = time.monotonic()
+        cc_log_last = last
+        while not self.stop.is_set():
+            now = time.monotonic()
+            if self.cc:
+                # ---- congestion-window pacing (MRC #2) ----------------------
+                # Send only while inflight < cwnd; the window self-clocks on the
+                # sink's ACKs. A retransmit-timeout (no ACK for ~RTO with data
+                # outstanding) is treated as loss: halve cwnd and clear inflight
+                # so the flow can recover instead of deadlocking.
+                with self._cc_lock:
+                    rto = max(0.10, (self.base_rtt_ns / 1e9 * 4) if self.base_rtt_ns else 0.20)
+                    if self.inflight > 0 and (now - self.last_ack_mono) > rto:
+                        self.cwnd = max(self.cwnd_min, self.cwnd * 0.5)
+                        self.inflight = 0.0
+                        self.last_ack_mono = now
+                    headroom = self.cwnd - self.inflight
+                    budget = int(headroom / self.payload_size) if headroom > 0 else 0
+                budget = min(MAX_BURST_CC, max(0, budget))
+                sent_this_tick = 0
+                while sent_this_tick < budget and not self.stop.is_set():
+                    try:
+                        seq += 1
+                        struct.pack_into(">QQ", buf, 12, seq, time.time_ns())
+                        self.socks[send_idx % sock_n].sendto(mv, (self.peer_addr, self.peer_port))
+                        send_idx += 1
+                        self.pkts += 1; self.bytes += self.payload_size
+                        self.highest_sent = seq
+                        sent_this_tick += 1
+                    except (BlockingIOError, InterruptedError):
+                        seq -= 1            # didn't send: don't burn the seq
+                        self.errors += 1
+                        break
+                    except OSError:
+                        self.errors += 1
+                        break
+                if sent_this_tick:
+                    with self._cc_lock:
+                        self.inflight += sent_this_tick * self.payload_size
+            else:
+                credit += (now - last) * self.rate_pps
+                last = now
+                if credit > MAX_BURST:        # don't hoard during a long stall
+                    credit = MAX_BURST
+                sent_this_tick = 0
+                while credit >= 1.0 and sent_this_tick < MAX_BURST and not self.stop.is_set():
+                    try:
+                        seq += 1
+                        struct.pack_into(">QQ", buf, 12, seq, time.time_ns())
+                        self.socks[send_idx % sock_n].sendto(mv, (self.peer_addr, self.peer_port))
+                        send_idx += 1
+                        self.pkts += 1; self.bytes += self.payload_size
+                        self.highest_sent = seq
+                    except (BlockingIOError, InterruptedError):
+                        # Egress queue full (EAGAIN): the path is congested. Count it
+                        # as offered-but-dropped and stop bursting this tick so a
+                        # congested EV can't spin — it'll retry next tick. credit is
+                        # consumed either way so we don't busy-loop on a full queue.
+                        self.errors += 1
+                        credit -= 1.0
+                        break
+                    except OSError:
+                        self.errors += 1
+                    credit -= 1.0
+                    sent_this_tick += 1
+            # opportunistic retransmission within the token budget
+            if self.enable_retx and self._retx_spans:
+                self._drain_retx(buf, time.monotonic())
+            if self.cc and (now - cc_log_last) >= 2.0:
+                cc_log_last = now
+                snap = self.cc_snapshot()
+                print(f"[cc] {self.label:<20} EV={self.ev:<6} "
+                      f"cwnd={snap['cwnd_pkts']:>7}p inflight={snap['inflight_pkts']:>6}p "
+                      f"rtt={snap['rtt_us']}us base={snap['base_rtt_us']}us "
+                      f"qdelay={snap['qdelay_us']}us acks={snap['acks']} ce={snap['ce_acks']}",
+                      file=sys.stderr)
+            self.stop.wait(TICK)
+        for s in self.socks:
+            try: s.close()
+            except Exception: pass
+
+# ---- driver ----------------------------------------------------------------
+class Driver:
+    def __init__(self, args):
+        self.args = args
+        self.lock = threading.Lock()
+        self.streams = []
+        self.ev_to_stream = {}     # ev_id -> Stream (for NAK dispatch)
+        self.local_stop = None
+        self.last_mode = None
+        self.last_evs  = None
+        # entropy_ports can be driven live by the fabric profile (UDP panel).
+        # We seed from the CLI flag and let apply_state() override from the
+        # watched profile; a change in this value forces a stream rebuild.
+        self._entropy = max(1, getattr(args, "entropy_ports", 1))
+        self.last_entropy = None
+        self._weights = {}        # per-EV adaptive weights (SRv6), from agent
+        self.last_wsig = ()
+        self._reset_at = time.time()
+        self._reset_baseline = 0
+        self.nak_rx = 0
+        import secrets
+        self.session_nonce = secrets.randbits(32)
+        print(f"[probe] session_nonce=0x{self.session_nonce:08x}", file=sys.stderr)
+
+    def _rebuild(self, mode, evs_list):
+        with self.lock:
+            if self.local_stop:
+                self.local_stop.set()
+                for s in self.streams: s.join(timeout=0.3)
+            self.streams = []
+            self.ev_to_stream = {}
+            self.local_stop = threading.Event()
+            stop = self.local_stop
+
+            pairs = []
+            if mode in ("udp", "stev", "srv6") and evs_list:
+                for idx, e in enumerate(evs_list):
+                    ev    = e.get("entropy", 49000 + idx)
+                    label = e.get("path", f"ev-{ev}")
+                    pairs.append((ev, label, idx))
+            else:
+                pairs.append((0, "plain", 0))
+
+            n_streams = max(len(pairs), 1)
+            # Adaptive weighted spray: if the agent has published per-EV weights
+            # (SRv6 only), size each stream's pps by its weight instead of an even
+            # 1/N split. Weights sum to ~1 across the active EVs; a path the agent
+            # has down-weighted (worse latency) sends proportionally fewer pps.
+            # Falls back to even split when no weights are present.
+            weights = getattr(self, "_weights", None) or {}
+            def stream_pps(ev):
+                if self.args.rate:
+                    base = self.args.rate            # explicit per-stream override
+                else:
+                    target_bps = self.args.target_mbps * 1e6
+                    base = target_bps / 8 / self.args.size   # total pps budget
+                if weights and mode == "srv6":
+                    w = weights.get(str(ev), None)
+                    if w is not None:
+                        return max(1, int(base * float(w)))
+                # even split
+                return max(1, int(base / n_streams)) if not self.args.rate else base
+
+            for ev, label, idx in pairs:
+                # Closed-loop auto-deny (MRC #1): the agent zeroes the weight of a
+                # path it has auto-denied. Drop that stream entirely so we STOP
+                # spraying the bad path — the control-plane TWAMP probe keeps
+                # measuring it for recovery. No-op in normal operation: active EVs
+                # always carry a floored weight > 0, so nothing is skipped unless
+                # an EV was explicitly zeroed by the agent.
+                if mode == "srv6" and weights:
+                    _wv = weights.get(str(ev), None)
+                    if _wv is not None and float(_wv) <= 0.0:
+                        continue
+                st = Stream(mode, ev, label, self.args.peer, self.args.port, idx,
+                            stream_pps(ev), self.args.size, stop, self.session_nonce,
+                            entropy_ports=self._entropy,
+                            enable_retx=self.args.enable_retx, ring=self.args.ring,
+                            retx_algo=getattr(self.args, "retx_mode", "auto"),
+                            cc=(getattr(self.args, "cc", "none") == "nscc"),
+                            ecn=getattr(self.args, "ecn", False),
+                            target_qdelay_us=getattr(self.args, "target_qdelay_us", 50.0),
+                            max_cwnd_pkts=getattr(self.args, "cc_max_cwnd", 4096))
+                st.start()
+                self.streams.append(st)
+                self.ev_to_stream[ev & 0xFFFF] = st
+
+            self.last_mode = mode
+            self.last_entropy = self._entropy
+            if mode in ("udp", "stev", "srv6"):
+                self.last_evs = tuple(e[0] for e in pairs)
+            else:
+                self.last_evs = ()
+            self._reset_at = time.time(); self._reset_baseline = 0
+            stream_pps_list = [s.rate_pps for s in self.streams]
+            agg_mbps = (sum(stream_pps_list) * self.args.size * 8) / 1e6
+            spray = f"  entropy-ports={self._entropy}" if self._entropy > 1 else ""
+            retx  = "  retx=on" if self.args.enable_retx else ""
+            wtag  = "  weighted" if (getattr(self, "_weights", None) and mode == "srv6") else ""
+            print(f"[probe] mode={mode}  streams={len(self.streams)}  "
+                  f"target={self.args.target_mbps:.0f} Mbps  "
+                  f"actual={agg_mbps:.1f} Mbps  size={self.args.size}B{spray}{retx}{wtag}  "
+                  f"→ {self.args.peer}:{self.args.port}", flush=True)
+            for s in self.streams:
+                ports = (f"src_ports={s.src_ports[0]}..(+{len(s.src_ports)-1})"
+                         if len(s.src_ports) > 1 else f"src_port={s.src_port}")
+                # per-stream pps / share / Mbps so the actual spray split is
+                # DIRECTLY observable from the log (don't infer it from switch
+                # counters, which conflate shared links + mesh probe traffic).
+                s_mbps = (s.rate_pps * self.args.size * 8) / 1e6
+                share  = (s.rate_pps / sum(stream_pps_list) * 100.0) if sum(stream_pps_list) else 0.0
+                wv = self._weights.get(str(s.ev)) if (getattr(self, "_weights", None) and mode == "srv6") else None
+                wtxt = f"  weight={wv:.3f}" if wv is not None else ""
+                print(f"          {s.label:<22}  EV={s.ev:<6}  "
+                      f"pps={s.rate_pps:<7} {s_mbps:5.1f}Mbps {share:4.1f}%{wtxt}  {ports}",
+                      flush=True)
+
+    def dispatch_nak(self, ev_id, expected_seq):
+        with self.lock:
+            st = self.ev_to_stream.get(ev_id & 0xFFFF)
+        if st:
+            st.enqueue_retx(expected_seq)
+            self.nak_rx += 1
+
+    def dispatch_ack(self, ev_id, cum_seq, echo_ns, ce, rcvd_bytes):
+        with self.lock:
+            st = self.ev_to_stream.get(ev_id & 0xFFFF)
+        if st:
+            st.on_ack(cum_seq, echo_ns, ce, rcvd_bytes)
+
+    def cc_snapshots(self):
+        with self.lock:
+            return [s.cc_snapshot() for s in self.streams if getattr(s, "cc", False)]
+
+    def apply_state(self, state):
+        prof = (state or {}).get("profile") or {}
+        mode = (prof.get("mode") or "none").lower()
+        evs  = prof.get("active_evs") or []
+        full = {e.get("entropy"): e for e in (prof.get("evs") or [])}
+        evs_enriched = []
+        for e in evs:
+            entry = dict(e); ent = e.get("entropy")
+            if ent in full: entry["path"] = full[ent].get("id", entry.get("usid", "?"))
+            evs_enriched.append(entry)
+        # Entropy is a UDP-mode property of the fabric profile (the UDP panel
+        # owns it). The probe picks it up live: a change in entropy_ports forces
+        # a stream rebuild so the spray widens/narrows without relaunching. It's
+        # only meaningful in udp mode (srv6 pins via fwmark, stev encodes the
+        # port itself, none has no EV) — elsewhere we hold it at 1.
+        if mode == "udp":
+            ent_ports = max(1, int(prof.get("entropy_ports", self._entropy) or 1))
+        else:
+            ent_ports = 1
+        self._entropy = ent_ports
+        # Adaptive weighted spray: the agent publishes per-EV weights (SRv6 only)
+        # at the TOP level of the state file (not inside profile). Apply them and
+        # rebuild when they shift meaningfully. We quantise to ~5% buckets so a
+        # tiny slew step doesn't churn the streams every sweep — only a real
+        # redistribution rebuilds.
+        raw_w = (state or {}).get("ev_weights") or {}
+        self._weights = {str(k): float(v) for k, v in raw_w.items()} if raw_w else {}
+        w_sig = tuple(sorted((k, round(v, 2)) for k, v in self._weights.items())) \
+                if (self._weights and mode == "srv6") else ()
+        if mode in ("udp", "stev", "srv6"):
+            evs_sig = tuple(e.get("entropy") for e in evs_enriched)
+        else:
+            evs_sig = ()
+        key = (mode, evs_sig, ent_ports, w_sig)
+        if key != (self.last_mode, self.last_evs, self.last_entropy,
+                   getattr(self, "last_wsig", ())):
+            self.last_wsig = w_sig
+            self._rebuild(mode, evs_enriched)
+
+    def stop(self):
+        with self.lock:
+            if self.local_stop: self.local_stop.set()
+            for s in self.streams: s.join(timeout=0.3)
+            self.streams = []
+            self.ev_to_stream = {}
+
+# ---- NAK listener ----------------------------------------------------------
+def start_nak_listener(drv, nak_port, stop):
+    """Bind the NAK channel and dispatch incoming NAKs to the right stream."""
+    fam = socket.AF_INET6
+    s = socket.socket(fam, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try: s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError): pass
+    try: s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    except Exception: pass
+    try:
+        s.bind(("::", nak_port))
+    except OSError as e:
+        print(f"[probe] NAK listener bind :{nak_port} failed ({e}); retx disabled",
+              file=sys.stderr)
+        return
+    s.settimeout(0.5)
+    print(f"[probe] NAK listener on :{nak_port}", file=sys.stderr)
+    def loop():
+        while not stop.is_set():
+            try:
+                data, addr = s.recvfrom(256)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            # ACK (drives the congestion window) — check first since it's larger
+            if len(data) >= ACK_SIZE and data[:4] == ACK_MAGIC:
+                try:
+                    _m, nonce, ev_id, _fi, cum_seq, echo_ns, ce, rcvd_bytes = \
+                        struct.unpack(ACK_FMT, data[:ACK_SIZE])
+                except struct.error:
+                    continue
+                if nonce != (drv.session_nonce & 0xFFFFFFFF):
+                    continue
+                drv.dispatch_ack(ev_id, cum_seq, echo_ns, ce, rcvd_bytes)
+                continue
+            if len(data) < NAK_SIZE: continue
+            try:
+                magic, nonce, ev_id, flow_idx, exp_seq, rcv_seq = struct.unpack(NAK_FMT, data[:NAK_SIZE])
+            except struct.error:
+                continue
+            if magic != NAK_MAGIC or nonce != (drv.session_nonce & 0xFFFFFFFF):
+                continue
+            drv.dispatch_nak(ev_id, exp_seq)
+        try: s.close()
+        except Exception: pass
+    threading.Thread(target=loop, daemon=True).start()
+
+# ---- main ------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(prog="mrc-probe", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--peer", help="peer tenant address (IPv6 or IPv4). Use --dst to look up by name.")
+    ap.add_argument("--dst", help="destination host name (resolved via controller /api/topology)")
+    ap.add_argument("--src", help="source host name (informational only)")
+    ap.add_argument("--family", choices=["ipv4", "ipv6"], default="ipv6",
+                    help="address family for --dst lookup (default: ipv6)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT,
+                    help=f"destination UDP port (default {DEFAULT_PORT})")
+    ap.add_argument("--target-mbps", type=float, default=100.0,
+                    help="aggregate target bandwidth across ALL streams (default 100)")
+    ap.add_argument("--rate", type=int, default=None,
+                    help="(legacy) per-stream pps. If set, overrides --target-mbps.")
+    ap.add_argument("--size", type=int, default=1024, help="UDP payload size in bytes (default 1024)")
+    ap.add_argument("--state", default=DEFAULT_STATE, help=f"agent state file (default {DEFAULT_STATE})")
+    ap.add_argument("--watch", action=argparse.BooleanOptionalAction, default=True,
+                    help="re-read agent state every 1s and rebuild on changes (default: ON)")
+    ap.add_argument("--duration", type=int, default=0, help="stop after N seconds (0 = until ctrl-c)")
+    ap.add_argument("--bytes", type=int, default=0, dest="bytes_quota",
+                    help="file-transfer mode: stop once aggregate bytes-sent reaches N")
+    # --- ARQ -----------------------------------------------------------------
+    ap.add_argument("--enable-retx", action=argparse.BooleanOptionalAction, default=None,
+                    help="retransmit on NAK. Default: ON in --bytes mode, OFF otherwise. "
+                         "GBN in 'none' mode, selective in MRC modes.")
+    ap.add_argument("--ring", type=int, default=4096,
+                    help="per-stream retx ring depth = max recoverable seqs and "
+                         "the retx rate cap in pkts/sec (default 4096)")
+    ap.add_argument("--retx-mode", choices=["auto", "gbn", "selective"], default="auto",
+                    dest="retx_mode",
+                    help="force the retransmit algorithm regardless of mode: "
+                         "'gbn' resends from the loss to the head (Go-Back-N), "
+                         "'selective' resends only the lost packet. "
+                         "default 'auto' = GBN in none mode, selective in MRC modes.")
+    ap.add_argument("--nak-port", type=int, default=NAK_PORT_DEFAULT,
+                    help=f"UDP port to receive NAKs on (default {NAK_PORT_DEFAULT})")
+    # --- STACK spraying ------------------------------------------------------
+    ap.add_argument("--entropy-ports", type=int, default=1,
+                    help="spread each flow across N source ports (STACK-style). "
+                         "N>1 overrides per-EV encoded src ports. Most meaningful "
+                         "in 'none' mode (default 1 = no spraying).")
+    # --- congestion control (NSCC-lite) + ECN --------------------------------
+    ap.add_argument("--cc", choices=["none", "nscc"], default="none",
+                    help="congestion control. 'none' = fixed-rate pacer (default). "
+                         "'nscc' = per-stream congestion window clocked by the "
+                         "sink's ACKs, grown/shrunk from RTT + ECN (spec 8.2). "
+                         "Requires the updated mrc-sink (sends ACKs).")
+    ap.add_argument("--ecn", action=argparse.BooleanOptionalAction, default=None,
+                    help="set ECT(0) on data packets so the fabric can mark CE "
+                         "(needs ECN-capable switch qdiscs to fire). "
+                         "Default: ON when --cc nscc, else OFF.")
+    ap.add_argument("--target-qdelay-us", type=float, default=50.0,
+                    dest="target_qdelay_us",
+                    help="NSCC target queueing delay in microseconds: cwnd grows "
+                         "while measured qdelay is under this, eases above it "
+                         "(default 50us).")
+    ap.add_argument("--cc-max-cwnd", type=int, default=4096, dest="cc_max_cwnd",
+                    help="upper bound on the congestion window in packets (default 4096)")
+    args = ap.parse_args()
+
+    if args.peer and args.dst:
+        ap.error("--peer and --dst are mutually exclusive (pick one)")
+    if not args.peer and not args.dst:
+        ap.error("specify either --peer <addr> or --dst <host>")
+    if args.duration and args.bytes_quota:
+        ap.error("--duration and --bytes are mutually exclusive")
+    if args.entropy_ports < 1:
+        ap.error("--entropy-ports must be >= 1")
+    # resolve retx default by transfer mode
+    if args.enable_retx is None:
+        args.enable_retx = bool(args.bytes_quota)
+    # ECN defaults on when congestion control is enabled (it's the leading signal)
+    if args.ecn is None:
+        args.ecn = (args.cc == "nscc")
+
+    if args.dst:
+        try:
+            args.peer = resolve_host_via_controller(args.dst, args.family, args.state)
+        except RuntimeError as e:
+            print(f"[probe] {e}", file=sys.stderr); sys.exit(2)
+        print(f"[probe] resolved --dst {args.dst} → {args.peer} ({args.family})", file=sys.stderr)
+
+    import socket as _sock
+    local_host = _sock.gethostname()
+    if args.src and args.src != local_host:
+        print(f"[probe] WARN: --src {args.src} != local hostname {local_host}", file=sys.stderr)
+    src_label = args.src or local_host
+    dst_label = args.dst or "<peer>"
+    mode_hint = "file-transfer" if args.bytes_quota else ("timed" if args.duration else "continuous")
+    print(f"[probe] flow: {src_label} → {dst_label} [{args.peer}]:{args.port}  "
+          f"mode={mode_hint}  retx={'on' if args.enable_retx else 'off'}  "
+          f"entropy-ports={args.entropy_ports}  "
+          f"family={args.family if args.dst else ('v6' if ':' in args.peer else 'v4')}",
+          file=sys.stderr)
+
+    # Singleton guard.
+    import os, subprocess
+    my_pid = os.getpid()
+    try:
+        r = subprocess.run(["pgrep", "-f", "mrc-probe"], capture_output=True, text=True)
+        others = [int(p) for p in r.stdout.split() if p.strip().isdigit() and int(p) != my_pid]
+        if others:
+            print(f"[probe] killing prior mrc-probe instance(s): {others}", file=sys.stderr)
+            for pid in others:
+                try: os.kill(pid, 9)
+                except ProcessLookupError: pass
+            time.sleep(0.5)
+    except FileNotFoundError:
+        pass
+
+    drv = Driver(args)
+    state = read_state(args.state)
+    if not state:
+        print(f"[probe] no agent state at {args.state}; running in plain mode", file=sys.stderr)
+    drv.apply_state(state or {})
+
+    stop = threading.Event()
+    def _sig(*a): stop.set()
+    signal.signal(signal.SIGINT, _sig); signal.signal(signal.SIGTERM, _sig)
+
+    # NAK listener (always on so counters work even if retx is off; dispatch
+    # is a no-op per-stream when retx is disabled)
+    start_nak_listener(drv, args.nak_port, stop)
+
+    if args.watch:
+        def watch():
+            while not stop.is_set():
+                stop.wait(1.0)
+                if stop.is_set(): break
+                s = read_state(args.state)
+                if s: drv.apply_state(s)
+        threading.Thread(target=watch, daemon=True).start()
+
+    def stats():
+        last_b = 0; last_t = time.time()
+        last_reset_at = drv._reset_at
+        # per-EV byte history for computing true per-path TX rate (source-side,
+        # contamination-immune — this is what the probe ACTUALLY sprayed, the
+        # ground truth the dashboard split should use instead of shared-link
+        # switch counters). Reported to the controller keyed by EV.
+        ev_last = {}   # ev -> (ts, cum_bytes)
+        # resolve controller URL from the probe's state file (best-effort)
+        ctrl_url = ""
+        try:
+            _st = read_state(args.state) or {}
+            ctrl_url = ((_st.get("controller") or {}).get("url") or "").rstrip("/")
+        except Exception:
+            ctrl_url = ""
+        def report_tx(rates, src, dst):
+            if not ctrl_url or not rates:
+                return
+            try:
+                body = _json.dumps({"src": src, "dst": dst,
+                                    "evs": [{"ev": ev, "bps": bps} for ev, bps in rates.items()]}).encode()
+                req = urllib.request.Request(ctrl_url + "/api/probe-tx", data=body,
+                                             headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=2).read()
+            except Exception:
+                pass   # telemetry is best-effort; never disrupt the test
+        while not stop.is_set():
+            stop.wait(2.0)
+            if stop.is_set(): break
+            now = time.time()
+            if drv._reset_at != last_reset_at:
+                last_b = 0; last_t = drv._reset_at; last_reset_at = drv._reset_at
+                ev_last.clear()
+            dt = max(now - last_t, 1e-3)
+            tot_p = sum(s.pkts  for s in drv.streams)
+            tot_b = sum(s.bytes for s in drv.streams)
+            tot_e = sum(s.errors for s in drv.streams)
+            tot_rt = sum(s.retx_pkts for s in drv.streams)
+            db = max(tot_b - last_b, 0)
+            mbps = (db * 8.0) / dt / 1e6
+            per_stream = "  ".join(f"{s.label}({s.pkts}p)" for s in drv.streams)
+            rt = f"  retx={tot_rt}  nak_rx={drv.nak_rx}" if args.enable_retx else ""
+            print(f"[probe] {tot_p:>8}p  {tot_b:>12}B  {mbps:>6.2f} Mbps over {dt:.1f}s  "
+                  f"err={tot_e}{rt}   {per_stream}", flush=True)
+            # true per-EV TX rate (diff cumulative bytes per stream) -> controller
+            ev_rates = {}
+            for s in drv.streams:
+                ev = s.ev; cum = s.bytes
+                prev = ev_last.get(ev); ev_last[ev] = (now, cum)
+                if prev:
+                    edt = now - prev[0]; edb = cum - prev[1]
+                    if edt > 0.05 and edb >= 0:
+                        ev_rates[ev] = (edb * 8.0) / edt
+            report_tx(ev_rates, args.src, args.dst)
+            last_b = tot_b; last_t = now
+    threading.Thread(target=stats, daemon=True).start()
+
+    deadline = time.time() + args.duration if args.duration > 0 else None
+    quota    = args.bytes_quota if args.bytes_quota > 0 else None
+    start_t  = time.time()
+    quota_hit_reason = None
+    while not stop.is_set():
+        if deadline and time.time() >= deadline:
+            quota_hit_reason = f"--duration {args.duration}s elapsed"; break
+        if quota:
+            tot = sum(s.bytes for s in drv.streams)
+            if tot >= quota:
+                quota_hit_reason = f"--bytes {quota:,} reached ({tot:,} sent)"; break
+        time.sleep(0.2 if quota else 0.5)
+
+    snap = [(s.label, s.ev, s.pkts, s.bytes, s.errors, s.retx_pkts, s.retx_bytes, s.retx_skipped)
+            for s in drv.streams]
+    drv.stop()
+    elapsed = time.time() - start_t
+    tot_p = sum(x[2] for x in snap)
+    tot_b = sum(x[3] for x in snap)
+    tot_e = sum(x[4] for x in snap)
+    tot_rt = sum(x[5] for x in snap)
+    tot_rb = sum(x[6] for x in snap)
+    avg_mbps = (tot_b * 8.0) / max(elapsed, 1e-3) / 1e6
+    print(f"[probe] stopped — {quota_hit_reason or 'signal'}", file=sys.stderr)
+    print(f"[probe] sent: pkts={tot_p:,}  bytes={tot_b:,}  errors={tot_e}  "
+          f"elapsed={elapsed:.2f}s  avg={avg_mbps:.1f} Mbps", file=sys.stderr)
+    if args.enable_retx:
+        retx_pct = (100.0 * tot_rt / tot_p) if tot_p else 0.0
+        print(f"[probe] retx: pkts={tot_rt:,}  bytes={tot_rb:,}  "
+              f"({retx_pct:.2f}% of sent)  naks_received={drv.nak_rx:,}", file=sys.stderr)
+    for label, ev, pkts, bytes_, errs, rtp, rtb, rsk in snap:
+        extra = f"  retx={rtp:,}" if args.enable_retx else ""
+        print(f"        {label:<22}  EV={ev:<6}  pkts={pkts:>10,}  bytes={bytes_:>14,}{extra}",
+              file=sys.stderr)
+    if quota:
+        print(f"[probe] check receiver-side: `mrc show ev-counters` on "
+              f"{args.dst or 'the destination host'}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

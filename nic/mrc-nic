@@ -1,0 +1,2420 @@
+#!/usr/bin/env python3
+"""
+mrc-nic — standalone host-side virtual MRC NIC (Pollara/Thor-class emulation).
+
+Maintains a persistent SSE subscription to the mrc-fabric controller and
+programs the host dataplane to match the served EV profile in real time:
+
+  - lifecycle of the `mrc0` dummy interface (the host's tenant identity surface)
+  - the host's tenant IPv6 address lives on mrc0 (decoupled from any underlay)
+  - seg6 encap routes to peer tenant addresses (single-path OR ECMP multipath)
+  - L4 multipath hashing sysctl
+  - posts underlay byte counters back to the controller for real telemetry
+  - writes its full state to a local state file so `mrc-agent status` (and any
+    other tool on the host) can see everything in one place, instantly
+
+Any application sending to a peer tenant address picks up the agent's current
+state — apps stay MRC-unaware; the agent is the MRC endpoint.
+
+Commands:
+  mrc-nic run --tenant ADDR --underlay IF [--profile FILE]   (standalone, no controller)
+  mrc-nic run --tenant ADDR --underlay IF --controller URL   (controller-driven, legacy)
+  mrc-agent status  [--watch] [--json] [--state PATH]
+  mrc-agent paths   [--state PATH]
+  mrc-agent test    --controller URL
+"""
+import argparse, json, os, re, signal, socket, struct, subprocess, sys, tempfile, threading, time
+from urllib import request as urlreq, error as urlerr
+
+DEFAULT_IFACE   = "mrc0"
+MRC_NIC_BUILD   = "2026-06-25-g13-aggregated-routes"  # bump on every change; printed at startup
+DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
+METRICS_PERIOD  = 1.0
+RECONNECT_BASE  = 1.0
+RECONNECT_CAP   = 30.0
+VERSION         = "0.2"
+
+def run(cmd, check=False, capture=False, timeout=None):
+    r = subprocess.run(cmd, shell=isinstance(cmd, str),
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None,
+                       text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"cmd failed ({r.returncode}): {cmd}\n{r.stderr}")
+    return r
+
+# ---- shared agent state (single writer: the run-loop) ---------------------
+class State:
+    """Thread-safe-ish state object, written to disk atomically on every change.
+    Single writer pattern: the SSE thread updates `profile`/`kernel`/`controller`,
+    the metrics thread updates `counters`. We use a lock around the dict mutation
+    and the write."""
+    def __init__(self, path, agent_meta):
+        self.path = path
+        self.lock = threading.Lock()
+        self.data = {
+            "version": 1, "agent_version": VERSION,
+            "agent": agent_meta,
+            "controller": {
+                "url": agent_meta.get("controller_url", ""),
+                "status": "starting",
+                "last_event_at": 0, "events_received": 0, "reconnects": 0,
+            },
+            "profile": None,           # last received profile (full snapshot)
+            "peers": {},               # standalone: ALL active peers keyed by dst
+            "kernel": {
+                "route_dst": None, "n_paths": 0,
+                "last_program_at": 0, "last_program_ok": None,
+                "last_program_error": None,
+            },
+            "counters": {
+                "iface": agent_meta.get("underlay"),
+                "tx_bytes_total": 0, "rx_bytes_total": 0,
+                "tx_bps_1s": 0.0, "rx_bps_1s": 0.0,
+                "sampled_at": 0,
+            },
+        }
+
+    def update(self, section, **kw):
+        with self.lock:
+            self.data.setdefault(section, {}).update(kw)
+            self.data["agent"]["uptime_s"] = int(time.time() - self.data["agent"]["started_at"])
+            self._flush()
+
+    def set(self, section, value):
+        with self.lock:
+            self.data[section] = value
+            self.data["agent"]["uptime_s"] = int(time.time() - self.data["agent"]["started_at"])
+            self._flush()
+
+    def get(self, section, default=None):
+        """Thread-safe read of a top-level section (returns a shallow copy for
+        dict sections so callers can't mutate internal state without the lock)."""
+        with self.lock:
+            v = self.data.get(section, default)
+            return dict(v) if isinstance(v, dict) else v
+
+    def _flush(self):
+        # atomic write: write to tmp + rename
+        try:
+            d = os.path.dirname(self.path) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".mrc-agent.", dir=d)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.data, f, indent=2)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            sys.stderr.write(f"[state] write failed: {e}\n")
+
+def resolve_state_path(requested):
+    """If the default /run path isn't writable, fall back to /tmp."""
+    if requested != DEFAULT_STATE:
+        return requested
+    try:
+        os.makedirs("/run", exist_ok=True)
+        with open("/run/.mrc-agent-probe", "w") as f: f.write("ok")
+        os.unlink("/run/.mrc-agent-probe")
+        return "/run/mrc-agent.json"
+    except (PermissionError, OSError):
+        return "/tmp/mrc-agent.json"
+
+# ---- dataplane ------------------------------------------------------------
+class Dataplane:
+    def __init__(self, iface, tenant_addr, underlay, dry_run=False):
+        self.iface = iface; self.tenant = tenant_addr; self.underlay = underlay
+        self.dry = dry_run
+        self.installed_route_dst = None
+        self.installed_segs = []
+        # Per-EV (fwmark, table) rule tracker for explicit SRv6 path selection.
+        # The agent installs one rule per active EV — mrc-probe stamps each
+        # stream's socket with SO_MARK = EV value, and the kernel routes via
+        # that EV's private table (single-nexthop SRv6 encap) instead of the
+        # main-table multipath route (which hashes ephemeral src ports onto
+        # nexthops and can collide several streams onto the same path).
+        # Set of int EV values currently installed; cleared on mode change.
+        self._installed_marks = set()
+
+    def _ip(self, args):
+        cmd = ["ip"] + args
+        if self.dry: print("[dry] " + " ".join(cmd)); return 0, ""
+        r = run(cmd, capture=True)
+        if r.returncode != 0:
+            sys.stderr.write(f"[ip] {' '.join(args)} -> {r.returncode}: {r.stderr.strip()}\n")
+        return r.returncode, r.stderr or ""
+
+    def bring_up(self):
+        # mrc0 is a marker/identity dummy. The tenant address itself stays on
+        # the underlay (eth1) where the leaf's uA SID needs it to be ND-resolvable
+        # as a nexthop. Putting the address on mrc0 as well (with /128 winning
+        # longest-prefix-match) routed decapped packets into the dummy and
+        # silently dropped them — discovered the hard way.
+        if self.dry:
+            for c in [["link", "add", self.iface, "type", "dummy"],
+                      ["link", "set", self.iface, "up"]]:
+                self._ip(c)
+            print(f"[dp:dry] {self.iface} up (marker), tenant {self.tenant} on underlay={self.underlay}")
+            self.install_decap()
+            return
+        if run(["ip", "link", "show", self.iface], capture=True).returncode != 0:
+            self._ip(["link", "add", self.iface, "type", "dummy"])
+        self._ip(["link", "set", self.iface, "up"])
+        run("sysctl -w net.ipv6.fib_multipath_hash_policy=1 >/dev/null 2>&1", capture=True)
+        # seg6 decap only fires if the INGRESS interface has seg6_enabled=1. The packet
+        # arrives on the underlay (eth1), not mrc0, so enabling it just on mrc0 isn't enough.
+        # Enable on all + 'all'/'default' so a late-added iface inherits it. Report what took.
+        self._enable_seg6()
+        print(f"[dp] {self.iface} up (marker), tenant {self.tenant} on underlay={self.underlay}")
+        self.install_decap()
+
+    def _enable_seg6(self):
+        if self.dry:
+            print("[dp:dry] would enable seg6 on all ipv6 interfaces")
+            return
+        enabled = []
+        # the per-interface knobs + the global all/default
+        import glob as _glob
+        for path in _glob.glob("/proc/sys/net/ipv6/conf/*/seg6_enabled"):
+            try:
+                with open(path, "w") as f:
+                    f.write("1")
+                enabled.append(path.split("/")[-2])
+            except OSError:
+                pass
+        # forwarding too (needed for the kernel to process+forward SRv6)
+        run("sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1", capture=True)
+        if enabled:
+            print(f"[dp] seg6_enabled set on: {', '.join(sorted(enabled))}")
+        else:
+            sys.stderr.write("[dp] WARNING: could not set seg6_enabled on any interface "
+                             "— SRv6 decap will not fire. Check /proc/sys/net/ipv6/conf/*/seg6_enabled\n")
+
+    def _check_iproute2_capability(self):
+        """Detect iproute2 too old for uSID/NEXT-C-SID decap. The route installs on
+        old tools but the kernel's uSID terminal decap never fires (validated on the
+        network-multitool image: iproute2 5.6.0 / 2020 -> 100% silent loss even for a
+        local self-decap). NEXT-C-SID landed in iproute2 6.1. We parse `ip -V` and warn
+        hard so this never silently eats packets again."""
+        if self.dry:
+            return
+        try:
+            r = run(["ip", "-V"], capture=True)
+            ver = (r.stdout or "").strip()
+        except (FileNotFoundError, OSError, Exception):
+            ver = ""
+        # ip -V prints e.g. "ip utility, iproute2-6.1.0" or older "iproute2-ss200330"
+        import re as _re
+        m = _re.search(r"iproute2-(?:ss(\d{6})|v?(\d+)\.(\d+))", ver)
+        too_old = False
+        detail = ver or "unknown"
+        if m:
+            if m.group(1):           # ss-dated build (e.g. ss200330 = 2020-03-30) -> pre-6.1
+                too_old = True
+                detail = f"{ver} (dated build, pre-NEXT-C-SID)"
+            else:
+                major, minor = int(m.group(2)), int(m.group(3))
+                if (major, minor) < (6, 1):
+                    too_old = True
+        if too_old:
+            sys.stderr.write(
+                "[dp] *** CAPABILITY WARNING ***\n"
+                f"[dp] iproute2 is too old for SRv6 uSID/NEXT-C-SID decap: {detail}\n"
+                "[dp] The decap route will install but the kernel's uSID End.DT6 will\n"
+                "[dp] NOT fire — packets reach this NIC and are silently dropped.\n"
+                "[dp] FIX: use a GPU image with iproute2 >= 6.1 (Debian bookworm ships 6.1;\n"
+                "[dp] trixie 6.15). NEXT-C-SID requires kernel >= 6.1 AND iproute2 >= 6.1.\n"
+                "[dp] (Proven leaf-decap fabric — spec_mode=false — works on the current image.)\n")
+            self._iproute2_too_old = True
+        else:
+            self._iproute2_too_old = False
+            print(f"[dp] iproute2 capability OK for uSID decap: {detail}")
+
+    def install_decap(self):
+        """MRC-faithful model: the destination NIC decapsulates its own traffic.
+
+        In the original SONiC fabric the leaf owned End.DT6 and the NIC never
+        decapped. Per the MRC spec the inner DA is the NIC's own tenant address,
+        so the receiving NIC strips the outer IPv6+SRH before delivery. We install
+        a local seg6 decap endpoint matching THIS NIC's tenant address.
+
+        We ALSO install a route for the SRv6 carrier block via the leaf gateway,
+        so that the encapsulated packet (outer DA = a fc00:/fcbb: carrier) is
+        routable off the host. Without this the encap route exists but the packet
+        has no nexthop and is dropped — the GPU only knows its own /64 + the GPU
+        aggregate otherwise.
+        """
+        if not self.tenant:
+            return
+        # 0) CAPABILITY PREFLIGHT — the decap silently no-ops on iproute2 too old for
+        # NEXT-C-SID/uSID (anything < ~6.1; the network-multitool Alpine image ships
+        # 5.6.0 from 2020). Detect and SHOUT, because a stale tool installs the route
+        # but the kernel's uSID decap never completes — hours-of-debugging-silent.
+        self._check_iproute2_capability()
+        # 1) carrier-block reachability: route the uSID blocks toward the leaf gw.
+        # The encapsulated packet's outer DA is a carrier (fc00:/fcbb:) that only
+        # the leaf knows how to forward, so we must send it VIA the leaf gateway,
+        # not treat the carrier as on-link. The gateway sits on the connected /64;
+        # we prime its neighbor entry first (a `via` to an unresolved neighbor can
+        # answer "Host is unreachable" before ND completes).
+        gw = self._underlay_gateway()
+        if gw:
+            self._prime_neighbor(gw)
+            for blk in ("fc00::/16", "fcbb:bb00::/32"):
+                ok = False
+                for _attempt in range(3):
+                    rc, _ = self._ip(["-6", "route", "replace", blk, "via", gw, "dev", self.underlay])
+                    if rc == 0:
+                        ok = True
+                        break
+                    self._prime_neighbor(gw)   # re-resolve and retry
+                    time.sleep(0.3)
+                if not ok:
+                    sys.stderr.write(f"[dp] WARNING: carrier route {blk} via {gw} failed after retries\n")
+            print(f"[dp] carrier-block routes (fc00::/16, fcbb:bb00::/32) via {gw} dev {self.underlay}")
+        else:
+            sys.stderr.write("[dp] WARNING: no leaf gateway found — carrier block not routed.\n")
+        # 2) decap SID(s) = the NIC's tenant address AND (spec-mode) its decap uSID.
+        #
+        # PROVEN RECIPE (validated on the wire, kernel 6.8 + iproute2 6.1):
+        # A bare `End.DT6 table main dev mrc0` route does NOT fire — the arriving packet
+        # has a non-local DA, so the kernel sends it down the FORWARD path and never hands
+        # it to seg6local (counter stays 0, Ip6InDiscards climbs). The fix is the canonical
+        # Linux "MyLocalSID" pattern:
+        #   (a) a high-priority FIB rule steers the SID prefix into a dedicated localsid
+        #       table  ->  ip -6 rule add prio 50 to <sid>/48 lookup 100
+        #   (b) the End.DT6 SID lives in that table, decapping with the inner lookup in the
+        #       LOCAL table (255) where the GPU's own address actually resides (table main
+        #       errors; table 255 delivers to the local stack and ICMP responds).
+        # The carrier-block route installed in step (1) lets the GPU's own encapped REPLIES
+        # egress; without it replies are generated but "Network is unreachable" on send.
+        LOCALSID_TABLE = "100"
+        decap_targets = [self.tenant]
+        spec_sid = getattr(self, "decap_sid", None)
+        if spec_sid and spec_sid not in decap_targets:
+            decap_targets.append(spec_sid)
+        for tgt in decap_targets:
+            # /64 for a uSID decap SID (block:9LLL:GGGG::/64), /128 for the tenant host SID.
+            prefixlen = "64" if (spec_sid and tgt == spec_sid) else "128"
+            sidpfx = f"{tgt}/{prefixlen}"
+            # (a) steer the SID prefix to the localsid table. Delete any stale copy first
+            #     (rule adds are not idempotent; a silent dup or leftover blocks the path).
+            self._ip(["-6", "rule", "del", "prio", "50", "to", sidpfx, "lookup", LOCALSID_TABLE])
+            rc_rule, err_rule = self._ip(["-6", "rule", "add", "prio", "50", "to", sidpfx,
+                                          "lookup", LOCALSID_TABLE])
+            if rc_rule != 0:
+                sys.stderr.write(f"[dp] WARNING: localsid rule for {sidpfx} failed: {err_rule}\n")
+            # (b) install End.DT6 in the localsid table, inner lookup in the LOCAL table (255).
+            installed = False
+            for inner_tbl in ("255", "254"):   # 255=local (proven); 254=main fallback
+                rc, err = self._ip(["-6", "route", "replace", sidpfx, "table", LOCALSID_TABLE,
+                                    "encap", "seg6local", "action", "End.DT6",
+                                    "count", "table", inner_tbl, "dev", self.underlay])
+                if rc == 0:
+                    installed = True
+                    self._decap_installed = True
+                    print(f"[dp] decap (End.DT6) installed for {sidpfx} "
+                          f"(localsid table {LOCALSID_TABLE}, inner lookup table {inner_tbl})")
+                    break
+            if not installed:
+                sys.stderr.write(f"[dp] WARNING: could not install NIC decap for {sidpfx} "
+                                 f"— validate seg6local action on this kernel\n")
+
+    def remove_decap(self):
+        if not getattr(self, "_decap_installed", False):
+            return
+        self._ip(["-6", "route", "del", f"{self.tenant}/128"])
+        self._decap_installed = False
+
+    def tear_down(self):
+        self.remove_decap()
+        self._ip(["link", "del", self.iface])
+
+    def _prime_neighbor(self, addr, timeout=3.0):
+        """Resolve a nexthop's neighbor entry and BLOCK until it's usable, so a
+        subsequent `via <addr>` route doesn't race ahead of ND and fail with
+        'Host is unreachable'. ND is async: the manual sequence works because the
+        commands are seconds apart, but the NIC fires them back-to-back. We ping
+        to kick off resolution, then poll `ip neigh` until the entry is
+        REACHABLE/STALE/DELAY/PROBE (any state with a known lladdr is routable).
+        Best-effort within timeout."""
+        if self.dry or not addr:
+            return True
+        run(["ping6", "-c", "1", "-W", "1", "-I", self.underlay, addr], capture=True)
+        deadline = time.time() + timeout
+        good = ("REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT")
+        while time.time() < deadline:
+            r = run(["ip", "-6", "neigh", "show", addr, "dev", self.underlay], capture=True)
+            out = (r.stdout or "").strip()
+            if out and "lladdr" in out and any(s in out for s in good):
+                return True
+            # keep nudging resolution
+            run(["ping6", "-c", "1", "-W", "1", "-I", self.underlay, addr], capture=True)
+            time.sleep(0.3)
+        # last resort: force a permanent-ish entry so the route can install
+        r = run(["ip", "-6", "neigh", "show", addr, "dev", self.underlay], capture=True)
+        if r.stdout and "lladdr" in r.stdout:
+            return True
+        sys.stderr.write(f"[dp] WARNING: neighbor {addr} not resolved after {timeout}s; "
+                         f"via routes may fail until it is.\n")
+        return False
+
+    def _underlay_gateway(self):
+        """Find the IPv6 gateway reachable via the underlay (the GPU's leaf gw).
+        Linux requires `via <gw>` on each nexthop for IPv6 multipath.
+
+        Strategy, most-specific first:
+          1. an explicit gateway passed in (self.gateway), if set;
+          2. the `via` of the SRv6 carrier-block route (fc00::/16 or fcbb:bb00::/32),
+             if the host has one (installed by the generator / srv6-ping);
+          3. the `via` of the GPU aggregate route (fd00:9::/32-ish) — the leaf gw;
+          4. the first non-link-local nexthop on the underlay's default-ish routes.
+        Returns the gateway string, or None if nothing usable is found.
+        """
+        if self.dry:
+            return "fe80::1"
+        if getattr(self, "gateway", None):
+            return self.gateway
+        targets = ["fc00::/16", "fcbb:bb00::/32", "fc00:0000::/32",
+                   "fd00:9::/32", "fd00:9:1::/48", "2001:db8:cccc::/48"]
+        for target in targets:
+            r = run(["ip", "-6", "route", "show", target], capture=True)
+            if r.returncode != 0 or not r.stdout:
+                continue
+            toks = r.stdout.split()
+            if "via" in toks:
+                return toks[toks.index("via") + 1]
+        # last resort: any route on the underlay that has a `via`
+        r = run(["ip", "-6", "route", "show", "dev", self.underlay], capture=True)
+        if r.returncode == 0 and r.stdout:
+            for line in r.stdout.splitlines():
+                t = line.split()
+                if "via" in t:
+                    gw = t[t.index("via") + 1]
+                    if not gw.startswith("fe80"):
+                        return gw
+        return None
+
+    def program_srv6(self, peer_dst, ev_stacks):
+        """SRv6 kernel encap with explicit per-EV path pinning.
+
+        ev_stacks is a list of {entropy: int, usid: str} dicts. We install:
+
+          (a) Main-table route to peer_dst with all stacks as ECMP nexthops.
+              This is the fallback for any socket WITHOUT an SO_MARK — kernel
+              hashes ephemeral src port → nexthop → encap. Same behaviour as
+              before, kept so non-MRC traffic (ping, etc.) still works.
+
+          (b) One private route table per EV, containing a single-nexthop
+              route to peer_dst encapped with THIS EV's uSID stack.
+
+          (c) One `ip -6 rule fwmark <EV> table <EV>` per EV.
+
+        mrc-probe sets SO_MARK = EV on each stream's socket when in SRv6
+        mode, so the kernel route lookup hits the fwmark rule, hits the
+        private table, applies the single-nexthop encap — fully deterministic
+        per-EV path selection. Without this, the lab demonstrated 2-of-4
+        paths used because four ephemeral src ports hashed onto two
+        nexthops, which defeats the whole point of explicit SRv6 source
+        routing. Returns (ok, err)."""
+        if not peer_dst or not ev_stacks: return False, "empty profile"
+        usid_stacks = [e["usid"] for e in ev_stacks if e.get("usid")]
+        if not usid_stacks: return False, "no usids in profile"
+
+        # --- (a) main-table route (fallback for unmarked sockets) ----------
+        # The encap nexthop must point at the leaf gateway (the outer DA is a
+        # carrier only the leaf forwards), so we use `via gw`. All nexthops share
+        # the one underlay to the one connected gateway. We prime the gateway's
+        # neighbor entry first so the `via` resolves (else "Host is unreachable").
+        # The main-table route is only a fallback for unmarked sockets; the per-EV
+        # fwmark routes below are the real path-pinning, so if (a) fails we log and
+        # STILL install (b)/(c) rather than aborting.
+        gw = self._underlay_gateway()
+        if gw:
+            self._prime_neighbor(gw)
+        cmd = ["ip", "-6", "route", "replace", f"{peer_dst}/128"]
+        if len(usid_stacks) == 1:
+            seg = ["encap", "seg6", "mode", "encap", "segs", usid_stacks[0]]
+            cmd += seg + (["via", gw, "dev", self.underlay] if gw else ["dev", self.underlay])
+        elif gw:
+            for u in usid_stacks:
+                cmd += ["nexthop", "encap", "seg6", "mode", "encap", "segs", u,
+                        "via", gw, "dev", self.underlay, "weight", "1"]
+        else:
+            # no gateway resolvable — fall back to a single-nexthop dev route so at
+            # least one path works; per-EV routes below still give full pinning.
+            cmd += ["encap", "seg6", "mode", "encap", "segs", usid_stacks[0],
+                    "dev", self.underlay]
+        if self.dry:
+            print("[dry] " + " ".join(cmd))
+        else:
+            r = run(cmd, capture=True)
+            if r.returncode != 0:
+                sys.stderr.write(f"[dp] main-table ECMP fallback failed (non-fatal, "
+                                 f"per-EV routes still installed): {r.stderr.strip()}\n")
+
+        # --- (b) + (c) per-EV deterministic routes via fwmark --------------
+        # Drop any stale per-EV rules first (e.g., the previous mode left them
+        # behind, or the EV set changed). Then install the current set.
+        self._clear_per_ev_marks()
+        per_ev_ok = 0
+        for e in ev_stacks:
+            ev   = e.get("entropy")
+            usid = e.get("usid")
+            if not isinstance(ev, int) or not usid: continue
+            # Use the EV value as both fwmark and table-id — they're naturally
+            # unique per EV (49000-range) and well clear of system tables
+            # (local=255, main=254, default=253).
+            table = ev
+            if self.dry:
+                print(f"[dry] ip -6 route replace {peer_dst}/128 "
+                      f"encap seg6 mode encap segs {usid} dev {self.underlay} "
+                      f"table {table}")
+                print(f"[dry] ip -6 rule add fwmark {ev} table {table} pref 100")
+                self._installed_marks.add(ev); per_ev_ok += 1
+                continue
+            r1 = run(["ip", "-6", "route", "replace", f"{peer_dst}/128",
+                      "encap", "seg6", "mode", "encap", "segs", usid,
+                      "dev", self.underlay, "table", str(table)], capture=True)
+            r2 = run(["ip", "-6", "rule", "add", "fwmark", str(ev),
+                      "table", str(table), "pref", "100"], capture=True)
+            if r1.returncode == 0 and r2.returncode == 0:
+                self._installed_marks.add(ev); per_ev_ok += 1
+            else:
+                msg = (r1.stderr or "").strip() or (r2.stderr or "").strip()
+                sys.stderr.write(f"[dp] per-EV install for ev={ev} failed: {msg}\n")
+
+        self.installed_route_dst = peer_dst
+        self.installed_segs = list(usid_stacks)
+        kind = "ECMP" if len(usid_stacks) > 1 else "single"
+        print(f"[dp] srv6 route -> {peer_dst} via {kind} "
+              f"({len(usid_stacks)} path) + {per_ev_ok} per-EV fwmark rules")
+        return True, None
+
+    def _clear_per_ev_marks(self):
+        """Remove all per-EV fwmark rules + their route tables installed by
+        a previous program_srv6 call. Idempotent — silently ignores ENOENT."""
+        for ev in list(self._installed_marks):
+            table = ev
+            if self.dry:
+                print(f"[dry] ip -6 rule del fwmark {ev} table {table}")
+                print(f"[dry] ip -6 route flush table {table}")
+            else:
+                run(["ip", "-6", "rule", "del", "fwmark", str(ev),
+                     "table", str(table), "pref", "100"], capture=True)
+                run(["ip", "-6", "route", "flush", "table", str(table)],
+                    capture=True)
+        self._installed_marks.clear()
+
+    def clear_encap(self, peer_dst):
+        """Remove any agent-installed encap route to peer_dst. Used between
+        mode switches so a leftover SRv6 route doesn't shadow plain RoCE or
+        app-driven UDP/STEV encap on the next mode. Also clears all per-EV
+        fwmark rules + their private route tables (installed by program_srv6
+        for explicit per-EV path selection)."""
+        self._clear_per_ev_marks()
+        if not peer_dst: return
+        if self.dry:
+            print(f"[dry] ip -6 route del {peer_dst}/128 (clear)")
+        else:
+            run(["ip", "-6", "route", "del", f"{peer_dst}/128"], capture=True)
+        self.installed_route_dst = None
+        self.installed_segs = []
+
+# ---- counters -------------------------------------------------------------
+def _stats(iface):
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/tx_bytes") as f: tx = int(f.read())
+        with open(f"/sys/class/net/{iface}/statistics/rx_bytes") as f: rx = int(f.read())
+        return tx, rx
+    except FileNotFoundError:
+        return None, None
+
+class MetricsPoster(threading.Thread):
+    def __init__(self, controller, host, iface, state, dp, period=METRICS_PERIOD):
+        super().__init__(daemon=True)
+        self.controller = controller.rstrip("/"); self.host = host; self.iface = iface
+        self.state = state; self.dp = dp; self.period = period
+        self.stop = threading.Event()
+        self.last_tx = self.last_rx = self.last_ts = None
+
+    def run(self):
+        while not self.stop.is_set():
+            tx, rx = _stats(self.iface); ts = time.time()
+            tx_bps = rx_bps = 0.0
+            if tx is not None and self.last_tx is not None:
+                dt = ts - self.last_ts
+                if dt > 0:
+                    tx_bps = max(0.0, (tx - self.last_tx) * 8.0 / dt)
+                    rx_bps = max(0.0, (rx - self.last_rx) * 8.0 / dt)
+            if tx is not None:
+                self.state.update("counters", iface=self.iface,
+                                  tx_bytes_total=tx, rx_bytes_total=rx,
+                                  tx_bps_1s=tx_bps, rx_bps_1s=rx_bps,
+                                  sampled_at=ts)
+                self._post(tx_bps, rx_bps)
+            self.last_tx, self.last_rx, self.last_ts = tx, rx, ts
+            self.stop.wait(self.period)
+
+    def _post(self, tx_bps, rx_bps):
+        body = json.dumps({
+            "host": self.host, "iface": self.iface,
+            "eth_tx_bps": tx_bps, "eth_rx_bps": rx_bps,
+            "routes": len(self.dp.installed_segs),
+        }).encode()
+        req = urlreq.Request(f"{self.controller}/api/metrics", data=body,
+                             headers={"Content-Type": "application/json"})
+        try: urlreq.urlopen(req, timeout=2).read()
+        except (urlerr.URLError, socket.timeout): pass
+        # Also forward mrc-sink stats if present — per-EV NAK/OOO/latency.
+        self._post_evstats()
+
+    def _post_evstats(self):
+        try:
+            with open("/run/mrc-sink.json", "r") as f:
+                snap = json.load(f)
+        except (OSError, ValueError):
+            return
+        body = json.dumps({
+            "host": self.host,
+            "ts":   snap.get("ts"),
+            "evs":  snap.get("evs", []),
+            "total_rx":  snap.get("total_rx", 0),
+            "total_bad": snap.get("total_bad", 0),
+        }).encode()
+        req = urlreq.Request(f"{self.controller}/api/ev-stats", data=body,
+                             headers={"Content-Type": "application/json"})
+        try: urlreq.urlopen(req, timeout=2).read()
+        except (urlerr.URLError, socket.timeout): pass
+
+# ---- test-runner job runner ------------------------------------------------
+PROBE_BIN = os.environ.get("MRC_PROBE_BIN", "mrc-probe")
+
+class JobRunner:
+    """Subscribes to the controller's jobs SSE channel and, for every job where
+    THIS host is the source, launches an `mrc-probe` to match — and kills it
+    when the job leaves the active set. This is what makes a test fully runnable
+    from the Web UI: the controller only broadcasts intent; the agent (already
+    on each host) does the privileged spawn locally. No docker socket anywhere.
+    """
+    def __init__(self, controller, host, stop_evt):
+        self.controller = controller.rstrip("/"); self.host = host
+        self.stop = stop_evt
+        self.procs = {}            # job_id -> subprocess.Popen
+        self.lock = threading.Lock()
+
+    def _report(self, jid, state, **kw):
+        body = json.dumps({"id": jid, "host": self.host, "state": state, **kw}).encode()
+        req = urlreq.Request(f"{self.controller}/api/jobs/status", data=body,
+                             headers={"Content-Type": "application/json"})
+        try: urlreq.urlopen(req, timeout=2).read()
+        except (urlerr.URLError, socket.timeout): pass
+
+    def _build_cmd(self, job):
+        # --watch (default) lets the probe re-read the agent's live profile
+        # state (/run/mrc-agent.json) every second and rebuild its EV streams
+        # when the active set changes. This is what makes deny/restore take
+        # effect DURING a running test: deny a path -> controller drops the EV
+        # -> agent re-programs seg6 + rewrites the state file -> the probe drops
+        # that EV's stream. Previously conductor jobs were spawned --no-watch,
+        # so a denied path kept being sprayed (its packets just fell through to
+        # the main-table route) and the deny appeared to do nothing live.
+        cmd = [PROBE_BIN, "--dst", job["dst"], "--watch",
+               "--target-mbps", str(job.get("target_mbps", 100.0)),
+               "--size", str(job.get("size", 1024)),
+               "--family", job.get("family", "ipv6"),
+               "--entropy-ports", str(job.get("entropy_ports", 1))]
+        # file transfer (finite byte quota with sequence numbers) vs timed/cont.
+        # --bytes and --duration are mutually exclusive in the probe.
+        if job.get("bytes"):       cmd += ["--bytes", str(int(job["bytes"]))]
+        elif job.get("duration"):  cmd += ["--duration", str(int(job["duration"]))]
+        if job.get("retx"):        cmd += ["--enable-retx"]
+        else:                      cmd += ["--no-enable-retx"]
+        ra = job.get("retx_mode", "auto")
+        if ra in ("gbn", "selective"): cmd += ["--retx-mode", ra]
+        return cmd
+
+    def _spawn(self, job):
+        jid = job["id"]
+        cmd = self._build_cmd(job)
+        # Send the probe's stdout/stderr to the agent log (not /dev/null) so its
+        # [probe] per-stream lines (pps / share / Mbps per EV) are observable —
+        # this is the ground truth for what the probe INTENDS to spray, separate
+        # from switch counters which conflate shared links + mesh probe traffic.
+        log_path = os.environ.get("MRC_AGENT_LOG", "/var/log/mrc-agent.log")
+        try:
+            logf = open(log_path, "a")
+        except Exception:
+            logf = None
+        try:
+            p = subprocess.Popen(cmd,
+                                  stdout=(logf or subprocess.DEVNULL),
+                                  stderr=(logf or subprocess.DEVNULL),
+                                  start_new_session=True)
+        except Exception as e:
+            self._report(jid, "error", error=f"spawn failed: {e}")
+            return
+        with self.lock: self.procs[jid] = p
+        self._report(jid, "running", pid=p.pid)
+        print(f"[job] {jid} started: {' '.join(cmd)} (pid {p.pid})")
+        def _wait():
+            rc = p.wait()
+            with self.lock: self.procs.pop(jid, None)
+            # if we were asked to stop, the kill path already reported 'stopped'
+            if rc == 0:      self._report(jid, "done")
+            elif rc < 0:     self._report(jid, "stopped")
+            else:            self._report(jid, "error", error=f"exit {rc}")
+            print(f"[job] {jid} ended rc={rc}")
+        threading.Thread(target=_wait, daemon=True).start()
+
+    def _kill(self, jid):
+        with self.lock: p = self.procs.get(jid)
+        if not p: return
+        try:
+            import signal as _sig
+            os.killpg(os.getpgid(p.pid), _sig.SIGTERM)
+        except Exception:
+            try: p.terminate()
+            except Exception: pass
+        self._report(jid, "stopped")
+        print(f"[job] {jid} killed")
+
+    def on_jobs(self, msg):
+        jobs = msg.get("jobs", [])
+        mine = {j["id"]: j for j in jobs if j.get("src") == self.host
+                and j.get("state") in ("pending", "running")}
+        with self.lock: running_ids = set(self.procs.keys())
+        # Kill removed jobs FIRST, then spawn new ones. Order matters: on a
+        # "replace" launch (stop old + start new in one go) a new job may land on
+        # the same source host as a job being stopped — killing first guarantees
+        # the old probe's traffic ceases before the new probe starts, so the two
+        # never briefly overlap on the wire.
+        for jid in running_ids - set(mine.keys()):
+            self._kill(jid)
+        for jid, job in mine.items():
+            if jid not in running_ids:
+                self._spawn(job)
+
+    def killall(self):
+        with self.lock: ids = list(self.procs.keys())
+        for jid in ids: self._kill(jid)
+
+    def reap_orphans(self):
+        """Kill any mrc-probe left running from a PREVIOUS agent session. The
+        agent restarts on every redeploy, which loses self.procs — so a probe
+        spawned by the old session keeps running headless forever, still
+        spraying its (now-stale) flow. That orphan is the classic 'phantom
+        traffic at idle' / 'denied path still has traffic' culprit: it's a probe
+        for a different flow that nothing is tracking. On startup we sweep them
+        so each session begins clean. We match our own probe binary name and
+        exclude our own PID-group (we have no children yet at startup, so a
+        blunt pkill is safe here)."""
+        try:
+            import signal as _sig
+            # SIGTERM every mrc-probe in this container; we haven't spawned any
+            # yet (called before the jobs SSE connects), so none are ours.
+            r = run(["pkill", "-TERM", "-f", "mrc-probe"], capture=True)
+            if r.returncode == 0:
+                print("[job] reaped orphaned mrc-probe process(es) from a prior session")
+        except Exception as e:
+            sys.stderr.write(f"[job] orphan reap failed (non-fatal): {e}\n")
+
+# ---- mesh health -----------------------------------------------------------
+MESH_PERIOD   = float(os.environ.get("MRC_MESH_PERIOD", "5.0"))   # seconds between sweeps
+MESH_COUNT    = int(os.environ.get("MRC_MESH_COUNT", "5"))        # echoes per peer per sweep
+MESH_INTERVAL = float(os.environ.get("MRC_MESH_INTERVAL", "0.2")) # spacing between echoes
+
+# TWAMP mesh-health (replaces the ICMPv6 echo probe). A ~2s continuous burst
+# per path per sweep: 20 packets at 100ms = 2.0s window, well inside MESH_PERIOD.
+TWAMP_BIN      = os.environ.get("MRC_TWAMP_BIN", "/usr/local/bin/mrc-twamp")
+TWAMP_PORT     = int(os.environ.get("MRC_TWAMP_PORT", "20001"))   # responder port
+TWAMP_COUNT    = int(os.environ.get("MRC_TWAMP_COUNT", "20"))     # packets per burst
+TWAMP_INTERVAL = float(os.environ.get("MRC_TWAMP_INTERVAL", "0.1"))  # s between packets
+TWAMP_TIMEOUT  = float(os.environ.get("MRC_TWAMP_TIMEOUT", "6.0"))   # hard cap per burst
+
+# --- adaptive weighted spray (SRv6 only) -----------------------------------
+# The agent senses per-path latency via the per-path TWAMP sweep and shifts the
+# PROPORTION of traffic each EV gets, inversely to that path's cost. This is the
+# agent-local control loop: sense (TWAMP) -> think (EWMA + weights) -> act
+# (publish per-EV weights; the probe re-reads them via --watch and resizes each
+# stream's pps). All tunables here exist to keep the loop STABLE — naive
+# latency-weighting oscillates, so we smooth, floor, and slew-limit.
+WEIGH_ENABLE   = os.environ.get("MRC_WEIGH", "1") not in ("0", "false", "no")
+WEIGH_EWMA     = float(os.environ.get("MRC_WEIGH_EWMA", "0.4"))   # 0..1; new-sample weight
+WEIGH_FLOOR    = float(os.environ.get("MRC_WEIGH_FLOOR", "0.05")) # min share/path (keep measuring)
+WEIGH_SLEW     = float(os.environ.get("MRC_WEIGH_SLEW", "0.25"))  # max weight move per sweep
+WEIGH_JITTER_K = float(os.environ.get("MRC_WEIGH_JITTER_K", "1.0"))  # jitter penalty multiplier
+WEIGH_LOSS_K   = float(os.environ.get("MRC_WEIGH_LOSS_K", "5.0"))    # ms-equiv cost per 1% loss
+# Latency signal for the cost: 'oneway' uses the forward one-way delay (ob_avg,
+# isolates the pinned path — recommended), 'rtt' uses round-trip (contaminated by
+# the unpinned return leg, but works without ob_avg). A/B'able live on the box.
+WEIGH_SIGNAL   = os.environ.get("MRC_WEIGH_SIGNAL", "oneway").lower()
+
+class PathWeigher:
+    """Agent-local weighted-spray policy (SRv6 only). Fed per-path latency/jitter/
+    loss samples each mesh sweep; maintains a smoothed cost per path and turns it
+    into normalised traffic weights that the probe applies per EV.
+
+    Stability is the whole game — raw latency-weighting oscillates because moving
+    traffic off a path changes that path's latency. Three dampers:
+      * EWMA on the per-path COST (react to the trend, not the jittery sample).
+      * a weight FLOOR so no path goes fully dark from latency alone — we must
+        keep sending a trickle to keep MEASURING it (else we're blind to its
+        recovery and can never weight it back up).
+      * SLEW limiting so weights move gradually per sweep, not in jumps.
+
+    Cost model: cost = rtt_avg_ms + K_jitter*jitter_ms + K_loss*loss_pct. Weight
+    is inverse-cost, normalised across the active paths, floored, slewed.
+    A path with no successful samples (fully down) gets the floor only, so its
+    traffic drains to other paths but a probe trickle keeps checking it.
+    """
+    def __init__(self):
+        self.cost = {}        # path_id -> EWMA cost (ms-equiv)
+        self.weight = {}      # path_id -> current normalised weight (0..1)
+        self.lock = threading.Lock()
+        # Live, tunable config. Defaults come from the env constants (set at
+        # deploy), but the controller can push overrides on the profile so the
+        # whole fabric is tuned from the dashboard without a redeploy. set_cfg()
+        # applies a pushed dict; DEFAULTS is the 'reset to defaults' target.
+        self.DEFAULTS = {
+            "enable":   WEIGH_ENABLE,
+            "balance":  False,      # demo: even spray, ignore latency
+            "ewma":     WEIGH_EWMA,
+            "floor":    WEIGH_FLOOR,
+            "slew":     WEIGH_SLEW,
+            "jitter_k": WEIGH_JITTER_K,
+            "loss_k":   WEIGH_LOSS_K,
+            "signal":   WEIGH_SIGNAL,
+            # --- closed-loop auto-deny (MRC #1) ----------------------------
+            # OFF by default so behaviour is byte-identical to before unless the
+            # operator enables it. When on, a path whose loss stays >= deny_loss_pct
+            # for deny_after consecutive sweeps is removed from the spray set
+            # (survivors re-spray); it keeps being PROBED (the plan probes every
+            # path), and is restored after restore_after consecutive healthy sweeps.
+            "autodeny":      False,
+            "deny_loss_pct": 60.0,  # loss% at/above which a sweep counts as 'bad'
+            "deny_after":    3,     # consecutive bad sweeps -> auto-deny
+            "restore_after": 3,     # consecutive good sweeps -> auto-restore
+        }
+        self.cfg = dict(self.DEFAULTS)
+
+    def set_cfg(self, d):
+        """Apply pushed weigher settings (partial dict ok). Clamps to safe ranges
+        so a bad UI value can't destabilise the loop. Unknown keys ignored."""
+        if not d:
+            return
+        with self.lock:
+            def num(k, lo, hi, cur):
+                try:    return max(lo, min(hi, float(d[k])))
+                except (KeyError, TypeError, ValueError): return cur
+            self.cfg["ewma"]     = num("ewma",     0.05, 1.0,  self.cfg["ewma"])
+            self.cfg["floor"]    = num("floor",    0.0,  0.49, self.cfg["floor"])
+            self.cfg["slew"]     = num("slew",     0.01, 1.0,  self.cfg["slew"])
+            self.cfg["jitter_k"] = num("jitter_k", 0.0,  20.0, self.cfg["jitter_k"])
+            self.cfg["loss_k"]   = num("loss_k",   0.0,  50.0, self.cfg["loss_k"])
+            if "signal" in d and str(d["signal"]).lower() in ("oneway", "rtt"):
+                self.cfg["signal"] = str(d["signal"]).lower()
+            if "enable" in d:
+                self.cfg["enable"] = d["enable"] not in (False, 0, "0", "false", "no")
+            if "balance" in d:
+                self.cfg["balance"] = d["balance"] not in (False, 0, "0", "false", "no")
+            if "autodeny" in d:
+                self.cfg["autodeny"] = d["autodeny"] not in (False, 0, "0", "false", "no")
+            self.cfg["deny_loss_pct"] = num("deny_loss_pct", 1.0, 100.0, self.cfg["deny_loss_pct"])
+            # integer sweep counts
+            def inum(k, lo, hi, cur):
+                try:    return int(max(lo, min(hi, float(d[k]))))
+                except (KeyError, TypeError, ValueError): return cur
+            self.cfg["deny_after"]    = inum("deny_after",    1, 20, self.cfg["deny_after"])
+            self.cfg["restore_after"] = inum("restore_after", 1, 20, self.cfg["restore_after"])
+
+    def update(self, samples, active_ids):
+        """samples: list of dicts with path_id, rtt_avg, rtt_mdev, loss_pct, up.
+        active_ids: the set of path_ids currently allowed (operator-active).
+        Returns {path_id: weight} for the active set (sums to 1.0)."""
+        c = self.cfg
+        if not c["enable"]:
+            return {}
+        active = list(dict.fromkeys(active_ids))   # de-dup, preserve order
+        if not active:
+            with self.lock: self.weight = {}
+            return {}
+        by_id = {s.get("path_id"): s for s in samples if s.get("path_id")}
+        with self.lock:
+            # 1) update EWMA cost per active path
+            for pid in active:
+                s = by_id.get(pid)
+                # Latency term: prefer the FORWARD one-way delay (ob_avg) over
+                # round-trip (rtt_avg). TWAMP RTT = forward (pinned to this path's
+                # uSID) + return (NOT pinned — comes back via fabric ECMP), so the
+                # return leg smears shared/unrelated delay across every path and
+                # muddies the per-path signal. The forward one-way leg is the part
+                # the uSID actually controls, so it isolates THIS path's health.
+                # ob_avg is software-timestamped (abs value has clock skew) but the
+                # skew is common to all paths from this host, so it cancels when we
+                # RANK paths against each other — exactly what the weigher does.
+                # Configurable so it can be A/B'd on the box; RTT is the fallback
+                # when ob_avg is absent (older twamp / probe error).
+                lat = None
+                if s and s.get("up"):
+                    if c["signal"] == "oneway" and s.get("ob_avg") is not None:
+                        lat = float(s["ob_avg"])
+                    elif s.get("rtt_avg") is not None:
+                        lat = float(s["rtt_avg"])
+                if lat is not None:
+                    inst = (lat
+                            + c["jitter_k"] * float(s.get("rtt_mdev") or 0.0)
+                            + c["loss_k"]  * float(s.get("loss_pct") or 0.0))
+                else:
+                    # no sample / path down this sweep: treat as a high cost so it
+                    # bleeds traffic, but DON'T zero it — the floor keeps probing.
+                    inst = (self.cost.get(pid, 1.0) * 2.0) or 100.0
+                prev = self.cost.get(pid)
+                self.cost[pid] = inst if prev is None else (
+                    c["ewma"] * inst + (1 - c["ewma"]) * prev)
+            # drop costs for paths no longer active
+            for pid in list(self.cost):
+                if pid not in active: self.cost.pop(pid, None)
+            # BALANCE mode (demo): ignore the measured latency entirely and split
+            # traffic EVENLY over the active paths. Cost is still updated above so
+            # the dashboard keeps SHOWING the per-path latency — we're just
+            # choosing not to act on it (a nice contrast: "here's the latency, and
+            # here's us deliberately ignoring it"). Even weights are applied
+            # instantly (no floor/slew) so the demo flip is immediate and exact.
+            if c.get("balance"):
+                even = 1.0 / len(active)
+                new = {pid: even for pid in active}
+                self.weight = new
+                return dict(new)
+            # 2) inverse-cost target weights, normalised over the active set
+            inv = {pid: 1.0 / max(self.cost[pid], 1e-3) for pid in active}
+            tot = sum(inv.values()) or 1.0
+            target = {pid: inv[pid] / tot for pid in active}
+            # 3) apply floor, then renormalise so it still sums to 1
+            target = {pid: max(c["floor"], w) for pid, w in target.items()}
+            tot = sum(target.values()) or 1.0
+            target = {pid: w / tot for pid, w in target.items()}
+            # 4) slew-limit toward target from the current weight
+            new = {}
+            for pid in active:
+                cur = self.weight.get(pid, 1.0 / len(active))
+                delta = target[pid] - cur
+                if   delta >  c["slew"]: delta =  c["slew"]
+                elif delta < -c["slew"]: delta = -c["slew"]
+                new[pid] = cur + delta
+            tot = sum(new.values()) or 1.0
+            new = {pid: w / tot for pid, w in new.items()}
+            self.weight = new
+            return dict(new)
+
+    def recompute(self, active_ids):
+        """Recompute weights from the EXISTING cost EWMA (no new samples). Used to
+        apply a balance/cfg toggle immediately between sweeps, reusing the latency/
+        loss already measured. Balance -> instant even; else inverse-cost + floor
+        (no slew, so the toggle is snappy rather than ramping)."""
+        c = self.cfg
+        if not c["enable"]:
+            return {}
+        active = list(dict.fromkeys(active_ids))
+        if not active:
+            with self.lock: self.weight = {}
+            return {}
+        with self.lock:
+            if c.get("balance"):
+                even = 1.0 / len(active)
+                new = {pid: even for pid in active}
+                self.weight = new
+                return dict(new)
+            inv = {pid: 1.0 / max(self.cost.get(pid, 1.0), 1e-3) for pid in active}
+            tot = sum(inv.values()) or 1.0
+            target = {pid: inv[pid] / tot for pid in active}
+            target = {pid: max(c["floor"], w) for pid, w in target.items()}
+            tot = sum(target.values()) or 1.0
+            new = {pid: w / tot for pid, w in target.items()}
+            self.weight = new
+            return dict(new)
+
+    def snapshot(self):
+        with self.lock:
+            return {"cost": dict(self.cost), "weight": dict(self.weight),
+                    "signal": self.cfg["signal"], "cfg": dict(self.cfg)}
+
+
+class MeshHealth(threading.Thread):
+    """Always-on, low-rate full-mesh reachability probe. Every MESH_PERIOD this
+    host pings each *other* GPU's tenant address with a short ICMPv6 echo train
+    and reports RTT (min/avg/max), jitter (mdev) and packet loss to the
+    controller. This rides the real fabric end-to-end via the tenant addresses,
+    so it reflects the path the data plane actually takes — useful later as a
+    health signal for path selection.
+
+    Non-intrusive by construction: a handful of 56-byte echoes every few seconds
+    per peer (a few hundred bps), completely separate from test-runner traffic.
+    """
+    def __init__(self, controller, host, stop_evt, state=None, dp=None):
+        super().__init__(daemon=True)
+        self.controller = controller.rstrip("/"); self.host = host
+        self.stop = stop_evt
+        self.state = state         # optional State for local `mrc-agent status`
+        self.dp = dp               # Dataplane — for installing per-path fwmark routes
+        self.peers = {}            # name -> tenant addr (refreshed each sweep)
+        self._last_topo = 0.0
+        self.weigher = PathWeigher()  # agent-local adaptive weighted spray
+        self.plan = []             # per-(peer,spine) probe plan (SRv6 mode)
+        self._plan_marks = set()   # fwmarks we've installed routes for
+        self._encap_ok = {}        # fwmark -> did its seg6 encap route install?
+        self._last_plan = 0.0
+        # cached mapping from the last sweep, so a balance/cfg toggle can
+        # republish weights IMMEDIATELY (off-sweep) from already-measured costs
+        # instead of waiting up to MESH_PERIOD for the next TWAMP sweep.
+        self._last_active_ids = []
+        self._last_id_to_ev = {}
+        self._last_balance = None
+        # --- closed-loop auto-deny (MRC #1) state --------------------------
+        self._ad_bad  = {}        # path_id -> consecutive bad-sweep count
+        self._ad_good = {}        # path_id -> consecutive good-sweep count
+        self.auto_denied = set()  # path_ids the agent has auto-denied (local)
+        self.path_health = []     # full-mesh list: [{peer, path_id, spine, up, loss_pct, rtt_min, rtt_avg, rtt_max, jitter, ob_avg, ib_avg, bad, good, denied}]
+
+    def _apply_autodeny(self, samples, active_ids, flow_dst=None):
+        """Closed-loop path failure handling (MRC #1). Given this sweep's per-path
+        samples and the operator-active path set, returns the SPRAY set (active
+        minus auto-denied) and refreshes self.auto_denied / self.path_health.
+
+        self.path_health is published as a LIST of per-(peer,path) entries for the
+        FULL MESH (#2) — every probed path to every peer, independent of whichever
+        flow is configured for a test. It's a list (not a path_id-keyed dict)
+        because path_id encodes only the spine sequence: two peers on different
+        leaves of the same cluster reached via the same spines share a path_id, so
+        a dict would collapse them. Auto-deny still operates on the active flow's
+        single dst (flow_dst), so its sample lookup and the 'denied' annotation are
+        peer-exact even when path_ids collide across peers.
+
+        Gated on weigher.cfg['autodeny'] — when off, this is a no-op that returns
+        active_ids unchanged and clears any prior auto-deny state. A path is judged
+        on packet loss from its pinned TWAMP probe; auto-denied after deny_after
+        consecutive bad sweeps, auto-restored after restore_after good ones. The
+        probe plan keeps measuring auto-denied paths, which is what makes recovery
+        observable. SAFETY: never auto-deny the LAST surviving path."""
+        cfg = self.weigher.cfg
+        # Per-path health for EVERY probed path (full mesh, #2) — a flat list so
+        # colliding path_ids across peers are never merged. Each carries peer+path_id.
+        health = []
+        for s in samples:
+            pid = s.get("path_id")
+            if not pid:
+                continue
+            health.append({
+                "peer": s.get("peer"), "path_id": pid, "spine": s.get("spine"),
+                "up": bool(s.get("up")),
+                "loss_pct": s.get("loss_pct"),
+                "rtt_min": s.get("rtt_min"),
+                "rtt_avg": s.get("rtt_avg"),
+                "rtt_max": s.get("rtt_max"),
+                "jitter":  s.get("rtt_mdev"),    # RFC1889 jitter (mdev)
+                "ob_avg":  s.get("ob_avg"),       # one-way outbound (TWAMP)
+                "ib_avg":  s.get("ib_avg"),       # one-way inbound  (TWAMP)
+                "encap_ok": bool(s.get("encap_ok", True)),  # did seg6 route install?
+                "bad": 0, "good": 0, "denied": False,
+            })
+        if not cfg.get("autodeny"):
+            # disabled: wipe auto-deny state so nothing stays denied; health still
+            # reports the full mesh (so `show health` works with autodeny off too)
+            if self.auto_denied or self._ad_bad or self._ad_good:
+                self._ad_bad.clear(); self._ad_good.clear(); self.auto_denied.clear()
+            self.path_health = health
+            return list(active_ids)
+
+        # samples for the ACTIVE flow's dst only, keyed by path_id (unique within
+        # one dst). Falls back to all samples if the flow dst is unknown.
+        if flow_dst:
+            by_flow = {s.get("path_id"): s for s in samples
+                       if s.get("path_id") and s.get("peer") == flow_dst}
+        else:
+            by_flow = {s.get("path_id"): s for s in samples if s.get("path_id")}
+
+        thresh = float(cfg.get("deny_loss_pct", 60.0))
+        need_bad  = int(cfg.get("deny_after", 3))
+        need_good = int(cfg.get("restore_after", 3))
+        for pid in active_ids:
+            s = by_flow.get(pid)
+            # no sample this sweep == path down == 100% loss for our purposes
+            loss = float(s.get("loss_pct")) if (s and s.get("loss_pct") is not None) else 100.0
+            is_bad = (not (s and s.get("up"))) or (loss >= thresh)
+            if is_bad:
+                self._ad_bad[pid]  = self._ad_bad.get(pid, 0) + 1
+                self._ad_good[pid] = 0
+            else:
+                self._ad_good[pid] = self._ad_good.get(pid, 0) + 1
+                self._ad_bad[pid]  = 0
+            if pid not in self.auto_denied and self._ad_bad.get(pid, 0) >= need_bad:
+                # don't deny the last surviving path (avoid a self-inflicted blackhole)
+                survivors = [q for q in active_ids if q not in self.auto_denied and q != pid]
+                if survivors:
+                    self.auto_denied.add(pid)
+                    print(f"[autodeny] {pid} auto-DENIED (loss {loss:.0f}% x{self._ad_bad[pid]} sweeps)",
+                          file=sys.stderr)
+            elif pid in self.auto_denied and self._ad_good.get(pid, 0) >= need_good:
+                self.auto_denied.discard(pid)
+                print(f"[autodeny] {pid} auto-RESTORED ({self._ad_good[pid]} healthy sweeps)",
+                      file=sys.stderr)
+        # forget state for paths no longer active
+        for d in (self._ad_bad, self._ad_good):
+            for pid in list(d):
+                if pid not in active_ids: d.pop(pid, None)
+        self.auto_denied = {pid for pid in self.auto_denied if pid in active_ids}
+        # annotate ONLY the active flow's dst entries (peer-exact)
+        for e in health:
+            pid = e["path_id"]
+            if pid in active_ids and (flow_dst is None or e["peer"] == flow_dst):
+                e.update(bad=self._ad_bad.get(pid, 0),
+                         good=self._ad_good.get(pid, 0),
+                         denied=pid in self.auto_denied)
+        self.path_health = health
+        spray = [pid for pid in active_ids if pid not in self.auto_denied]
+        return spray or list(active_ids)   # never return empty (blackhole guard)
+
+    def _publish_weights(self, weights, active_ids, id_to_ev):
+        """Map path weights -> per-EV weights, write ev_weights + weigher snapshot
+        to the state file. Returns the weigher_snap (for the mesh-health POST)."""
+        ev_weights = {}
+        for pid, w in weights.items():
+            ev = id_to_ev.get(pid)
+            if ev is not None:
+                ev_weights[str(ev)] = round(w, 4)
+        # Auto-denied paths (#1): publish an explicit 0 weight so the probe DROPS
+        # that stream. (A missing weight falls back to an even/full share, and a
+        # bare floor would still send a trickle — the probe specifically skips
+        # weight==0 streams, so 0 is what actually stops the spray.)
+        for pid in active_ids:
+            if pid in self.auto_denied:
+                ev = id_to_ev.get(pid)
+                if ev is not None:
+                    ev_weights[str(ev)] = 0.0
+        if self.state is not None:
+            self.state.set("ev_weights", ev_weights)
+        snap = self.weigher.snapshot()
+        weigher_snap = {
+            "path_cost": {k: round(v, 2) for k, v in snap["cost"].items()},
+            "path_weight": {k: round(v, 4) for k, v in snap["weight"].items()},
+            "active_ids": active_ids,
+            # closed-loop auto-deny (#1) + per-path health (#2) so the controller
+            # and dashboard can show path health and which paths the agent denied.
+            "auto_denied": sorted(self.auto_denied),
+            "path_health": list(self.path_health),
+            "signal": snap.get("signal"),
+            "cfg": snap.get("cfg"),
+            "updated_at": time.time()}
+        if self.state is not None:
+            self.state.update("weigher", **weigher_snap)
+        return weigher_snap
+
+    def _maybe_fast_rebalance(self):
+        """Called ~1s cadence: if the balance flag (or cfg) changed since the last
+        sweep, recompute + republish weights NOW from the cached per-path costs —
+        so toggling 'even spray' takes effect in ~1s, not on the next 5s sweep.
+        Uses the weigher's existing cost EWMA (latency/loss already measured), so
+        switching latency<->even is immediate and based on current knowledge."""
+        try:
+            prof = (self.state.get("profile") if self.state else {}) or {}
+            if (prof.get("mode") or "").lower() != "srv6":
+                return
+            cfg = prof.get("weigher_cfg") or {}
+            self.weigher.set_cfg(cfg)
+            bal = self.weigher.cfg.get("balance")
+            if bal == self._last_balance:
+                return                      # nothing changed; sweep handles steady state
+            self._last_balance = bal
+            active_ids = self._last_active_ids
+            if not active_ids:
+                return                      # no cached topology yet; wait for a sweep
+            # recompute from CACHED cost (no fresh TWAMP needed) and republish
+            weights = self.weigher.recompute(active_ids)
+            self._publish_weights(weights, active_ids, self._last_id_to_ev)
+        except Exception as e:
+            print(f"[weigh] fast-rebalance error (continuing): {e!r}", file=sys.stderr)
+
+    def _refresh_plan(self):
+        """Pull the per-path probe plan and install a fwmark->table->uSID route
+        per path so an SO_MARK'd ping is pinned to exactly that spine. Only
+        meaningful in SRv6 mode; on any error we just fall back to plain ping."""
+        if self.dp is None:
+            return
+        if time.time() - self._last_plan < 30 and self.plan:
+            return
+        try:
+            with urlreq.urlopen(f"{self.controller}/api/mesh-plan?src={self.host}", timeout=4) as r:
+                plan = json.loads(r.read()).get("paths", [])
+        except Exception:
+            return
+        # install a dedicated route table per (peer, spine) keyed by fwmark
+        want = {}
+        for p in plan:
+            fw, dst = p.get("fwmark"), p.get("dst")
+            usid = p.get("probe_sid") or p.get("usid")
+            if not (fw and usid and dst):
+                continue
+            want[fw] = p
+            if fw not in self._plan_marks:
+                try:
+                    rr = run(["ip", "-6", "route", "replace", f"{dst}/128",
+                              "encap", "seg6", "mode", "encap", "segs", usid,
+                              "dev", self.dp.underlay, "table", str(fw)], capture=True)
+                    ok = (rr.returncode == 0)
+                    self._encap_ok[fw] = ok
+                    if not ok:
+                        # Most common cause: a uSID stack that overflows a single
+                        # 128-bit carrier (>6 uSIDs after a /32 block) is an invalid
+                        # IPv6 address, so the seg6 route never installs and the
+                        # SO_MARK probe falls through to NATIVE forwarding. Log it
+                        # loudly so 'up' on such a path isn't mistaken for SRv6.
+                        print(f"[mesh] seg6 route install FAILED for {p.get('peer')} "
+                              f"{p.get('path_id')} (segs {usid}): "
+                              f"{(rr.stderr or '').strip()[:120]}", file=sys.stderr)
+                    run(["ip", "-6", "rule", "add", "fwmark", str(fw),
+                         "table", str(fw), "pref", "90"], capture=True)
+                    self._plan_marks.add(fw)
+                except Exception:
+                    pass
+        # tear down marks no longer in the plan
+        for fw in list(self._plan_marks):
+            if fw not in want:
+                try:
+                    run(["ip", "-6", "rule", "del", "fwmark", str(fw), "table", str(fw)], capture=True)
+                    run(["ip", "-6", "route", "flush", "table", str(fw)], capture=True)
+                except Exception:
+                    pass
+                self._plan_marks.discard(fw)
+                self._encap_ok.pop(fw, None)
+        self.plan = plan
+        self._last_plan = time.time()
+
+    def _refresh_peers(self):
+        # cheap: only re-pull topology every ~30s
+        if time.time() - self._last_topo < 30 and self.peers:
+            return
+        try:
+            with urlreq.urlopen(f"{self.controller}/api/topology", timeout=4) as r:
+                topo = json.loads(r.read())
+        except Exception:
+            return
+        peers = {}
+        for h in topo.get("hosts", []):
+            if h.get("name") and h.get("name") != self.host:
+                addr = h.get("addr_v6") or h.get("addr")
+                if addr: peers[h["name"]] = addr
+        self.peers = peers
+        self._last_topo = time.time()
+
+    @staticmethod
+    def _twamp_probe(addr, count, mark=0, interval_ms=None, timeout=None):
+        """Run one bounded IPv6 TWAMP-light burst via the mrc-twamp wrapper and
+        return the same dict shape the ICMPv6 probe used (rtt_min/avg/max,
+        rtt_mdev=jitter, loss_pct, tx/rx) so the controller/dashboard need no
+        changes. If mark>0 the burst is SO_MARK-pinned to that SRv6 path's
+        fwmark route. The far end runs `twampy responder :20001`.
+
+        TWAMP replaces the old ICMPv6 mesh probe: it measures real two-way
+        delay + RFC1889 jitter + loss per SRv6 path, not just echo RTT."""
+        ivl = TWAMP_INTERVAL if interval_ms is None else interval_ms
+        tmo = TWAMP_TIMEOUT if timeout is None else timeout
+        # bracket bare IPv6 literals; mrc-twamp appends :20001 if no port given
+        tgt = addr
+        if ":" in tgt and not tgt.startswith("["):
+            tgt = f"[{tgt}]:{TWAMP_PORT}"
+        cmd = [TWAMP_BIN, "probe", tgt,
+               "--count", str(count), "--interval", str(int(ivl * 1000)),
+               "--timeout", str(tmo)]
+        if mark:
+            cmd += ["--mark", str(mark)]
+        try:
+            cp = run(cmd, capture=True, timeout=tmo + 4)
+            out = (cp.stdout or "").strip().splitlines()
+            line = out[-1] if out else ""
+            d = json.loads(line)
+            # normalise to the probe dict shape (rx/tx/loss_pct/rtt_* present)
+            return {"tx": d.get("tx", count), "rx": d.get("rx", 0),
+                    "loss_pct": d.get("loss_pct", 100.0),
+                    "rtt_min": d.get("rtt_min"), "rtt_avg": d.get("rtt_avg"),
+                    "rtt_max": d.get("rtt_max"), "rtt_mdev": d.get("rtt_mdev"),
+                    "ob_avg": d.get("ob_avg"), "ib_avg": d.get("ib_avg"),
+                    "err": None if d.get("ok") else d.get("err")}
+        except Exception as e:
+            return {"tx": count, "rx": 0, "loss_pct": 100.0,
+                    "rtt_min": None, "rtt_avg": None, "rtt_max": None,
+                    "rtt_mdev": None, "err": f"twamp: {e}"}
+
+    @staticmethod
+    def _ping6_raw(addr, count, timeout=1.0, mark=0):
+        """Pure-Python ICMPv6 echo using a raw socket — no external 'ping'
+        binary or apt needed. The agent runs as root (it programs seg6), so
+        CAP_NET_RAW is available. Returns the same dict shape as _ping6.
+        If mark>0, SO_MARK is set so the echo is pinned to a specific SRv6
+        path via the agent's per-path fwmark routes."""
+        res = {"tx": count, "rx": 0, "loss_pct": 100.0,
+               "rtt_min": None, "rtt_avg": None, "rtt_max": None, "rtt_mdev": None}
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+        except Exception as e:
+            res["err"] = f"raw icmpv6 socket: {e}"
+            return res
+        if mark:
+            try: s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(mark))
+            except Exception as e: res["err"] = f"SO_MARK {mark}: {e}"
+        s.settimeout(timeout)
+        ident = os.getpid() & 0xFFFF
+        rtts = []
+        try:
+            ai = socket.getaddrinfo(addr, None, socket.AF_INET6, socket.SOCK_RAW)[0][4]
+        except Exception as e:
+            res["err"] = f"resolve {addr}: {e}"; s.close(); return res
+        def cksum(b):
+            if len(b) % 2: b += b"\x00"
+            x = sum((b[i] << 8) + b[i+1] for i in range(0, len(b), 2))
+            x = (x >> 16) + (x & 0xFFFF); x += x >> 16
+            return (~x) & 0xFFFF
+        for seq in range(count):
+            # ICMPv6 type 128 (echo request); kernel fills the checksum for
+            # IPPROTO_ICMPV6 raw sockets, so 0 is fine.
+            payload = b"mrc-mesh" + struct.pack(">d", time.time())
+            hdr = struct.pack(">BBHHH", 128, 0, 0, ident, seq & 0xFFFF)
+            pkt = hdr + payload
+            t0 = time.monotonic()
+            try:
+                s.sendto(pkt, ai)
+                while True:
+                    data, _ = s.recvfrom(1024)
+                    # echo reply is type 129; match our ident
+                    if len(data) >= 8 and data[0] == 129:
+                        rid = struct.unpack(">H", data[4:6])[0]
+                        if rid == ident:
+                            rtts.append((time.monotonic() - t0) * 1000.0); break
+            except socket.timeout:
+                pass
+            except Exception as e:
+                res["err"] = f"icmpv6 send/recv: {e}"; break
+            time.sleep(0.05)
+        s.close()
+        res["rx"] = len(rtts)
+        res["loss_pct"] = round(100.0 * (count - len(rtts)) / count, 1) if count else 100.0
+        if rtts:
+            res["rtt_min"] = round(min(rtts), 3); res["rtt_max"] = round(max(rtts), 3)
+            avg = sum(rtts) / len(rtts); res["rtt_avg"] = round(avg, 3)
+            res["rtt_mdev"] = round((sum((x - avg) ** 2 for x in rtts) / len(rtts)) ** 0.5, 3)
+            res.pop("err", None)
+        return res
+
+    @staticmethod
+    def _ping6(addr, count, interval):
+        """Return dict(rx, tx, loss_pct, rtt_min/avg/max/mdev_ms) or None.
+        On a hard failure, the dict carries an 'err' string so the controller
+        can show WHY a peer is unreachable (no ping binary, perm denied, etc.)."""
+        # Sub-second -i needs root/CAP_NET_RAW; clamp to >=1s so unprivileged
+        # ping in the container doesn't bail with 'cannot flood'. Keeps it light.
+        iv = interval if interval >= 1.0 else 1.0
+        cmd = ["ping", "-6", "-c", str(count), "-i", str(iv),
+               "-W", "1", "-q", addr]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=count*iv + 5)
+        except FileNotFoundError:
+            # no ping binary — use the built-in raw ICMPv6 pinger (no apt needed)
+            return MeshHealth._ping6_raw(addr, count)
+        except Exception as e:
+            return {"tx": count, "rx": 0, "loss_pct": 100.0, "err": f"ping spawn: {e}",
+                    "rtt_min": None, "rtt_avg": None, "rtt_max": None, "rtt_mdev": None}
+        out = r.stdout + "\n" + (r.stderr or "")
+        res = {"tx": count, "rx": 0, "loss_pct": 100.0,
+               "rtt_min": None, "rtt_avg": None, "rtt_max": None, "rtt_mdev": None}
+        m = re.search(r"(\d+) packets transmitted, (\d+) received.*?([\d.]+)% packet loss", out, re.S)
+        if m:
+            res["tx"] = int(m.group(1)); res["rx"] = int(m.group(2))
+            res["loss_pct"] = float(m.group(3))
+        elif r.returncode != 0:
+            # ping failed before producing stats — capture a short reason
+            res["err"] = (r.stderr or r.stdout or f"ping rc={r.returncode}").strip().split("\n")[0][:120]
+        m = re.search(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms", out)
+        if m:
+            res["rtt_min"] = float(m.group(1)); res["rtt_avg"] = float(m.group(2))
+            res["rtt_max"] = float(m.group(3)); res["rtt_mdev"] = float(m.group(4))
+        return res
+
+    def run(self):
+        # small initial stagger so all hosts don't sweep in lockstep
+        self.stop.wait(0.5 + (hash(self.host) % 1000) / 1000.0)
+        print(f"[mesh] started on {self.host}: TWAMP per-path every {MESH_PERIOD}s, "
+              f"{TWAMP_COUNT} pkts/burst @ {int(TWAMP_INTERVAL*1000)}ms",
+              file=sys.stderr)
+        first = True
+        while not self.stop.is_set():
+            try:
+                self._refresh_peers()
+                self._refresh_plan()
+                if not self.peers and first:
+                    print("[mesh] no peers yet from /api/topology", file=sys.stderr)
+                samples = []
+                if self.plan:
+                    # SRv6 per-path TWAMP probing: one bounded TWAMP-light burst
+                    # per path, SO_MARK-pinned to that path's fwmark route, so we
+                    # measure two-way delay + RFC1889 jitter + loss on EVERY uSID
+                    # path between the GPUs (not one ECMP-hashed aggregate).
+                    for p in self.plan:
+                        if self.stop.is_set(): break
+                        r = self._twamp_probe(p["dst"], TWAMP_COUNT, mark=p["fwmark"])
+                        samples.append({"peer": p["peer"], "addr": p["dst"],
+                                        "spine": p["spine"], "path_id": p["path_id"],
+                                        "encap_ok": self._encap_ok.get(p["fwmark"], True),
+                                        "up": r.get("rx", 0) > 0, **r})
+                else:
+                    # no per-path plan yet: per-peer TWAMP burst (unpinned)
+                    for name, addr in list(self.peers.items()):
+                        if self.stop.is_set(): break
+                        r = self._twamp_probe(addr, TWAMP_COUNT)
+                        samples.append({"peer": name, "addr": addr,
+                                        "up": r.get("rx", 0) > 0, **r})
+                if samples:
+                    # --- adaptive weighted spray (SRv6 only) -----------------
+                    # Feed the per-path latency/jitter/loss into the weigher and
+                    # publish per-EV weights the probe will apply. Only meaningful
+                    # in SRv6, where each EV is pinned to one path so the sample
+                    # is attributable; in other modes we publish nothing (equal).
+                    # Wrapped in its own try so a weigher bug logs loudly and
+                    # CANNOT silently kill the rest of the sweep (mesh-health
+                    # reporting, etc.) — earlier the outer handler swallowed it.
+                    weigher_snap = None
+                    try:
+                        prof = (self.state.get("profile") if self.state else {}) or {}
+                        mode = (prof.get("mode") or "").lower()
+                        # fabric-wide weigher settings pushed on the profile (live,
+                        # no redeploy). Partial dict ok; clamped in set_cfg.
+                        self.weigher.set_cfg(prof.get("weigher_cfg"))
+                        if mode == "srv6" and self.plan:
+                            active_evs = prof.get("active_evs") or []
+                            id_to_ev = {(e.get("path") or e.get("id")): e.get("entropy")
+                                        for e in active_evs}
+                            # active_ids = path ids carried by the plan AND in the
+                            # active EV set. The plan can list a path_id more than
+                            # once (it probes every peer), so DEDUPE — otherwise
+                            # balance mode's 1/len(active) divides by the wrong count
+                            # (e.g. 1/8 -> 13% instead of 1/4 -> 25%), and even the
+                            # latency path double-counts a shared id.
+                            seen = set(); active_ids = []
+                            for p in self.plan:
+                                pid = p.get("path_id")
+                                if pid in id_to_ev and pid not in seen:
+                                    seen.add(pid); active_ids.append(pid)
+                            # closed-loop auto-deny (#1): drop sustained-bad paths
+                            # from the SPRAY set (survivors re-spray); no-op + state
+                            # cleared when cfg.autodeny is off, so default unchanged.
+                            flow_dst = (prof.get("flow") or {}).get("dst")
+                            spray_ids = self._apply_autodeny(samples, active_ids, flow_dst)
+                            weights = self.weigher.update(samples, spray_ids)
+                            self._last_active_ids = spray_ids    # cache for fast republish
+                            self._last_id_to_ev   = dict(id_to_ev)
+                            weigher_snap = self._publish_weights(weights, active_ids, id_to_ev)
+                        elif self.state is not None:
+                            self.state.set("ev_weights", {})
+                    except Exception as we:
+                        print(f"[weigh] error (continuing): {we!r}", file=sys.stderr)
+                    self._post(samples, weigher=weigher_snap)
+                    if self.state is not None:
+                        up = sum(1 for s in samples if s["up"])
+                        self.state.update("mesh",
+                            last_sweep_at=time.time(), per_path=bool(self.plan),
+                            peers_total=len(samples), peers_up=up,
+                            samples=[{"peer": s["peer"], "spine": s.get("spine"),
+                                      "path_id": s.get("path_id"),
+                                      "up": s["up"], "loss_pct": s.get("loss_pct"),
+                                      "rtt_avg": s.get("rtt_avg"),
+                                      "ob_avg": s.get("ob_avg"), "ib_avg": s.get("ib_avg"),
+                                      "err": s.get("err")} for s in samples])
+                    if first:
+                        up = sum(1 for s in samples if s["up"])
+                        errs = {s.get("err") for s in samples if s.get("err")}
+                        kind = "per-path" if self.plan else "per-peer"
+                        print(f"[mesh] first sweep ({kind}): {up}/{len(samples)} up"
+                              + (f"; errors: {', '.join(e for e in errs if e)}" if errs else ""),
+                              file=sys.stderr)
+                        first = False
+            except Exception as e:
+                print(f"[mesh] sweep error (continuing): {e}", file=sys.stderr)
+            # Wait MESH_PERIOD before the next TWAMP sweep, but in 1s chunks so a
+            # balance/cfg toggle is applied within ~1s (off-sweep) from cached
+            # costs — the operator sees 'even spray' take effect immediately, not
+            # on the next 5s sweep boundary.
+            waited = 0.0
+            while waited < MESH_PERIOD and not self.stop.is_set():
+                self.stop.wait(1.0)
+                waited += 1.0
+                self._maybe_fast_rebalance()
+
+    def _post(self, samples, weigher=None):
+        payload = {"host": self.host, "ts": time.time(), "peers": samples}
+        if weigher is not None:
+            # include the live adaptive-spray state so the dashboard can show
+            # per-path cost + weight without a separate endpoint
+            payload["weigher"] = weigher
+        body = json.dumps(payload).encode()
+        req = urlreq.Request(f"{self.controller}/api/mesh-health", data=body,
+                             headers={"Content-Type": "application/json"})
+        try: urlreq.urlopen(req, timeout=2).read()
+        except (urlerr.URLError, socket.timeout): pass
+
+# ---- SSE ------------------------------------------------------------------
+def sse_subscribe(url, on_message, on_status, stop_evt):
+    backoff = RECONNECT_BASE
+    reconnects = -1
+    while not stop_evt.is_set():
+        reconnects += 1
+        try:
+            on_status("connecting", reconnects=reconnects)
+            print(f"[sse] connecting to {url}")
+            req = urlreq.Request(url, headers={"Accept": "text/event-stream"})
+            # 60s read timeout — server keepalive is every 5s so we're well-padded
+            with urlreq.urlopen(req, timeout=60) as resp:
+                print(f"[sse] connected (HTTP {resp.status})")
+                on_status("connected", reconnects=reconnects)
+                backoff = RECONNECT_BASE
+                buf = b""
+                for line in resp:
+                    if stop_evt.is_set(): break
+                    if line in (b"\n", b"\r\n"):
+                        for L in buf.split(b"\n"):
+                            if L.startswith(b"data:"):
+                                try: on_message(json.loads(L[5:].strip()))
+                                except json.JSONDecodeError as e:
+                                    sys.stderr.write(f"[sse] bad json: {e}\n")
+                        buf = b""
+                    else:
+                        buf += line
+        except (urlerr.URLError, socket.timeout, ConnectionResetError) as e:
+            on_status("disconnected", error=str(e))
+            sys.stderr.write(f"[sse] disconnected: {e} — retrying in {backoff:.0f}s\n")
+        except Exception as e:
+            on_status("error", error=repr(e))
+            sys.stderr.write(f"[sse] error: {e!r} — retrying in {backoff:.0f}s\n")
+        for _ in range(int(backoff * 10)):
+            if stop_evt.is_set(): return
+            time.sleep(0.1)
+        backoff = min(backoff * 2, RECONNECT_CAP)
+
+# ---- file profile source (standalone, no controller) ----------------------
+class FileProfileSource:
+    """Standalone profile feed: reads a generator-produced profile JSON from
+    disk and delivers each block to the SAME on_profile() seam the SSE path
+    uses. This is what makes the NIC controller-independent.
+
+    The file may be either:
+      - a single profile dict  {mode, flow, active_dst, active_evs:[...]}, or
+      - a list of such dicts (one per destination peer), or
+      - {"profiles": [ ... ]} wrapping the list.
+
+    Every block is pushed through on_profile exactly as the controller would
+    have streamed it, so the dataplane programming path is byte-for-byte the
+    same. Re-reads on SIGHUP and on mtime change (so Ansible can drop a new
+    profile and the NIC re-programs without a restart), polling every `period`.
+    """
+    def __init__(self, path, on_profile, on_status, stop_evt, period=2.0):
+        self.path = path; self.on_profile = on_profile
+        self.on_status = on_status; self.stop = stop_evt
+        self.period = period; self._mtime = None
+        self._hup = threading.Event()
+        try:
+            signal.signal(signal.SIGHUP, lambda *_: self._hup.set())
+        except (ValueError, OSError):
+            pass  # not main thread / unsupported — mtime polling still works
+
+    def _load(self):
+        with open(self.path) as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and "profiles" in doc:
+            return list(doc["profiles"])
+        if isinstance(doc, dict):
+            return [doc]
+        if isinstance(doc, list):
+            return doc
+        raise ValueError("profile must be an object or a list of objects")
+
+    def _apply(self):
+        try:
+            blocks = self._load()
+        except FileNotFoundError:
+            self.on_status("error", error=f"profile not found: {self.path}")
+            return
+        except (json.JSONDecodeError, ValueError) as e:
+            self.on_status("error", error=f"bad profile: {e}")
+            return
+        self.on_status("connected")
+        for p in blocks:
+            try:
+                self.on_profile(p)
+            except Exception as e:  # one bad block shouldn't kill the feed
+                sys.stderr.write(f"[file] on_profile failed for a block: {e!r}\n")
+
+    def run(self):
+        print(f"[file] standalone profile source -> {self.path}")
+        self.on_status("starting")
+        # initial load
+        try:
+            self._mtime = os.path.getmtime(self.path)
+        except OSError:
+            self._mtime = None
+        self._apply()
+        # poll for changes + honour SIGHUP
+        while not self.stop.is_set():
+            for _ in range(int(self.period * 10)):
+                if self.stop.is_set():
+                    return
+                if self._hup.is_set():
+                    self._hup.clear()
+                    print("[file] SIGHUP — reloading profile")
+                    self._apply()
+                time.sleep(0.1)
+            try:
+                m = os.path.getmtime(self.path)
+            except OSError:
+                continue
+            if self._mtime is None or m != self._mtime:
+                self._mtime = m
+                print("[file] profile changed on disk — reloading")
+                self._apply()
+
+
+# ---- driver ---------------------------------------------------------------
+def cmd_run(args):
+    print(f"[mrc-nic] build {MRC_NIC_BUILD} starting (pid {os.getpid()})")
+    # In standalone mode, allow tenant, underlay, and gateway to come from the
+    # profile file so the launch command needn't repeat them. CLI flags still win.
+    prof_gateway = None
+    prof_decap_sid = None
+    if not args.controller:
+        try:
+            with open(args.profile) as _f:
+                _doc = json.load(_f)
+            if not args.tenant and _doc.get("tenant"):
+                args.tenant = _doc["tenant"]
+            if (not args.underlay or args.underlay == "eth1") and _doc.get("underlay"):
+                args.underlay = _doc["underlay"]
+            prof_gateway = _doc.get("gateway")
+            prof_decap_sid = _doc.get("decap_sid")
+        except (FileNotFoundError, ValueError, KeyError):
+            pass
+    if getattr(args, "gateway", None):
+        prof_gateway = args.gateway   # explicit CLI gateway wins over everything
+    if not args.tenant:
+        sys.stderr.write("error: --tenant not given and no 'tenant' field in the profile\n")
+        sys.exit(2)
+    state_path = resolve_state_path(args.state)
+    dp = Dataplane(args.iface, args.tenant, args.underlay, dry_run=args.dry_run)
+    if prof_gateway:
+        dp.gateway = prof_gateway   # deterministic nexthop from the generator; avoids the
+                                    # fragile route-table discovery that can return None.
+    if prof_decap_sid:
+        dp.decap_sid = prof_decap_sid  # spec-mode: decap the GPU's own decap SID (block:gpu_usid::)
+    dp.bring_up()
+    started = time.time()
+    state = State(state_path, agent_meta={
+        "host": args.host, "iface": args.iface, "tenant": args.tenant,
+        "underlay": args.underlay, "controller_url": args.controller,
+        "pid": os.getpid(), "started_at": started, "uptime_s": 0,
+        "dry_run": bool(args.dry_run),
+    })
+    print(f"[agent] state -> {state_path}")
+
+    stop = threading.Event()
+    def shutdown(*_): print("[agent] stop"); stop.set()
+    signal.signal(signal.SIGINT, shutdown); signal.signal(signal.SIGTERM, shutdown)
+
+    standalone = not args.controller
+    metrics = None
+    mesh = None
+    if not standalone:
+        metrics = MetricsPoster(args.controller, args.host, args.underlay, state, dp)
+        metrics.start()
+
+    # always-on full-mesh reachability probe (RTT / loss / jitter to every peer)
+    # — controller-coupled (POSTs results), so only when attached to a controller.
+    if not standalone:
+        mesh = MeshHealth(args.controller, args.host, stop, state, dp)
+        mesh.start()
+
+    def on_status(status, **kw):
+        upd = {"status": status, "last_status_at": time.time()}
+        if "reconnects" in kw: upd["reconnects"] = kw["reconnects"]
+        if "error" in kw:      upd["last_error"] = kw["error"]
+        state.update("controller", **upd)
+
+    def on_profile(p):
+        mode = (p.get("mode") or "").lower()
+        flow = p.get("flow") or {}
+        dst = p.get("active_dst") or flow.get("dst_addr")
+        evs = p.get("active_evs") or []
+        stacks = [e["usid"] for e in evs if e.get("usid")]
+        if not stacks and p.get("active_usid"): stacks = [p["active_usid"]]
+        # for UDP/STEV the EV itself doubles as a UDP src-port hint for apps
+        ev_ports = [int(e["entropy"]) for e in evs if isinstance(e.get("entropy"), int)]
+
+        c = state.data["controller"]
+        state.update("controller",
+                     events_received=c.get("events_received", 0) + 1,
+                     last_event_at=time.time())
+        state.set("profile", {**p, "received_at": time.time()})
+        # Standalone multi-peer: the single "profile" slot only holds the LAST peer
+        # pushed (legacy controller pushed one active flow at a time). Accumulate ALL
+        # peers keyed by dst so `paths` / `status` can show the full mesh, not just the
+        # most-recent push.
+        if dst:
+            peers = state.data.get("peers")
+            if not isinstance(peers, dict):
+                peers = {}
+            peers[str(dst)] = {
+                "dst": dst,
+                "flow": flow,
+                "mode": mode,
+                "active_evs": evs,
+                "received_at": time.time(),
+            }
+            state.set("peers", peers)
+
+        # Only the source host of the flow programs anything. The destination
+        # already decaps natively via its End.DT6 SID (SRv6) or just receives
+        # plain RoCEv2 (UDP/STEV/none).
+        #
+        # In STANDALONE mode the generator wrote one profile file PER source GPU,
+        # so every block in THIS file is sourced from THIS NIC by construction —
+        # the host-name gate is both redundant and fragile (clab hostname need not
+        # equal the profile's node name), so we skip it and always program.
+        if (not standalone) and flow.get("src") and flow.get("src") != args.host:
+            print(f"[push] mode={mode} paths={len(stacks)} dst={dst} "
+                  f"(this host is not the source — no programming)")
+            state.update("kernel", route_dst=None, n_paths=0, last_mode=mode,
+                         last_program_at=time.time(),
+                         last_program_ok=None, last_program_error=None)
+            return
+
+        # Clear any stale encap from a previous mode before re-programming.
+        # Without this, a leftover SRv6 route would shadow a later UDP/none mode.
+        if dst:
+            dp.clear_encap(dst)
+
+        if mode == "srv6":
+            if dst and evs:
+                ok, err = dp.program_srv6(dst, evs)
+            else:
+                ok, err = False, "no segments"
+            state.update("kernel", route_dst=dst, n_paths=len(stacks), last_mode=mode,
+                         last_program_at=time.time(),
+                         last_program_ok=ok, last_program_error=err)
+            print(f"[push] mode=srv6 paths={len(stacks)} dst={dst} ok={ok}")
+
+        elif mode in ("udp", "stev"):
+            # No kernel encap. The MRC-aware app (rocebench) reads active_evs
+            # from /run/mrc-agent.json and encodes EV in its RoCEv2 UDP source
+            # port (UDP) or structured into UDP src per the STEV bit layout.
+            print(f"[push] mode={mode} ev_ports={ev_ports} — state published, "
+                  f"encap is app-driven (no kernel routes installed)")
+            state.update("kernel", route_dst=None, n_paths=len(ev_ports),
+                         last_mode=mode, last_program_at=time.time(),
+                         last_program_ok=True, last_program_error=None)
+
+        elif mode in ("none", "ipv4", ""):
+            # Plain RoCEv2, no MRC. The app talks to dst as a normal IPv4 (or
+            # IPv6) peer; switches L4-hash on whatever 5-tuple the app exposes.
+            print(f"[push] mode={mode or 'none'} — plain RoCEv2, no MRC encap")
+            state.update("kernel", route_dst=None, n_paths=0, last_mode=mode,
+                         last_program_at=time.time(),
+                         last_program_ok=True, last_program_error=None)
+
+        else:
+            print(f"[push] mode={mode}: unrecognized — leaving dataplane alone")
+            state.update("kernel", route_dst=None, n_paths=0, last_mode=mode,
+                         last_program_at=time.time(),
+                         last_program_ok=False, last_program_error=f"unknown mode '{mode}'")
+
+    try:
+        if standalone:
+            # No controller: read the generator-produced profile from disk and
+            # drive the SAME on_profile() seam. This is the virtual NIC running
+            # as a standing SR source with its precomputed EV-set.
+            src = FileProfileSource(args.profile, on_profile, on_status, stop)
+            src.run()
+        else:
+            # jobs channel: a second SSE subscription that lets this host run probes
+            # on demand from the Web UI test runner.
+            jobrunner = JobRunner(args.controller, args.host, stop)
+            jobrunner.reap_orphans()   # clear any probe left running from a prior session
+            jt = threading.Thread(
+                target=sse_subscribe,
+                args=(f"{args.controller.rstrip('/')}/api/jobs/stream",
+                      jobrunner.on_jobs, lambda *a, **k: None, stop),
+                daemon=True)
+            jt.start()
+            sse_subscribe(f"{args.controller.rstrip('/')}/api/profile/stream",
+                          on_profile, on_status, stop)
+    finally:
+        try: jobrunner.killall()
+        except Exception: pass
+        if metrics is not None: metrics.stop.set()
+        if args.delete_iface_on_exit: dp.tear_down()
+
+# ---- status / paths / test ------------------------------------------------
+def _bps(n):
+    for u, t in [("Tbps", 1e12), ("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)]:
+        if n >= t: return f"{n/t:.2f} {u}"
+    return f"{n:.0f} bps"
+
+def _bytes(n):
+    for u, t in [("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)]:
+        if n >= t: return f"{n/t:.2f} {u}"
+    return f"{n} B"
+
+def _age(ts):
+    if not ts: return "—"
+    s = time.time() - ts
+    if s < 1.0: return "now"
+    if s < 60:  return f"{s:.1f}s ago"
+    if s < 3600: return f"{int(s/60)}m {int(s%60)}s ago"
+    return f"{int(s/3600)}h {int((s%3600)/60)}m ago"
+
+def _ctrl_badge(status):
+    return {
+        "connected":    ("✓", "CONNECTED"),
+        "connecting":   ("·", "connecting"),
+        "disconnected": ("✗", "DISCONNECTED"),
+        "error":        ("!", "ERROR"),
+        "starting":     ("·", "starting"),
+    }.get(status, ("?", status.upper() if status else "UNKNOWN"))
+
+def _read_state(path):
+    try:
+        with open(path) as f: return json.load(f)
+    except FileNotFoundError:
+        sys.stderr.write(f"no state file at {path}; is mrc-agent running?\n")
+        sys.exit(2)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"state file corrupted: {e}\n"); sys.exit(2)
+
+def _query_kernel_route(dst):
+    if not dst: return ""
+    try:
+        r = run(["ip", "-6", "route", "show", dst], capture=True)
+        return (r.stdout or "").rstrip() if r.returncode == 0 else ""
+    except FileNotFoundError:
+        return ""
+
+def render_status(s):
+    a = s["agent"]; c = s["controller"]; p = s.get("profile") or {}; k = s["kernel"]; m = s["counters"]
+    badge, label = _ctrl_badge(c.get("status", "?"))
+    lines = []
+    lines.append(f"╭─ {a['iface']} · MRC virtual NIC ──────────────────────── state UP ─╮")
+    lines.append(f"│  host        {a['host']}")
+    lines.append(f"│  identity    {a['tenant']}")
+    lines.append(f"│  underlay    {a['underlay']}")
+    upt = a.get("uptime_s", 0)
+    upt_str = f"{upt//3600}h {(upt%3600)//60}m {upt%60}s" if upt >= 3600 else f"{upt//60}m {upt%60}s" if upt >= 60 else f"{upt}s"
+    lines.append(f"│  uptime      {upt_str}")
+    if a.get("dry_run"): lines.append("│  *** DRY-RUN MODE — no kernel changes ***")
+    lines.append("╰" + "─" * 65)
+    lines.append("")
+    lines.append(f"  CONTROLLER  {c.get('url','-')}")
+    lines.append(f"    [{badge}] {label} · {c.get('events_received',0)} events received · last push {_age(c.get('last_event_at'))}")
+    if c.get("reconnects", 0): lines.append(f"        reconnects: {c['reconnects']}")
+    if c.get("last_error"):    lines.append(f"        last error: {c['last_error']}")
+    lines.append("")
+    if p:
+        mode = (p.get("mode") or "-").lower()
+        mp = " · multipath" if p.get("multipath") else ""
+        flow = p.get("flow") or {}
+        lines.append(f"  EV PROFILE  (mode {mode.upper()}{mp})")
+        lines.append(f"    flow      {flow.get('src','?')} → {flow.get('dst','?')} ({flow.get('dst_addr','-')})")
+        evs = p.get("active_evs") or []
+        by_usid = {e.get("usid"): e for e in (p.get("evs") or []) if e.get("usid")}
+        if mode == "srv6":
+            if evs:
+                for e in evs:
+                    full = by_usid.get(e["usid"], {})
+                    pid  = full.get("id", "via-?")
+                    lines.append(f"    [✓] {pid:<18} EV {e['entropy']:>5}    {e['usid']}")
+            else:
+                lines.append("    (no active EVs)")
+        elif mode in ("udp", "stev"):
+            if evs:
+                lines.append(f"    encap     app-driven RoCEv2/UDP — EV in UDP source port")
+                for e in evs:
+                    # match the EV back to its path label via the full evs list
+                    pid = "via-?"
+                    for full in p.get("evs") or []:
+                        if full.get("entropy") == e.get("entropy"):
+                            pid = full.get("id", pid); break
+                    if mode == "stev":
+                        lines.append(f"    [✓] {pid:<18} STEV {e['entropy']:>5}  (srcport ← STEV(path,flow))")
+                    else:
+                        lines.append(f"    [✓] {pid:<18} EV {e['entropy']:>5}    (srcport ← EV)")
+            else:
+                lines.append("    (no active EVs)")
+        elif mode in ("none", "ipv4", ""):
+            lines.append("    plain RoCEv2 — no MRC encap; underlay does L4-hash ECMP")
+        else:
+            lines.append(f"    (unrecognized mode '{mode}')")
+    else:
+        lines.append("  EV PROFILE  (none received yet)")
+    lines.append("")
+    lines.append(f"  KERNEL ROUTE  →  {k.get('route_dst','—')}")
+    if k.get("route_dst"):
+        kind = "ECMP" if k.get("n_paths", 0) > 1 else ("single-path" if k.get("n_paths") == 1 else "—")
+        status = "OK" if k.get("last_program_ok") else ("FAILED" if k.get("last_program_ok") is False else "—")
+        lines.append(f"    {kind} · {k.get('n_paths',0)} nexthop(s) · programmed {_age(k.get('last_program_at'))} · {status}")
+        if k.get("last_program_error"): lines.append(f"    error: {k['last_program_error']}")
+        live = _query_kernel_route(k["route_dst"])
+        if live:
+            lines.append("    live kernel route:")
+            for L in live.splitlines(): lines.append("      " + L)
+    lines.append("")
+    lines.append(f"  COUNTERS  (underlay {m.get('iface','-')}; mrc0 is metadata-only)")
+    lines.append(f"    tx        {_bytes(m.get('tx_bytes_total',0)):>12}    last sec   {_bps(m.get('tx_bps_1s',0))}")
+    lines.append(f"    rx        {_bytes(m.get('rx_bytes_total',0)):>12}    last sec   {_bps(m.get('rx_bps_1s',0))}")
+    lines.append(f"    sampled   {_age(m.get('sampled_at'))}")
+    # mesh health (this host's view of every peer)
+    mesh = s.get("mesh") or {}
+    lines.append("")
+    if mesh.get("last_sweep_at"):
+        lines.append(f"  MESH HEALTH  {mesh.get('peers_up',0)}/{mesh.get('peers_total',0)} peers up "
+                     f"· swept {_age(mesh.get('last_sweep_at'))}")
+        for sm in mesh.get("samples", []):
+            tag = (" via " + sm["spine"]) if sm.get("spine") else ""
+            if sm.get("up"):
+                rtt = sm.get("rtt_avg")
+                lines.append(f"    [✓] {sm['peer']:<8}{tag:<16} loss {sm.get('loss_pct',0):>5.1f}%"
+                             + (f"   rtt {rtt:.2f} ms" if rtt is not None else ""))
+            else:
+                why = sm.get("err") or "unreachable"
+                lines.append(f"    [✗] {sm['peer']:<8}{tag:<16} {why}")
+    else:
+        lines.append("  MESH HEALTH  (no sweep yet — needs iputils-ping + peers from /api/topology)")
+    return "\n".join(lines)
+
+def cmd_status(args):
+    path = resolve_state_path(args.state)
+    if args.watch:
+        try:
+            while True:
+                sys.stdout.write("\033[2J\033[H")
+                sys.stdout.write(render_status(_read_state(path)))
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                time.sleep(args.interval)
+        except KeyboardInterrupt: print()
+        return
+    s = _read_state(path)
+    if args.json: print(json.dumps(s, indent=2))
+    else:         print(render_status(s))
+
+def cmd_doctor(args):
+    """Dump everything relevant to SRv6 decap so a failure is diagnosable in one shot,
+    instead of the multi-hour tcpdump archaeology. Read-only."""
+    def sh(cmd):
+        try:
+            r = run(cmd if isinstance(cmd, list) else cmd, capture=True)
+            return (r.stdout or r.stderr or "").rstrip()
+        except (FileNotFoundError, OSError) as e:
+            return f"(command unavailable: {e})"
+    print(f"=== mrc-nic doctor (build {MRC_NIC_BUILD}) ===")
+    print("\n[1] iproute2 version (need >= 6.1 for uSID/NEXT-C-SID decap):")
+    print("   ", sh(["ip", "-V"]))
+    print("\n[2] kernel (need >= 6.1 for uN/next-csid):")
+    print("   ", sh(["uname", "-r"]))
+    print("\n[3] seg6_enabled per interface (ingress iface MUST be 1 or decap won't fire):")
+    import glob as _g
+    for p in sorted(_g.glob("/proc/sys/net/ipv6/conf/*/seg6_enabled")):
+        try:
+            with open(p) as f:
+                print(f"     {p.split('/')[-2]:10} = {f.read().strip()}")
+        except OSError:
+            pass
+    print("\n[4] installed seg6local (decap) routes:")
+    out = sh(["ip", "-6", "route", "show", "table", "100"])
+    if out and "seg6local" in out:
+        for line in out.splitlines():
+            print("     [table 100]", line)
+    out2 = sh(["ip", "-6", "route", "show"])
+    for line in out2.splitlines():
+        if "seg6local" in line:
+            print("    ", line)
+    print("\n[4b] localsid steering rules (prio 50 -> table 100; REQUIRED for decap to fire):")
+    rules = sh(["ip", "-6", "rule", "show"])
+    for line in rules.splitlines():
+        if "lookup 100" in line or "prio 50" in line:
+            print("    ", line.strip())
+    print("\n[4c] carrier-block route (lets the GPU's own encapped replies egress):")
+    for line in out2.splitlines():
+        if "fcbb:bb00::/32" in line or "fc00::/16" in line:
+            print("    ", line)
+    print("\n[5] capability verdict:")
+    ver = sh(["ip", "-V"])
+    import re as _re
+    m = _re.search(r"iproute2-(?:ss(\d{6})|v?(\d+)\.(\d+))", ver)
+    if m and (m.group(1) or (int(m.group(2)), int(m.group(3))) < (6, 1)):
+        print("     TOO OLD — uSID decap will silently fail. Use a GPU image with")
+        print("     iproute2 >= 6.1 (Debian bookworm=6.1, trixie=6.15). Or run the")
+        print("     proven leaf-decap fabric (spec_mode=false), which works on any image.")
+    elif m:
+        print(f"     OK ({ver}) — iproute2 supports uSID/NEXT-C-SID decap.")
+    else:
+        print(f"     UNKNOWN — could not parse '{ver}'.")
+
+
+def _decode_usid(hx, nxt=None):
+    """Label a single 16-bit uSID hextet by its position-encoded meaning.
+    Encoding (matches the generator's address_plan, post-aggregation layout):
+      RPII  -> R=role(1=spine,2=leaf), P=plane, II=node index   (a uN/locator waypoint)
+      eNNN  -> End.X function toward neighbor NNN (next-csid cross-connect on a spine/leaf)
+      9LLL  -> the GPU block: nibble 9, LLL = home-leaf index; the FOLLOWING hextet is the
+               local GPU index. Together block:9LLL:GGGG:: is a GPU's decap SID (End.DT6).
+    Returns (short, detail) or None for an empty (0000) hextet."""
+    if hx in ("0000", "0"):
+        return None
+    if hx.startswith("9"):
+        leaf = int(hx[1:], 16)
+        gg = (": gpu " + str(int(nxt, 16))) if nxt and nxt not in ("0000", "0") else ""
+        return (f"leaf{leaf} GPU blk",
+                f"GPU decap block for leaf{leaf}{gg} — terminal End.DT6; the destination NIC "
+                f"strips the outer header here and delivers the inner packet")
+    if hx.startswith("e"):
+        n = hx[1:]
+        return (f"End.X→{n}", f"End.X cross-connect function (toward neighbor {int(n,16)}); the "
+                              f"spine does a next-csid shift, popping its locator+func pair")
+    role = {"1": "spine", "2": "leaf"}.get(hx[0], "node")
+    plane = hx[1]
+    idx = int(hx[2:], 16)
+    return (f"{role}{idx} loc", f"{role}{idx} locator (plane {plane}) — a uN waypoint; the packet "
+                               f"is steered to {role}{idx}")
+
+
+def _decode_carrier(usid):
+    """Return (block, [(hextet, short, detail), ...]) for the meaningful uSIDs after the
+    2-hextet block. Uses socket.inet_pton (already imported) to expand '::' rather than
+    pulling in the ipaddress module."""
+    try:
+        packed = socket.inet_pton(socket.AF_INET6, usid)
+    except OSError:
+        return usid, []
+    h = ["%02x%02x" % (packed[i], packed[i + 1]) for i in range(0, 16, 2)]
+    block = ":".join(h[0:2])
+    out = []
+    rest = h[2:]
+    i = 0
+    while i < len(rest):
+        hx = rest[i]
+        nxt = rest[i + 1] if i + 1 < len(rest) else None
+        d = _decode_usid(hx, nxt)
+        if d:
+            # a GPU block hextet (9LLL) consumes the following GPU-index hextet too
+            if hx.startswith("9"):
+                shown = f"{hx}:{nxt}" if nxt and nxt not in ("0000", "0") else hx
+                out.append((shown, d[0], d[1]))
+                i += 2
+                continue
+            out.append((hx, d[0], d[1]))
+        i += 1
+    return block, out
+
+
+def cmd_paths(args):
+    s = _read_state(resolve_state_path(args.state))
+    decode = getattr(args, "decode", False)
+
+    def show_ev(e):
+        sp = e.get("spine") or "same-leaf"
+        usid = e.get("usid", "?")
+        print(f"       EV {e.get('entropy','?'):>5}  via {sp:<8}  {usid}")
+        if decode and usid != "?":
+            block, hops = _decode_carrier(usid)
+            print(f"          block {block}  +  {len(hops)} uSID(s):")
+            for i, (hx, short, detail) in enumerate(hops, 1):
+                print(f"            {i}. {hx}  [{short}]  {detail}")
+
+    peers = s.get("peers")
+    if isinstance(peers, dict) and peers:
+        total = sum(len(v.get("active_evs", [])) for v in peers.values())
+        print(f"mode=SRV6  peers={len(peers)}  total_evs={total}")
+        for dst in sorted(peers):
+            v = peers[dst]
+            flow = v.get("flow") or {}
+            name = flow.get("dst") or dst
+            evs = v.get("active_evs", [])
+            print(f"  -> {name} ({dst})  [{len(evs)} path{'s' if len(evs)!=1 else ''}]")
+            for e in evs:
+                show_ev(e)
+        return
+    p = s.get("profile") or {}
+    print(f"mode={p.get('mode','-').upper()} active={len(p.get('active_evs',[]))}")
+    for e in p.get("active_evs", []):
+        show_ev(e)
+
+def cmd_mesh_test(args):
+    """Run a single mesh sweep synchronously and print exactly what happens:
+    is ping present, what peers were learned, per-peer result, and (optionally)
+    POST it. This isolates the three failure modes — no ping, no peers, POST
+    rejected — without waiting on the background thread."""
+    import threading as _t
+    stop = _t.Event()
+    m = MeshHealth(args.controller, args.host, stop)
+    # 1. ping availability
+    import shutil
+    png = shutil.which("ping")
+    print(f"ping binary: {png or 'NOT FOUND — install iputils-ping'}")
+    # 2. peer discovery from the controller topology
+    m._refresh_peers()
+    if not m.peers:
+        print(f"peers: NONE learned from {args.controller}/api/topology")
+        print("  → is the controller reachable from this host? is topology populated?")
+        return
+    print(f"peers ({len(m.peers)}): " + ", ".join(f"{k}={v}" for k, v in m.peers.items()))
+    # 3. one synchronous sweep
+    samples = []
+    for name, addr in m.peers.items():
+        r = m._ping6(addr, MESH_COUNT, MESH_INTERVAL)
+        up = r.get("rx", 0) > 0
+        samples.append({"peer": name, "addr": addr, "up": up, **r})
+        if up:
+            print(f"  [✓] {name:<10} {addr}  loss {r.get('loss_pct',0):.1f}%  rtt {r.get('rtt_avg')} ms")
+        else:
+            print(f"  [✗] {name:<10} {addr}  {r.get('err') or 'unreachable (100% loss)'}")
+    # 4. optional POST
+    if args.post:
+        m._post(samples)
+        print(f"posted {len(samples)} samples → {args.controller}/api/mesh-health")
+        try:
+            import urllib.request as _u
+            body = _u.urlopen(f"{args.controller.rstrip('/')}/api/diag", timeout=3).read().decode()
+            print("controller /api/diag now:", body[:200])
+        except Exception as e:
+            print("diag check failed:", e)
+
+def cmd_test(args):
+    url = f"{args.controller.rstrip('/')}/api/profile/stream"
+    print(f"[test] connecting to {url}")
+    stop = threading.Event()
+    def on(p):
+        print(f"[test] received profile: mode={p.get('mode')} active_evs={len(p.get('active_evs',[]))}")
+        stop.set()
+    def st(*a, **kw): pass
+    t = threading.Thread(target=sse_subscribe, args=(url, on, st, stop), daemon=True)
+    t.start(); t.join(timeout=args.timeout)
+    if not stop.is_set(): print("[test] timeout"); sys.exit(2)
+    print("[test] OK")
+
+# ---- monitor (rich live TUI) -----------------------------------------------
+SS_BIN = "ss"
+def _ss_flows(iface_addr):
+    """Parse `ss -tn6 -i -o state established`. Returns flows whose local
+    or peer address matches the host's tenant."""
+    if not iface_addr: return []
+    r = run([SS_BIN, "-tn6", "-i", "-o", "state", "established"], capture=True)
+    if r.returncode != 0 or not r.stdout: return []
+    flows = []; cur = None
+    for line in r.stdout.splitlines():
+        if not line.strip(): continue
+        if line.startswith(("Recv-Q", "State", "Netid")): continue
+        if not line.startswith((" ", "\t")):
+            parts = line.split()
+            if len(parts) < 4: continue
+            try:
+                local, peer = parts[-2], parts[-1]
+                la, lp = local.rsplit(":", 1); pa, pp = peer.rsplit(":", 1)
+                la, pa = la.strip("[]"), pa.strip("[]")
+                if iface_addr not in la and iface_addr not in pa:
+                    cur = None; continue
+                cur = {"sport": lp, "dport": pp, "src": la, "dst": pa,
+                       "cwnd": None, "rtt": None, "retr": 0, "mss": 0,
+                       "bytes_sent": 0, "segs_out": 0, "segs_in": 0}
+                flows.append(cur)
+            except Exception: cur = None
+            continue
+        if cur is None: continue
+        for tok in line.strip().split():
+            if ":" not in tok: continue
+            k, _, v = tok.partition(":")
+            try:
+                if k == "cwnd":        cur["cwnd"] = int(v)
+                elif k == "rtt":       cur["rtt"]  = float(v.split("/")[0])
+                elif k == "retrans":   cur["retr"] = int(v.split("/")[-1])
+                elif k == "bytes_sent":cur["bytes_sent"] = int(v)
+                elif k == "segs_out":  cur["segs_out"]   = int(v)
+                elif k == "segs_in":   cur["segs_in"]    = int(v)
+                elif k == "mss":       cur["mss"]        = int(v)
+            except Exception: pass
+    return flows
+
+def _flow_path_seg(dst_addr, sport, dport):
+    """Ask the kernel which nexthop's encap segs it would pick for this
+    5-tuple. Returns the inner uSID string or None."""
+    if not dst_addr: return None
+    r = run(["ip","-6","route","get",dst_addr,"sport",str(sport),"dport",str(dport)],
+            capture=True)
+    if r.returncode != 0 or not r.stdout: return None
+    out = r.stdout.strip()
+    if "[" in out and "]" in out:
+        return out[out.index("[")+1:out.index("]")].strip()
+    return None
+
+def _snmp6():
+    out = {}
+    try:
+        for ln in open("/proc/net/snmp6"):
+            k, _, v = ln.strip().partition(" "); v = v.strip()
+            if v.isdigit() and k in (
+                "Ip6InReceives","Ip6InDelivers","Ip6OutForwDatagrams",
+                "Ip6InDiscards","Ip6OutDiscards","Ip6InAddrErrors",
+                "Ip6InHdrErrors","Ip6InNoRoutes","Ip6InTruncatedPkts",
+                "Ip6OutNoRoutes"):
+                out[k] = int(v)
+    except Exception: pass
+    return out
+
+def _iface_stats(iface):
+    s = {}
+    for k in ("tx_bytes","rx_bytes","tx_packets","rx_packets","tx_errors","rx_errors","tx_dropped","rx_dropped"):
+        try: s[k] = int(open(f"/sys/class/net/{iface}/statistics/{k}").read())
+        except Exception: s[k] = 0
+    return s
+
+def _bar(frac, w=22): n = int(round(max(0.0, min(1.0, frac)) * w)); return "█"*n + "░"*(w-n)
+def _ucwnd(c): return f"{c/1000:.1f}K" if c and c>=1000 else (str(c) if c else "—")
+def _ubps(b, dt):
+    bps = (b*8.0) / max(dt, 1e-9)
+    if bps >= 1e9: return f"{bps/1e9:.2f}G"
+    if bps >= 1e6: return f"{bps/1e6:.1f}M"
+    if bps >= 1e3: return f"{bps/1e3:.0f}K"
+    return f"{bps:.0f}"
+
+def cmd_monitor(args):
+    """Live TUI: per-flow cwnd/rtt/retr, aggregate bytes/pkts, IPv6 fabric
+    counters, mode-specific overlay, and per-path attribution for SRv6 ECMP.
+    q to quit, r to reset deltas."""
+    path = resolve_state_path(args.state)
+    last_iface_snap = None; last_iface = None
+    last_flow_snap = {}; last_t = time.time()
+    import select, tty, termios
+    # put stdin in raw cbreak so single-key input is responsive
+    old_tty = None
+    try:
+        if sys.stdin.isatty():
+            old_tty = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        while True:
+            s = _read_state(path)
+            now = time.time(); dt = max(now - last_t, 1e-3)
+            a = s["agent"]; c = s["controller"]; p = s.get("profile") or {}; k = s["kernel"]
+            mode = (p.get("mode") or "").lower()
+            iface = a.get("underlay", "eth1")
+            iface_snap = _iface_stats(iface)
+            flows = _ss_flows(a.get("tenant", ""))
+
+            for f in flows:
+                key = (f["sport"], f["dport"], f["src"], f["dst"])
+                prev = last_flow_snap.get(key)
+                if prev:
+                    f["dbytes"] = max(f["bytes_sent"] - prev["bytes_sent"], 0)
+                    f["dacks"]  = max(f["segs_in"]    - prev["segs_in"],    0)
+                    f["dsegs"]  = max(f["segs_out"]   - prev["segs_out"],   0)
+                    f["dretr"]  = max(f["retr"]       - prev["retr"],       0)
+                else:
+                    f["dbytes"] = f["dacks"] = f["dsegs"] = f["dretr"] = 0
+                last_flow_snap[key] = {"bytes_sent": f["bytes_sent"],
+                                       "segs_in": f["segs_in"],
+                                       "segs_out": f["segs_out"],
+                                       "retr": f["retr"]}
+                f["path"] = None
+                if mode == "srv6" and k.get("n_paths", 0) > 1 and k.get("route_dst"):
+                    f["path"] = _flow_path_seg(k["route_dst"], f["sport"], f["dport"])
+
+            if last_iface_snap and last_iface == iface:
+                dtx  = max(iface_snap["tx_bytes"]   - last_iface_snap["tx_bytes"],   0)
+                drx  = max(iface_snap["rx_bytes"]   - last_iface_snap["rx_bytes"],   0)
+                dtxp = max(iface_snap["tx_packets"] - last_iface_snap["tx_packets"], 0)
+                drxp = max(iface_snap["rx_packets"] - last_iface_snap["rx_packets"], 0)
+            else:
+                dtx = drx = dtxp = drxp = 0
+            last_iface_snap = iface_snap; last_iface = iface; last_t = now
+            sn = _snmp6()
+
+            buf = ["\033[2J\033[H"]
+            badge, lbl = _ctrl_badge(c.get("status", "?"))
+            upt = a.get("uptime_s", 0)
+            ustr = f"{upt//3600}h{(upt%3600)//60:02d}m" if upt>=3600 else f"{upt//60}m{upt%60:02d}s" if upt>=60 else f"{upt}s"
+            mp = " · MULTIPATH" if p.get("multipath") else ""
+            buf.append(f"╭─ mrc-agent · LIVE MONITOR ─── mode \033[36m{mode.upper() or '—'}\033[0m{mp} ─── q quit · r reset ─╮")
+            buf.append(f"│ host       {a.get('host','-')} → {(p.get('flow') or {}).get('dst','-')}    underlay {iface}    up {ustr}")
+            buf.append(f"│ ctrl       [{badge}] {lbl}    events {c.get('events_received',0)}    last push {_age(c.get('last_event_at'))}")
+            if k.get("route_dst"):
+                kind = "ECMP" if k.get("n_paths",0) > 1 else "single"
+                buf.append(f"│ kernel     route → {k['route_dst']}  ({kind} · {k.get('n_paths',0)} path)")
+            else:
+                buf.append(f"│ kernel     no encap route (mode={mode or 'none'} — app-driven or plain)")
+            buf.append("╰" + "─" * 86)
+            buf.append("")
+
+            evs = p.get("active_evs") or []
+            buf.append(f"  ACTIVE  {len(evs)} path(s)")
+            for e in evs:
+                pid = "via-?"
+                for full in p.get("evs") or []:
+                    if full.get("entropy") == e.get("entropy"): pid = full.get("id", pid); break
+                if mode == "srv6":
+                    buf.append(f"    [✓] {pid:<18} EV {str(e.get('entropy','-')):>5}    \033[33m{e.get('usid','-')}\033[0m")
+                elif mode in ("udp","stev"):
+                    src_hint = "STEV(path,flow)" if mode=="stev" else "EV"
+                    buf.append(f"    [✓] {pid:<18} EV {str(e.get('entropy','-')):>5}    udp.srcport ← {src_hint}")
+                else:
+                    buf.append(f"    [✓] {pid:<18} (plain RoCEv2 / no MRC)")
+            buf.append("")
+
+            buf.append(f"  FLOWS ({len(flows)} established)                                          dt={dt*1000:.0f}ms")
+            buf.append("    sport  dport      cwnd     rtt(ms)  retr   acks/s   bytes/s   path")
+            buf.append("    " + "─" * 80)
+            for f in sorted(flows, key=lambda x: int(x.get("sport","0") or 0)):
+                pp = "—"
+                if f.get("path"):
+                    seg = f["path"]
+                    if seg.startswith("fc00:0:"):
+                        rest = seg[len("fc00:0:"):]
+                        pp = "sp" + rest.split(":",1)[0]
+                    else: pp = seg[:8]
+                rtt = f.get("rtt") or 0.0
+                buf.append(f"    {f['sport']:>5}  {f['dport']:>5}  {_ucwnd(f['cwnd']):>8}   "
+                           f"{rtt:>6.2f}  {f['retr']:>4}   {int(f['dacks']/dt):>6}  "
+                           f"{_ubps(f['dbytes'], dt):>8}   {pp}")
+            buf.append("")
+
+            buf.append(f"  COUNTERS · underlay {iface}                                       rate over {dt*1000:.0f}ms")
+            buf.append(f"    tx     {iface_snap['tx_bytes']:>14,} B  ({iface_snap['tx_packets']:>10,} pkts)   {_ubps(dtx, dt):>8}bps · {int(dtxp/dt):>6} pps")
+            buf.append(f"    rx     {iface_snap['rx_bytes']:>14,} B  ({iface_snap['rx_packets']:>10,} pkts)   {_ubps(drx, dt):>8}bps · {int(drxp/dt):>6} pps")
+            buf.append(f"    errors tx={iface_snap['tx_errors']} drop={iface_snap['tx_dropped']}    rx errs={iface_snap['rx_errors']} drop={iface_snap['rx_dropped']}")
+            buf.append("")
+
+            tot_acks = sum(f["segs_in"]  for f in flows)
+            tot_retr = sum(f["retr"]     for f in flows)
+            tot_segs = sum(f["segs_out"] for f in flows)
+            d_acks   = sum(f["dacks"]    for f in flows)
+            d_retr   = sum(f["dretr"]    for f in flows)
+            buf.append("  TCP DERIVED                                                              /s")
+            buf.append(f"    ACKs received     {tot_acks:>14,}                                  {int(d_acks/dt):>8}")
+            buf.append(f"    segs sent         {tot_segs:>14,}")
+            buf.append(f"    retrans (≈NACK)   {tot_retr:>14,}                                  {int(d_retr/dt):>8}")
+            buf.append("    (true RoCE ACK/NACK/SACK counters require a real IB device)")
+            buf.append("")
+
+            buf.append("  IPv6 FABRIC")
+            buf.append(f"    in receives     {sn.get('Ip6InReceives',0):>12,}     in delivers   {sn.get('Ip6InDelivers',0):>12,}")
+            buf.append(f"    out forw        {sn.get('Ip6OutForwDatagrams',0):>12,}     in no route   {sn.get('Ip6InNoRoutes',0):>12,}")
+            buf.append(f"    in discards     {sn.get('Ip6InDiscards',0):>12,}     in addr err   {sn.get('Ip6InAddrErrors',0):>12,}")
+            buf.append("")
+
+            if mode == "srv6" and k.get("n_paths",0) > 1 and flows:
+                by = {}
+                for f in flows:
+                    pp = f.get("path") or "—"
+                    by.setdefault(pp, {"bytes": 0, "n": 0})
+                    by[pp]["bytes"] += f["dbytes"]; by[pp]["n"] += 1
+                total = sum(v["bytes"] for v in by.values()) or 1
+                buf.append("  PATH DISTRIBUTION (kernel 5-tuple hash, observed)")
+                for pp, v in sorted(by.items()):
+                    pct = v["bytes"] / total
+                    label = pp
+                    if pp and pp.startswith("fc00:0:"):
+                        rest = pp[len("fc00:0:"):]
+                        label = "via-sp" + rest.split(":",1)[0]
+                    buf.append(f"    {label:<22} {_bar(pct):<22} {_ubps(v['bytes'], dt):>8}bps  ({pct*100:>4.1f}%)  flows={v['n']}")
+                buf.append("")
+
+            sys.stdout.write("\n".join(buf)); sys.stdout.write("\n"); sys.stdout.flush()
+
+            if select.select([sys.stdin], [], [], args.interval)[0]:
+                ch = sys.stdin.read(1)
+                if ch in ("q", "Q"): break
+                if ch == "r":
+                    last_flow_snap.clear(); last_iface_snap = None
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if old_tty is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+        sys.stdout.write("\n"); sys.stdout.flush()
+
+def main():
+    # line-buffer stdout/stderr so /var/log/mrc-nic.log is populated promptly even
+    # when the process is backgrounded (nohup ... &) — default block buffering can
+    # leave the log empty until a full buffer flushes or the process exits.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    ap = argparse.ArgumentParser(prog="mrc-nic")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="run the NIC (foreground)")
+    p_run.add_argument("--host", default=socket.gethostname(),
+                       help="host label for controller telemetry (default: hostname)")
+    p_run.add_argument("--controller", default=None,
+                       help="controller URL. OMIT for standalone file-profile mode.")
+    p_run.add_argument("--profile", default="/etc/mrc-nic/profile.json",
+                       help="standalone profile JSON (used when --controller is absent)")
+    p_run.add_argument("--tenant", default=None,
+                       help="this NIC's tenant address (for decap). If omitted, read from the "
+                            "profile's top-level 'tenant' field.")
+    p_run.add_argument("--underlay", default="eth1")
+    p_run.add_argument("--gateway", default=None,
+                       help="explicit IPv6 nexthop for carrier-block + multipath encap routes "
+                            "(the GPU's leaf gateway). Overrides the profile's 'gateway' field "
+                            "and route-table discovery.")
+    p_run.add_argument("--iface", default=DEFAULT_IFACE)
+    p_run.add_argument("--state", default=DEFAULT_STATE,
+                       help=f"state file path (default {DEFAULT_STATE}, falls back to /tmp)")
+    p_run.add_argument("--dry-run", action="store_true")
+    p_run.add_argument("--delete-iface-on-exit", action="store_true")
+    p_run.set_defaults(func=cmd_run)
+
+    p_st = sub.add_parser("status", help="rich view of the running agent (reads local state file)")
+    p_st.add_argument("--state", default=DEFAULT_STATE)
+    p_st.add_argument("--watch", action="store_true", help="refresh every --interval seconds")
+    p_st.add_argument("--interval", type=float, default=1.0)
+    p_st.add_argument("--json", action="store_true")
+    p_st.set_defaults(func=cmd_status)
+
+    p_pa = sub.add_parser("paths", help="just the active paths")
+    p_pa.add_argument("--state", default=DEFAULT_STATE)
+    p_pa.add_argument("--decode", action="store_true",
+                      help="break each carrier into its component uSIDs and label what each "
+                           "one does and which node processes it (the hop-by-hop walk)")
+    p_pa.set_defaults(func=cmd_paths)
+
+    p_ver = sub.add_parser("version", help="print build stamp and exit")
+    p_ver.set_defaults(func=lambda a: print(MRC_NIC_BUILD))
+
+    p_doc = sub.add_parser("doctor", help="dump SRv6 decap diagnostics (iproute2 version, "
+                                          "seg6_enabled, installed decap routes, capability)")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    p_te = sub.add_parser("test", help="one-shot SSE connection test")
+    p_te.add_argument("--controller", required=True)
+    p_te.add_argument("--timeout", type=float, default=5.0)
+    p_te.set_defaults(func=cmd_test)
+
+    p_mon = sub.add_parser("monitor", help="live TUI: flows, ACKs, retr, per-path attribution")
+    p_mon.add_argument("--state", default=DEFAULT_STATE)
+    p_mon.add_argument("--interval", type=float, default=0.5)
+    p_mon.set_defaults(func=cmd_monitor)
+
+    p_mt = sub.add_parser("mesh-test",
+                          help="run ONE mesh sweep synchronously and print the result "
+                               "(diagnoses ping / peers / POST without the background thread)")
+    p_mt.add_argument("--controller", required=True)
+    p_mt.add_argument("--host", required=True)
+    p_mt.add_argument("--post", action="store_true", help="also POST the result to the controller")
+    p_mt.set_defaults(func=cmd_mesh_test)
+
+    args = ap.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()

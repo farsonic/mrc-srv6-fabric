@@ -1,0 +1,9 @@
+{
+  "mode": "srv6",
+  "flow": { "src": "gpu1", "dst": "gpu3" },
+  "active_dst": "fd00:9:1:201::2",
+  "active_evs": [
+    { "entropy": 49001, "usid": "fcbb:bb00:1101:2102::", "plane": 1 },
+    { "entropy": 49002, "usid": "fcbb:bb00:1102:2102::", "plane": 1 }
+  ]
+}

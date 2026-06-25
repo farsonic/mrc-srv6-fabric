@@ -1,0 +1,203 @@
+---
+# All-Linux FRR fabric: generate (bind-mounted frr.conf) -> deploy -> verify -> GPUs.
+# Switches are plain Linux + FRR; their full config (addresses, static routes, SRv6
+# locators + static-sids) is bind-mounted as /etc/frr/frr.conf and is live the moment
+# the node boots. No vtysh push, no port race, no ASAN. Ansible only verifies the
+# switches and configures the GPU hosts.
+
+- name: Generate FRR-linux topology, deploy, register hosts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    proj: "{{ playbook_dir }}/.."
+    fabric_vars_path: "{{ playbook_dir }}/../fabric_vars.json"
+  tasks:
+    - name: Preflight — find any existing *.clab.yml topology files
+      ansible.builtin.find:
+        paths: "{{ proj }}"
+        patterns: "*.clab.yml"
+      register: clab_files
+
+    - name: Preflight — destroy any lab whose name != current fabric_name (kills renamed/stale labs)
+      ansible.builtin.command:
+        cmd: "containerlab destroy -t {{ item.path }} --cleanup"
+        chdir: "{{ proj }}"
+      become: true
+      loop: "{{ clab_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: (item.path | basename) != (fabric_name ~ '.clab.yml')
+      failed_when: false
+      changed_when: true
+
+    - name: Preflight — remove stale *.clab.yml that don't match fabric_name
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ clab_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: (item.path | basename) != (fabric_name ~ '.clab.yml')
+
+    - name: Preflight — remove regenerated artifacts so a stale generator can't leave ghosts
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ proj }}/fabric_vars.json"
+        - "{{ proj }}/fabric_address_map.txt"
+        - "{{ proj }}/srv6-test.sh"
+        - "{{ proj }}/srv6-walk.sh"
+      when: do_generate | bool
+
+    - name: Generate topology + per-node frr.conf (bind-mount)
+      ansible.builtin.command:
+        cmd: >
+          python3 {{ proj }}/gen_clab_topology.py
+          --image {{ switch_image | default('frrouting/frr:latest') }} --gpu-image {{ gpu_image }}
+          {{ ('--gpus-per-leaf ' ~ gpus_per_leaf) if (gpus_per_leaf | default(0) | int) > 0 else ('--gpus ' ~ gpus) }}
+          --leaves {{ leaves }} --spines {{ spines }} --planes {{ planes }}
+          --name {{ fabric_name }} --plan {{ proj }}/address_plan.json --out {{ proj }}/fabric
+          --frr-linux --seg6 {{ seg6_mode | default("frr") }}
+          {{ '--mrc-nic' if (mrc_nic | default(false) | bool) else '' }}
+          {{ '--spec-mode' if (spec_mode | default(false) | bool) else '' }}
+        chdir: "{{ proj }}"
+      when: do_generate | bool
+
+    - name: Sanity — confirm both SRv6 scripts were generated (catches a stale generator)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ proj }}/srv6-test.sh"
+        - "{{ proj }}/srv6-walk.sh"
+      register: srv6_scripts
+      when: do_generate | bool and not (spec_mode | default(false) | bool)
+
+    - name: Refresh dynamic inventory so a topology RESIZE drops stale ghost nodes
+      ansible.builtin.meta: refresh_inventory
+
+    - name: Sanity — fail clearly if a script is missing
+      ansible.builtin.assert:
+        that: "srv6_scripts.results | selectattr('stat.exists', 'equalto', false) | list | length == 0"
+        fail_msg: >-
+          A generated SRv6 script is missing — gen_clab_topology.py is likely stale.
+          Re-extract the bundle (tar xzf mrc-fabric-ansible.tgz) and re-run.
+        success_msg: "srv6-test.sh and srv6-walk.sh generated."
+      when: do_generate | bool and not (spec_mode | default(false) | bool)
+
+    - name: Preflight — drop the mgmt network so it is recreated at the planned subnet
+      ansible.builtin.shell: |
+        containerlab destroy -t "{{ proj }}/{{ fabric_name }}.clab.yml" --cleanup >/dev/null 2>&1 || true
+        docker network rm "{{ fabric_name }}-mgmt" >/dev/null 2>&1 || true
+        true
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: true
+      when: do_deploy | bool
+
+    - name: Deploy containerlab topology (linux+FRR boots clean; no staggering needed)
+      ansible.builtin.command:
+        cmd: containerlab deploy -t {{ fabric_name }}.clab.yml --reconfigure
+        chdir: "{{ proj }}"
+      become: true
+      when: do_deploy | bool
+
+    - name: Load generated fabric_vars.json
+      ansible.builtin.set_fact:
+        fabric: "{{ lookup('file', fabric_vars_path) | from_json }}"
+
+    - name: Register every node as an in-memory host (group by role)
+      ansible.builtin.add_host:
+        name: "{{ item.key }}"
+        groups: >-
+          {{ 'spines,switches' if item.value.role == 'spine'
+             else 'leaves,switches' if item.value.role == 'leaf'
+             else 'gpus' }}
+        ansible_connection: community.docker.docker
+        ansible_host: "clab-{{ fabric.name }}-{{ item.key }}"
+        node: "{{ item.value }}"
+      loop: "{{ fabric.nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value.role }})"
+
+- name: Verify FRR on switches (config is bind-mounted; this only checks it took)
+  hosts: switches
+  gather_facts: false
+  tasks:
+    - name: Wait for FRR/vtysh to be ready
+      ansible.builtin.raw: "vtysh -c 'show version' 2>/dev/null | head -1"
+      register: vv
+      retries: 20
+      delay: 3
+      until: vv.stdout is defined and ('FRR' in vv.stdout)
+      changed_when: false
+      failed_when: false
+    - name: Collect underlay routes + kernel seg6local SIDs
+      ansible.builtin.raw: |
+        echo '=== ipv6 route static (FRR underlay) ==='
+        vtysh -c 'show ipv6 route static' 2>/dev/null | grep -E '^[SC]>' | head -15
+        echo '=== kernel seg6local SIDs (the SRv6 dataplane) ==='
+        ip -6 route show | grep -i seg6local || echo '(none installed!)'
+      register: frr_verify
+      changed_when: false
+    - name: Show verification
+      ansible.builtin.debug:
+        var: frr_verify.stdout_lines
+
+- name: Configure GPU hosts (plain Linux networking)
+  hosts: gpus
+  gather_facts: false
+  roles:
+    - gpu_host
+
+- name: Edgeshark packet-capture web UI (optional; host service, introspects all namespaces)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    es_src: "{{ playbook_dir }}/files/edgeshark-compose.yml"
+    es_run: "{{ playbook_dir }}/../.edgeshark-compose.yml"
+  tasks:
+    - name: Edgeshark — render compose into project dir
+      ansible.builtin.copy:
+        src: "{{ es_src }}"
+        dest: "{{ es_run }}"
+        remote_src: true
+        mode: "0644"
+      when: do_edgeshark | bool
+
+    - name: Edgeshark — set web UI port (default 5001)
+      ansible.builtin.replace:
+        path: "{{ es_run }}"
+        regexp: '"5001:5001"'
+        replace: '"{{ edgeshark_port }}:5001"'
+      when:
+        - do_edgeshark | bool
+        - (edgeshark_port | int) != 5001
+
+    - name: Edgeshark — bring up (docker compose)
+      ansible.builtin.command:
+        cmd: "docker compose -f {{ es_run }} -p edgeshark up -d"
+      become: true
+      register: es_up
+      changed_when: true
+      when: do_edgeshark | bool
+
+    - name: Edgeshark — tear down when disabled (-e do_edgeshark=false)
+      ansible.builtin.command:
+        cmd: "docker compose -p edgeshark down"
+      become: true
+      failed_when: false
+      changed_when: true
+      when: not (do_edgeshark | bool)
+
+    - name: Edgeshark — access info
+      ansible.builtin.debug:
+        msg:
+          - "Edgeshark web UI:  http://{{ ansible_default_ipv4.address | default('<this-host-ip>') }}:{{ edgeshark_port }}"
+          - "Capture any interface on any node (leaf/spine/gpu), pipe to local Wireshark."
+          - "One-time on your laptop: install the cshargextcap plugin + packetflix:// handler"
+          - "  (see https://containerlab.dev/manual/wireshark/#edgeshark-integration)."
+      when: do_edgeshark | bool

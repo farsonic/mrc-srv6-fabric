@@ -1,0 +1,66 @@
+{
+  "_comment": "Address plan for gen_clab_topology.py. Every address is POSITION-ENCODED so you can read role/plane/index straight out of it. Edit the bases/host-bits freely; the encoding layout is documented per section.",
+
+  "hostname_prefixes": {
+    "spine": "spine",
+    "leaf": "leaf",
+    "gpu": "gpu",
+    "plane_tag": "p",
+    "_comment": "names are 1-based. single plane: spine1/leaf1/gpu1. multi-plane switches: spine1-p1 (prefix + index + '-' + plane_tag + plane). GPUs never carry a plane tag (one GPU spans all planes)."
+  },
+
+  "role_ids": {
+    "spine": 1,
+    "leaf": 2,
+    "gpu": 3,
+    "_comment": "single hex nibble per role; used as the high nibble of the position hextet RPII = role(1) plane(1) index(2)."
+  },
+
+  "mgmt": {
+    "subnet": "172.20.20.0/22",
+    "role_base": { "spine": 10, "leaf": 100, "gpu": 256 },
+    "per_plane_stride": { "spine": 20, "leaf": 20, "gpu": 0 },
+    "_comment": "static mgmt IPv4 = subnet.network + role_base[role] + (plane-1)*stride[role] + index. /22 = 172.20.20.0-172.20.23.255 (~1022 usable), holds hundreds of nodes. Blocks: spine .20.11-, leaf .20.101-, gpu starts at network+256 = .21.1 (so gpu index 1..256 -> .21.1-.22.0, no collision with leaf/spine, no broadcast). The generator HARD-FAILS on any collision, on the .1 gateway, or on out-of-subnet — widen the subnet further or raise gpu role_base to scale past ~256 GPUs.",
+    "_was": "172.20.20.0/24 with gpu role_base 180 — only fit ~74 GPUs before hitting .255."
+  },
+
+  "loopback": {
+    "base": "fd00:0:0",
+    "prefixlen": 128,
+    "host": 1,
+    "_comment": "switch loopback = {base}:{RPII}::{host}/128 where RPII hextet = role_id*0x1000 + plane*0x100 + index. e.g. spine2 in plane3 -> fd00:0:0:1302::1. base must be <= 3 hextets."
+  },
+
+  "p2p": {
+    "base": "fd00:1",
+    "prefixlen": 127,
+    "leaf_host": 0,
+    "spine_host": 1,
+    "_comment": "leaf<->spine link = {base}:{plane}:{LLSS}::/127 where LLSS = leaf*0x100 + spine. leaf end = ::{leaf_host}, spine end = ::{spine_host}. e.g. plane3 leaf1<->spine2 -> fd00:1:3:102::/127 (leaf .. ::0, spine .. ::1). base must be <= 2 hextets."
+  },
+
+  "gpu": {
+    "base": "fd00:9",
+    "prefixlen": 64,
+    "gpu_host": 2,
+    "leaf_host": 1,
+    "_comment": "every GPU has a NIC into every leaf. each gpu-NIC<->leaf subnet = {base}:{plane}:{LLGG}::/64 where LLGG = leaf*0x100 + gpu. gpu side = ::{gpu_host}, leaf gw = ::{leaf_host}. e.g. plane2 leaf1 gpu3 -> fd00:9:2:103::/64 (gpu ::2, leaf gw ::1). decodes to plane+leaf+gpu. base must be <= 2 hextets."
+  },
+
+  "srv6": {
+    "block": "fc00:0",
+    "locator_prefixlen": 48,
+    "func_end_dt6": "fff6",
+    "func_endx_base": "e000",
+    "_comment": "per-switch SRv6 locator = {block}:{RPII}::/48 (same RPII encoding as loopback). End/uN = the locator. End.DT6 (decap, on GPU leaves) = {locator}:{func_end_dt6}::. End.X toward neighbor n = {locator}:{func_endx_base + n}::. block must be <= 2 hextets so block:RPII = /48."
+  },
+
+  "srv6_spec": {
+    "block": "fcbb:bb00",
+    "locator_prefixlen": 48,
+    "gpu_usid_base": "9000",
+    "func_end_dt6": "fff6",
+    "func_endx_base": "e000",
+    "_comment": "MRC-spec NIC-decap mode (--spec-mode). 32-bit block fcbb:bb00 (F3216, matches the paper/Cisco). Switch locator = {block}:{RPII}::/48, behaviour uN (classic), End.X per neighbor (func_endx_base) for the up/down hops. Decap moves to the NIC: each GPU gets a decap uSID = gpu_usid_base + global_gpu_index, decap SID = {block}:{gpu_usid}::, programmed End.DT6 on the GPU. The dst leaf holds a PLAIN /48 forward route {block}:{gpu_usid}::/48 -> GPU port (no SID action — keeps the core dumb). Carrier = {block}:{T1 uSID}:{T0 uSID}:{gpu_usid}::, inner DA = dst GPU real addr. Leaves carry NO End.DT6 in this mode (func_end_dt6 kept only for the GPU's own decap SID)."
+  }
+}

@@ -1,0 +1,15 @@
+#jinja2: trim_blocks:True, lstrip_blocks:True
+{% set step = sonic_port_step | default(4) %}
+segment-routing
+ srv6
+  static-sids
+   sid {{ node.srv6.locator }} locator MAIN behavior uN
+{% for peer, x in node.srv6.endx.items() %}
+   sid {{ x.sid }}/64 locator MAIN behavior uA interface Ethernet{{ (x.dev[3:] | int - 1) * step }} nexthop {{ x.via }}
+{% endfor %}
+{% if node.srv6.end_dt6 %}
+   sid {{ node.srv6.end_dt6 }}/64 locator MAIN behavior uDT6 vrf default
+{% endif %}
+  exit
+ exit
+exit
