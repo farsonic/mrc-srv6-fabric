@@ -124,8 +124,9 @@ let DATA=null, NODES={}, byName={};
 
 // ---------- data loading ----------
 async function boot(){
-  // try to fetch fabric_vars.json sitting next to this file (or one dir up)
-  for(const url of ["fabric_vars.json","../fabric_vars.json"]){
+  // try to fetch fabric_vars.json sitting next to this file (or one dir up,
+  // or at the served repo root when this page is served from /gui/)
+  for(const url of ["fabric_vars.json","../fabric_vars.json","/fabric_vars.json"]){
     try{
       const r=await fetch(url,{cache:"no-store"});
       if(r.ok){ render(await r.json()); return; }

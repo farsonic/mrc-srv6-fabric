@@ -22,6 +22,10 @@ do_deploy: true          # containerlab deploy (needs sudo: run with -K if promp
 do_edgeshark: false       # optional Edgeshark capture UI; enable with -e do_edgeshark=true (needs docker compose v2)
 edgeshark_port: 5001      # web UI port on this host
 
+do_gui: false             # optional topology GUI; enable with -e do_gui=true
+gui_port: 8080            # host port for the topology viewer
+gui_image: python:3.12-slim  # tiny image used to serve the static GUI
+
 # ===== device config knobs =====
 sonic_port_step: 4               # clab ethN -> SONiC Ethernet{(N-1)*step}
 configure_srv6_locator: true

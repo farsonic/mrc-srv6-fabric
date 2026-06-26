@@ -228,3 +228,51 @@
       when:
         - do_edgeshark | bool
         - es_compose.stdout | default("none") != "none"
+
+- name: Topology GUI (optional; static viewer container serving fabric_vars.json)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    proj: "{{ playbook_dir }}/.."
+    gui_name: mrc-gui
+  tasks:
+    - name: GUI — remove any previous container (idempotent restart)
+      ansible.builtin.command:
+        cmd: "docker rm -f {{ gui_name }}"
+      become: true
+      failed_when: false
+      changed_when: true
+      when: do_gui | bool
+
+    - name: GUI — start static viewer (serves the repo root over HTTP)
+      ansible.builtin.command:
+        cmd: >
+          docker run -d --name {{ gui_name }}
+          --restart unless-stopped
+          -p {{ gui_port }}:8080
+          -v {{ proj | realpath }}:/srv:ro
+          -w /srv
+          {{ gui_image }}
+          python3 -m http.server 8080 --bind 0.0.0.0
+      become: true
+      register: gui_up
+      changed_when: true
+      failed_when: false
+      when: do_gui | bool
+
+    - name: GUI — tear down when disabled (-e do_gui=false)
+      ansible.builtin.command:
+        cmd: "docker rm -f {{ gui_name }}"
+      become: true
+      failed_when: false
+      changed_when: true
+      when: not (do_gui | bool)
+
+    - name: GUI — access info
+      ansible.builtin.debug:
+        msg:
+          - "Topology GUI:  http://{{ ansible_default_ipv4.address | default('<this-host-ip>') }}:{{ gui_port }}/gui/topology.html"
+          - "It auto-loads fabric_vars.json from the served repo root."
+          - "Re-run a deploy to refresh the data; the container serves it live (read-only bind mount)."
+      when: do_gui | bool

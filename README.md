@@ -193,6 +193,21 @@ total GPU count.
 
 ---
 
+## Topology GUI
+
+Bring up a browser-based topology viewer alongside the lab:
+
+```bash
+cd ansible
+ansible-playbook site-frr.yml -e gpus_per_leaf=2 -e leaves=2 -e spines=2 -e do_gui=true
+```
+
+Then open `http://<this-host>:8080/gui/topology.html`. It renders each plane as a
+CLOS layer with the GPUs threading up into every plane; hover to highlight a
+node's links, click to pin its details. See [`gui/README.md`](gui/README.md).
+
+---
+
 ## Tear the lab down
 
 ```bash
