@@ -63,6 +63,7 @@
           {{ ('--mgmt-subnet ' ~ mgmt_subnet) if (mgmt_subnet is defined) else '' }}
           {{ '--mrc-nic' if (mrc_nic | default(false) | bool) else '' }}
           {{ '--spec-mode' if (spec_mode | default(false) | bool) else '' }}
+          {{ ('--controller ' ~ mesh_controller_url) if (mesh_controller_url | default('') | length > 0) else '' }}
         chdir: "{{ proj }}"
       when: do_generate | bool
 
@@ -245,7 +246,7 @@
       changed_when: true
       when: do_gui | bool
 
-    - name: GUI — start static viewer (serves the repo root over HTTP)
+    - name: GUI — start viewer + path-health backend (serves the repo root over HTTP)
       ansible.builtin.command:
         cmd: >
           docker run -d --name {{ gui_name }}
@@ -254,7 +255,7 @@
           -v {{ proj | realpath }}:/srv:ro
           -w /srv
           {{ gui_image }}
-          python3 -m http.server 8080 --bind 0.0.0.0
+          python3 gui/server.py --port 8080 --root /srv
       become: true
       register: gui_up
       changed_when: true
@@ -273,6 +274,8 @@
       ansible.builtin.debug:
         msg:
           - "Topology GUI:  http://{{ ansible_default_ipv4.address | default('<this-host-ip>') }}:{{ gui_port }}/gui/topology.html"
-          - "It auto-loads fabric_vars.json from the served repo root."
-          - "Re-run a deploy to refresh the data; the container serves it live (read-only bind mount)."
+          - "It auto-loads fabric_vars.json and polls /api/mesh for live test-probe health."
+          - "Paths table is populated only when the NICs attach to this backend:"
+          - "  redeploy with -e mesh_controller_url=http://<this-host-ip>:{{ gui_port }}"
+          - "  (currently: {{ mesh_controller_url | default('') | ternary(mesh_controller_url, 'unset — NICs run standalone, table shows the path inventory only') }})"
       when: do_gui | bool

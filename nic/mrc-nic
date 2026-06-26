@@ -730,6 +730,23 @@ TWAMP_COUNT    = int(os.environ.get("MRC_TWAMP_COUNT", "20"))     # packets per 
 TWAMP_INTERVAL = float(os.environ.get("MRC_TWAMP_INTERVAL", "0.1"))  # s between packets
 TWAMP_TIMEOUT  = float(os.environ.get("MRC_TWAMP_TIMEOUT", "6.0"))   # hard cap per burst
 
+def _twamp_available():
+    """Is the mrc-twamp binary actually present? Resolved ONCE and cached. TWAMP
+    gives two-way + one-way delay, but it needs the responder binary deployed on
+    every peer. When it's absent (it isn't shipped in the base image), the mesh
+    falls back to the NIC's own raw-ICMPv6 pinger — SO_MARK-pinned to each path's
+    fwmark route exactly like the TWAMP probe — so per-path RTT/jitter/loss still
+    works with nothing but python3 + CAP_NET_RAW (which the agent already has)."""
+    import shutil
+    if getattr(_twamp_available, "_cached", None) is None:
+        path = TWAMP_BIN if os.path.isabs(TWAMP_BIN) else (shutil.which(TWAMP_BIN) or "")
+        _twamp_available._cached = bool(path) and os.path.exists(path) and os.access(path, os.X_OK)
+        if not _twamp_available._cached:
+            print(f"[mesh] {TWAMP_BIN} not found — per-path probe uses built-in raw ICMPv6 "
+                  f"(SO_MARK-pinned). Set MRC_TWAMP_BIN to enable TWAMP one-way delay.",
+                  file=sys.stderr)
+    return _twamp_available._cached
+
 # --- adaptive weighted spray (SRv6 only) -----------------------------------
 # The agent senses per-path latency via the per-path TWAMP sweep and shifts the
 # PROPORTION of traffic each EV gets, inversely to that path's cost. This is the
@@ -1205,6 +1222,16 @@ class MeshHealth(threading.Thread):
         self._last_topo = time.time()
 
     @staticmethod
+    def _probe_path(addr, count, mark=0):
+        """One per-path probe. Uses TWAMP when the binary is present (adds one-way
+        ob_avg/ib_avg delay), else the built-in raw-ICMPv6 pinger. Both honour
+        SO_MARK so the probe is pinned to this path's fwmark route — same carrier
+        the data plane takes. Returns the common probe dict either way."""
+        if _twamp_available():
+            return MeshHealth._twamp_probe(addr, count, mark=mark)
+        return MeshHealth._ping6_raw(addr, count, mark=mark)
+
+    @staticmethod
     def _twamp_probe(addr, count, mark=0, interval_ms=None, timeout=None):
         """Run one bounded IPv6 TWAMP-light burst via the mrc-twamp wrapper and
         return the same dict shape the ICMPv6 probe used (rtt_min/avg/max,
@@ -1358,7 +1385,7 @@ class MeshHealth(threading.Thread):
                     # path between the GPUs (not one ECMP-hashed aggregate).
                     for p in self.plan:
                         if self.stop.is_set(): break
-                        r = self._twamp_probe(p["dst"], TWAMP_COUNT, mark=p["fwmark"])
+                        r = self._probe_path(p["dst"], TWAMP_COUNT, mark=p["fwmark"])
                         samples.append({"peer": p["peer"], "addr": p["dst"],
                                         "spine": p["spine"], "path_id": p["path_id"],
                                         "encap_ok": self._encap_ok.get(p["fwmark"], True),
@@ -1367,7 +1394,7 @@ class MeshHealth(threading.Thread):
                     # no per-path plan yet: per-peer TWAMP burst (unpinned)
                     for name, addr in list(self.peers.items()):
                         if self.stop.is_set(): break
-                        r = self._twamp_probe(addr, TWAMP_COUNT)
+                        r = self._probe_path(addr, TWAMP_COUNT)
                         samples.append({"peer": name, "addr": addr,
                                         "up": r.get("rx", 0) > 0, **r})
                 if samples:

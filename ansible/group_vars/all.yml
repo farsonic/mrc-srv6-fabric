@@ -23,8 +23,13 @@ do_edgeshark: false       # optional Edgeshark capture UI; enable with -e do_edg
 edgeshark_port: 5001      # web UI port on this host
 
 do_gui: false             # optional topology GUI; enable with -e do_gui=true
-gui_port: 8080            # host port for the topology viewer
-gui_image: python:3.12-slim  # tiny image used to serve the static GUI
+gui_port: 8080            # host port for the topology viewer + path-health API
+gui_image: python:3.12-slim  # tiny image used to serve the GUI (runs gui/server.py)
+# Attach the NICs to the GUI backend so the paths table shows LIVE test-probe
+# health. Empty = NICs run standalone (no mesh; table shows the path inventory
+# only). Set to this host's reachable URL, e.g. http://172.20.20.1:8080
+# (the mgmt-net gateway the GPU containers can reach), then redeploy.
+mesh_controller_url: ""
 
 # ===== device config knobs =====
 sonic_port_step: 4               # clab ethN -> SONiC Ethernet{(N-1)*step}

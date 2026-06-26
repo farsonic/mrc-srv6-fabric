@@ -127,9 +127,14 @@ ansible/
   roles/sonic_frr/     Switch (FRR) config role + templates.
   roles/gpu_host/      GPU host bootstrap (image-agnostic iproute2/python3).
 gui/
-  topology.html        Single-file topology viewer (no deps). Renders planes as
-                       CLOS bands, GPUs threading into every plane, hover/click.
-  README.md            GUI usage (container + standalone).
+  topology.html        Topology viewer (no deps) + a paths table beneath it that
+                       shows every (src,dst,plane,spine) carrier with live
+                       test-probe health (RTT/jitter/loss), symmetric fwd/return,
+                       hover to overlay the carrier on the topology.
+  server.py            Backend (stdlib): serves the repo + the control-plane the
+                       NICs attach to (/api/topology, /api/mesh-plan,
+                       /api/mesh-health collect, /api/mesh aggregate for the page).
+  README.md            GUI usage (container + standalone) + the live-data flow.
 scripts/
   srv6-test.sh         End-to-end connectivity test (generated copy also lands
   srv6-walk.sh         hop-by-hop SRv6 walk            at repo root on deploy).
@@ -248,7 +253,13 @@ node's links, click pins its details. SSH tunnel if needed:
   cross-leaf + same-leaf, 0% loss.
 - **Route aggregation proven** on François's hardware (leaf = local /64s + one
   /36; spine = one /48 per leaf), forwarding through the /36→/48→/64 LPM chain.
-- **Topology GUI** built and containerized (`-e do_gui=true`).
+- **Topology GUI** built and containerized (`-e do_gui=true`), now with a live
+  **paths table** (`gui/server.py` backend): every (src,dst,plane,spine) carrier
+  with per-path test-probe health (RTT/jitter/loss), shown symmetrically, hover
+  to overlay the carrier. Generator emits the carrier list as `paths[]` in
+  `fabric_vars.json`; NICs attach with `-e mesh_controller_url=...` and POST
+  health to `/api/mesh-health`. Per-path probe uses TWAMP when `mrc-twamp` is
+  present, else the NIC's built-in `SO_MARK`-pinned raw ICMPv6 (no extra binary).
 - **Whitepaper** (`docs/…docx`) for a traditional network engineer: stateless
   core, scaling, multi-plane (with concrete plane-distinguished carriers),
   per-packet spray, probe-based path health. Framed against routed-CLOS+ECMP
@@ -270,13 +281,19 @@ node's links, click pins its details. SSH tunnel if needed:
 - **Prebuilt slim GPU image** (iproute2 6.1 + python3 + tcpdump baked in) to kill
   the per-boot apt cost before scaling toward many GPUs. Short Dockerfile + a
   `-e gpu_image=` swap. Becomes worthwhile past ~8 GPUs in spec mode.
-- **GUI backend (the planned next build-up).** The `mrc-gui` container is
-  deliberately just a static file server today — a clean seam. Next steps:
-  (a) `/api/status` endpoint polling docker/containerlab for live node up/down →
-  colour nodes green/red; (b) `/api/paths` shelling `mrc-nic paths --decode` so
-  clicking a GPU pair overlays the actual carrier path across the spines, tying
-  the GUI to the source-routing. Both fit in the same container without changing
-  the deploy model.
+- **GUI backend — BUILT (`gui/server.py`).** No longer a static-only seam: it
+  serves the repo AND the NIC control-plane (`/api/topology`, `/api/mesh-plan`,
+  `/api/mesh-health`, `/api/mesh`), and the page shows the live per-path test-probe
+  table with the carrier overlay. Still open on this seam:
+  (a) `/api/status` polling docker/containerlab for live node up/down → colour the
+  topology nodes green/red (the paths table already colours per-path health, but
+  the node boxes don't yet reflect container state);
+  (b) wire-validate the live pipeline end-to-end on the lab — the backend +
+  generator + NIC contract are unit-tested locally (synthetic POSTs render the
+  table correctly) but have NOT yet been run against real attached NICs. Deploy
+  with `-e mesh_controller_url=http://<mgmt-gw>:8080`, confirm `/api/reports`
+  fills, and confirm the table goes live. If a NIC can't reach the URL, check the
+  mgmt-net gateway IP the GPU containers actually see.
 - **GUI viewer polish:** pan/zoom for large fabrics (gets cramped past ~64 GPUs),
   per-plane collapse toggle.
 - **Traffic-level validation** with iperf3/mrc-probe (exercise per-EV fwmark

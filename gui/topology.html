@@ -84,6 +84,42 @@
   .filedrop input{display:none}
   .filedrop label{color:var(--leaf);cursor:pointer;text-decoration:underline}
   .err{color:#ff8e8e;font-size:12px;padding:20px}
+  /* ---- layout: topology on top, paths table beneath ---- */
+  body{display:flex;flex-direction:column;overflow:hidden}
+  .wrap{flex:1 1 56%;min-height:0}
+  .paths{flex:0 0 44%;min-height:0;display:flex;flex-direction:column;
+         border-top:1px solid var(--rule);background:#0a0f15}
+  .paths-head{display:flex;align-items:baseline;gap:14px;padding:9px 20px;
+              border-bottom:1px solid var(--rule)}
+  .paths-head h2{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin:0}
+  .paths-head h2 b{color:var(--leaf)}
+  .paths-head .meshstat{font-size:11px;color:var(--dim)}
+  .paths-head .meshstat b{color:var(--ink);font-weight:600}
+  .paths-head .grow{flex:1}
+  .paths-head label{font-size:11px;color:var(--dim);cursor:pointer;user-select:none}
+  .paths-head input[type=checkbox]{vertical-align:-1px;margin-right:4px}
+  .paths-scroll{flex:1;overflow:auto}
+  table.pt{border-collapse:collapse;width:100%;font-size:11.5px}
+  table.pt th,table.pt td{padding:5px 11px;text-align:left;white-space:nowrap}
+  table.pt thead th{position:sticky;top:0;background:#0d141c;color:var(--dim);
+      font-weight:600;letter-spacing:.03em;border-bottom:1px solid var(--rule);z-index:1}
+  table.pt thead th.grp{text-align:center;border-left:1px solid var(--rule);color:#9fb0c2}
+  table.pt tbody tr{border-bottom:1px solid #121b25}
+  table.pt tbody tr:hover{background:#10202c}
+  table.pt tbody tr.sel{background:#13283a}
+  table.pt td.num{text-align:right;font-variant-numeric:tabular-nums}
+  table.pt td.dir{border-left:1px solid #1a2632}
+  table.pt .path b{color:var(--ink)}
+  table.pt .carrier{color:var(--dim);font-size:10.5px}
+  table.pt .pl{display:inline-block;min-width:14px;color:var(--dim)}
+  table.pt .miss{color:#42525f}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:0;margin-right:6px}
+  .dot.up{background:var(--link-hot)} .dot.deg{background:#f0c050}
+  .dot.down{background:#ff7a7a} .dot.none{background:#3a4a5a}
+  .dot.denied{background:#c08af0}
+  .st-up{color:var(--link-hot)} .st-deg{color:#f0c050}
+  .st-down{color:#ff7a7a} .st-none{color:#5a6b7a} .st-denied{color:#c08af0}
+  .paths-empty{padding:18px 20px;color:var(--dim);font-size:12px;line-height:1.7}
 </style>
 </head>
 <body>
@@ -118,9 +154,26 @@
   </aside>
 </div>
 
+<section class="paths">
+  <div class="paths-head">
+    <h2>Paths — <b>test-probe</b> health</h2>
+    <span class="meshstat" id="meshStat">—</span>
+    <span class="grow"></span>
+    <label><input type="checkbox" id="symToggle" checked> symmetric pairs</label>
+  </div>
+  <div class="paths-scroll">
+    <table class="pt" id="pathsTable"><thead></thead><tbody></tbody></table>
+    <div class="paths-empty" id="pathsEmpty" style="display:none"></div>
+  </div>
+</section>
+
 <script>
 const SVGNS="http://www.w3.org/2000/svg";
 let DATA=null, NODES={}, byName={};
+let EDGES=null;        // edge records, for highlighting a carrier path
+let MESH=null;         // latest /api/mesh response (null until backend reached)
+let backendOk=false;   // did the last /api/mesh fetch succeed?
+let selPathKey=null;   // pinned path row key
 
 // ---------- data loading ----------
 async function boot(){
@@ -255,8 +308,10 @@ function render(data){
     `<b>${ns.filter(n=>n.role==="leaf").length}</b> leaf · `+
     `<b>${gpus.length}</b> gpu · <b>${(data.links||[]).length}</b> links`;
 
+  EDGES=edges;
   window._fit=()=>fit(svg);
   fit(svg);
+  rebuildPaths();
 }
 
 let pinned=null;
@@ -321,6 +376,183 @@ function showInfo(name,nodes){
      <div class="links-list">${links||'<div style="color:var(--dim)">none</div>'}</div>`;
 }
 
+// ---------- paths table (test-probe health) ----------
+function natCmp(a,b){ return a.localeCompare(b,undefined,{numeric:true}); }
+function fmtMs(v){ return (v==null)?'<span class="miss">·</span>':(+v).toFixed(2); }
+function fmtPct(v){ return (v==null)?'<span class="miss">·</span>':(+v).toFixed(v<10?1:0); }
+
+// classify one direction's probe health -> {cls,label}
+function dirStatus(h){
+  if(!h) return {cls:'none',label:'no data'};
+  if(h.denied) return {cls:'denied',label:'denied'};
+  if(!h.up || (h.loss_pct!=null&&h.loss_pct>=100)) return {cls:'down',label:'down'};
+  if((h.loss_pct!=null&&h.loss_pct>1)||h.encap_ok===false) return {cls:'deg',label:'degraded'};
+  return {cls:'up',label:'up'};
+}
+// worst of two directions (none ranks last so a measured side wins)
+const STRANK={down:4,denied:3,deg:2,up:1,none:0};
+function worst(a,b){ return STRANK[a.cls]>=STRANK[b.cls]?a:b; }
+
+// the carrier hops a path takes, for SVG highlighting
+function pathHops(rec){
+  const seq=[rec.src,rec.src_leaf,rec.spine,rec.dst_leaf,rec.dst].filter(Boolean);
+  return seq.filter((h,i)=>i===0||h!==seq[i-1]);   // collapse repeats (same-leaf)
+}
+function highlightPath(rec){
+  if(!EDGES) return;
+  const seq=pathHops(rec), want=new Set(), nodes=new Set(seq);
+  for(let i=0;i<seq.length-1;i++){ want.add(seq[i]+' '+seq[i+1]); want.add(seq[i+1]+' '+seq[i]); }
+  EDGES.forEach(e=>{ const on=want.has(e.a+' '+e.b);
+    e.el.classList.toggle('hot',on); e.el.classList.toggle('dim',!on); });
+  Object.entries(byName).forEach(([n,g])=>g.classList.toggle('dim',!nodes.has(n)));
+}
+function clearPathHi(){
+  if(!EDGES) return;
+  EDGES.forEach(e=>e.el.classList.remove('hot','dim'));
+  Object.values(byName).forEach(g=>g.classList.remove('dim'));
+  if(pinned) highlight(pinned,EDGES);
+}
+
+// index latest health by src|dst|path_id (from MESH if present, else null)
+function healthIndex(){
+  const H={};
+  const src=(MESH&&MESH.paths)?MESH.paths:null;
+  if(src) src.forEach(p=>{ H[p.src+'|'+p.dst+'|'+p.path_id]=p.health||null; });
+  return H;
+}
+
+function rebuildPaths(){
+  const base=(DATA&&DATA.paths)||[];
+  const tbl=document.getElementById('pathsTable');
+  const empty=document.getElementById('pathsEmpty');
+  const tb=tbl.tBodies[0], thead=tbl.tHead;
+  tb.innerHTML=''; thead.innerHTML='';
+  if(!base.length){
+    tbl.style.display='none'; empty.style.display='';
+    empty.innerHTML='This fabric has no <b>paths[]</b> in fabric_vars.json '+
+      '(needs homed mode — <code>--gpus-per-leaf</code> — and the current generator). '+
+      'Redeploy to populate the path inventory.';
+    updateMeshStat(); return;
+  }
+  tbl.style.display=''; empty.style.display='none';
+  const H=healthIndex();
+  const sym=document.getElementById('symToggle').checked;
+  sym?renderSym(base,H,thead,tb):renderDirected(base,H,thead,tb);
+  updateMeshStat();
+}
+
+function hCell(h){   // forward/return metric cells: rtt + loss
+  return `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td><td class="num">${fmtPct(h&&h.loss_pct)}</td>`;
+}
+function viaCell(rec){
+  return rec.spine
+    ? `<b>${shortName(rec.spine)}</b><br><span class="carrier">${rec.usid}</span>`
+    : `<span class="st-none">direct</span><br><span class="carrier">${rec.usid}</span>`;
+}
+function statusCell(s){ return `<span class="dot ${s.cls}"></span><span class="st-${s.cls}">${s.label}</span>`; }
+
+function renderSym(base,H,thead,tb){
+  thead.innerHTML=
+    '<tr><th>path</th><th>plane</th><th>via / carrier uSID</th>'+
+    '<th class="grp" colspan="2">→ forward</th><th class="grp" colspan="2">← return</th>'+
+    '<th>status</th></tr>'+
+    '<tr><th></th><th></th><th></th>'+
+    '<th class="num dir">rtt ms</th><th class="num">loss%</th>'+
+    '<th class="num dir">rtt ms</th><th class="num">loss%</th><th></th></tr>';
+  // group by unordered pair + plane + carrier(path_id)
+  const groups=new Map();
+  base.forEach(rec=>{
+    const A=natCmp(rec.src,rec.dst)<=0?rec.src:rec.dst;
+    const B=A===rec.src?rec.dst:rec.src;
+    const key=A+'|'+B+'|'+rec.plane+'|'+rec.path_id;
+    let g=groups.get(key);
+    if(!g){ g={A,B,plane:rec.plane,key,fwd:null,ret:null}; groups.set(key,g); }
+    if(rec.src===A) g.fwd=rec; else g.ret=rec;
+  });
+  const rows=[...groups.values()].sort((x,y)=>
+    natCmp(x.A,y.A)||natCmp(x.B,y.B)||x.plane-y.plane||natCmp((x.fwd||x.ret).path_id,(y.fwd||y.ret).path_id));
+  for(const g of rows){
+    const rec=g.fwd||g.ret;
+    const hf=H[g.A+'|'+g.B+'|'+rec.path_id], hr=H[g.B+'|'+g.A+'|'+rec.path_id];
+    const sf=dirStatus(hf), sr=dirStatus(hr), s=worst(sf,sr);
+    const tr=document.createElement('tr');
+    tr.innerHTML=
+      `<td class="path"><b>${shortName(g.A)}</b> ↔ <b>${shortName(g.B)}</b></td>`+
+      `<td><span class="pl">${g.plane}</span></td>`+
+      `<td>${viaCell(rec)}</td>`+
+      hCell(hf)+hCell(hr)+
+      `<td>${statusCell(s)}</td>`;
+    wireRow(tr,rec,g.key);
+    tb.appendChild(tr);
+  }
+}
+
+function renderDirected(base,H,thead,tb){
+  thead.innerHTML=
+    '<tr><th>flow</th><th>plane</th><th>via / carrier uSID</th>'+
+    '<th class="num dir">rtt ms</th><th class="num">loss%</th><th class="num">jitter</th>'+
+    '<th class="num">age</th><th>status</th></tr>';
+  const rows=[...base].sort((x,y)=>
+    natCmp(x.src,y.src)||natCmp(x.dst,y.dst)||x.plane-y.plane||natCmp(x.path_id,y.path_id));
+  for(const rec of rows){
+    const h=H[rec.src+'|'+rec.dst+'|'+rec.path_id];
+    const s=dirStatus(h);
+    const tr=document.createElement('tr');
+    tr.innerHTML=
+      `<td class="path"><b>${shortName(rec.src)}</b> → <b>${shortName(rec.dst)}</b></td>`+
+      `<td><span class="pl">${rec.plane}</span></td>`+
+      `<td>${viaCell(rec)}</td>`+
+      `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td>`+
+      `<td class="num">${fmtPct(h&&h.loss_pct)}</td>`+
+      `<td class="num">${fmtMs(h&&h.jitter)}</td>`+
+      `<td class="num">${(h&&h.age_s!=null)?h.age_s+'s':'<span class=miss>·</span>'}</td>`+
+      `<td>${statusCell(s)}</td>`;
+    wireRow(tr,rec,rec.src+'>'+rec.dst+'|'+rec.path_id);
+    tb.appendChild(tr);
+  }
+}
+
+function wireRow(tr,rec,key){
+  if(key===selPathKey) tr.classList.add('sel');
+  tr.addEventListener('mouseenter',()=>{ if(!selPathKey) highlightPath(rec); });
+  tr.addEventListener('mouseleave',()=>{ if(!selPathKey) clearPathHi(); });
+  tr.addEventListener('click',()=>{
+    if(selPathKey===key){ selPathKey=null; tr.classList.remove('sel'); clearPathHi(); }
+    else{ selPathKey=key;
+      document.querySelectorAll('#pathsTable tr.sel').forEach(r=>r.classList.remove('sel'));
+      tr.classList.add('sel'); highlightPath(rec); }
+  });
+}
+
+function updateMeshStat(){
+  const el=document.getElementById('meshStat');
+  const base=(DATA&&DATA.paths)||[];
+  if(!base.length){ el.textContent=''; return; }
+  if(!backendOk && !MESH){
+    el.innerHTML='<b>'+base.length+'</b> paths · no backend — showing inventory only '+
+      '(serve via <code>gui/server.py</code> for live probe health)';
+    return;
+  }
+  const ps=MESH&&MESH.paths?MESH.paths:[];
+  let up=0,meas=0,down=0;
+  ps.forEach(p=>{ if(p.health){ meas++; if(p.health.up&&!(p.health.loss_pct>=100)) up++; else down++; } });
+  const nics=MESH&&MESH.sources?Object.keys(MESH.sources).length:0;
+  el.innerHTML=`<b>${up}</b>/${base.length} paths up · <b>${down}</b> down · `+
+    `<b>${meas}</b> measured · <b>${nics}</b> NIC${nics===1?'':'s'} reporting`+
+    (MESH&&MESH.updated?` · updated ${ago(MESH.updated)}`:'');
+}
+function ago(ts){ const s=Math.max(0,Math.round(Date.now()/1000-ts)); return s<2?'just now':s+'s ago'; }
+
+async function pollMesh(){
+  try{
+    const r=await fetch('/api/mesh',{cache:'no-store'});
+    if(r.ok){ MESH=await r.json(); backendOk=true; }
+    else backendOk=false;
+  }catch(e){ backendOk=false; }   // static server / file:// — keep inventory view
+  rebuildPaths();
+}
+document.getElementById('symToggle').addEventListener('change',rebuildPaths);
+
 // ---------- helpers ----------
 function el(tag,attrs,text){
   const e=document.createElementNS(SVGNS,tag);
@@ -341,6 +573,8 @@ function fit(svg){
 document.getElementById("fit").addEventListener("click",()=>window._fit&&window._fit());
 window.addEventListener("resize",()=>window._fit&&window._fit());
 boot();
+pollMesh();                         // live probe health (no-op when no backend)
+setInterval(pollMesh,3000);
 </script>
 </body>
 </html>

@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""
+mrc-gui backend — static topology viewer + live path-health collector.
+
+This replaces the plain `python3 -m http.server` the GUI container used to run.
+It still serves the repo root (so /gui/topology.html and /fabric_vars.json work
+exactly as before), and adds a small control-plane the MRC NICs attach to:
+
+  GET  /api/topology             peer list (names + tenant addrs) — NICs discover
+                                 who to probe. Built from fabric_vars.json.
+  GET  /api/mesh-plan?src=<host> the per-path probe plan for one source NIC: every
+                                 (peer, spine) carrier with its fwmark + uSID, so
+                                 the NIC pins one test probe to each path. Built
+                                 from fabric_vars.json `paths` (no carrier re-derive).
+  POST /api/mesh-health          a NIC posts its latest full-mesh sweep here every
+                                 few seconds: {host, ts, peers:[...], weigher:{...}}.
+  GET  /api/mesh                 the aggregate the GUI tables: every path in the
+                                 fabric joined to the latest probe health reported
+                                 for it. Symmetric — src->dst and dst->src are both
+                                 present (each NIC probes its own outbound paths).
+  GET  /api/profile/stream       SSE keepalive so an attached NIC's controller
+                                 subscription stays connected (no profiles pushed).
+  POST /api/metrics|/api/ev-stats|/api/probe-tx|/api/jobs/status
+                                 accepted and dropped — the NIC posts these to a
+                                 controller; we just don't want it to error.
+
+Stdlib only. State is in-memory (the bind mount is read-only); a NIC re-posts its
+health every sweep, so a restart self-heals within one MESH_PERIOD.
+
+Usage:
+  python3 gui/server.py [--port 8080] [--root .] [--vars fabric_vars.json]
+"""
+
+import argparse, json, os, threading, time
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+# ---- live state ------------------------------------------------------------
+_LOCK = threading.Lock()
+_REPORTS = {}          # host -> {"ts","received_at","peers":[...],"weigher":{...}}
+_STOP = threading.Event()
+
+# ---- fabric_vars.json (reloaded on mtime change) ---------------------------
+_FAB = {"path": None, "mtime": 0.0, "data": None}
+
+def load_fabric(path):
+    """Return the parsed fabric_vars.json, reloading only when the file changes
+    so a redeploy refreshes the topology without restarting the server."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _FAB["data"]
+    if _FAB["data"] is None or st.st_mtime != _FAB["mtime"] or _FAB["path"] != path:
+        try:
+            with open(path) as f:
+                _FAB["data"] = json.load(f)
+            _FAB["mtime"] = st.st_mtime
+            _FAB["path"] = path
+        except (OSError, ValueError) as e:
+            print(f"[gui] could not load {path}: {e}")
+    return _FAB["data"]
+
+def gpu_hosts(fab):
+    """[{name, addr_v6, addr_v4}] for every GPU, from fabric_vars nodes. The
+    tenant addr is the GPU's plane-1 host address (its stable decap identity)."""
+    hosts = []
+    for name, nd in (fab.get("nodes") or {}).items():
+        if nd.get("role") != "gpu":
+            continue
+        addr6 = None
+        for itf in nd.get("interfaces", []):
+            ip = (itf.get("ipv6") or "").split("/")[0]
+            if ip:
+                addr6 = ip
+                break
+        hosts.append({"name": name, "addr_v6": addr6, "addr_v4": None})
+    return hosts
+
+def plan_for(fab, src):
+    """The per-path probe plan for one source host: every path whose src is this
+    host, shaped for the NIC's /api/mesh-plan consumer."""
+    out = []
+    for p in (fab.get("paths") or []):
+        if p.get("src") != src:
+            continue
+        out.append({
+            "peer": p["dst"], "dst": p["dst_addr"],
+            "spine": p.get("spine"), "path_id": p["path_id"],
+            "fwmark": p["fwmark"], "probe_sid": p["usid"], "usid": p["usid"],
+        })
+    return out
+
+# ---- health join -----------------------------------------------------------
+def _sample_index():
+    """{(host, peer, path_id): sample} over the latest report from every host,
+    plus a per-host {(peer,path_id): denied} overlay from the weigher snapshot."""
+    samples, denied, srcinfo = {}, {}, {}
+    now = time.time()
+    with _LOCK:
+        for host, rep in _REPORTS.items():
+            age = now - rep.get("received_at", now)
+            up = 0; tot = 0
+            for s in rep.get("peers", []):
+                pid = s.get("path_id")
+                if pid is None:
+                    continue
+                samples[(host, s.get("peer"), pid)] = s
+                tot += 1; up += 1 if s.get("up") else 0
+            for h in ((rep.get("weigher") or {}).get("path_health") or []):
+                denied[(host, h.get("peer"), h.get("path_id"))] = bool(h.get("denied"))
+            srcinfo[host] = {"age_s": round(age, 1), "peers_up": up, "peers_total": tot,
+                             "ts": rep.get("ts")}
+    return samples, denied, srcinfo
+
+def mesh_view(fab):
+    """Every path joined to its latest reported probe health. The full path list
+    always renders (from fabric_vars); health is null until a NIC reports it."""
+    samples, denied, srcinfo = _sample_index()
+    now = time.time()
+    paths = []
+    for p in (fab.get("paths") or []):
+        key = (p["src"], p["dst"], p["path_id"])
+        s = samples.get(key)
+        health = None
+        if s is not None:
+            rep_age = srcinfo.get(p["src"], {}).get("age_s")
+            health = {
+                "up": bool(s.get("up")),
+                "loss_pct": s.get("loss_pct"),
+                "rtt_min": s.get("rtt_min"), "rtt_avg": s.get("rtt_avg"),
+                "rtt_max": s.get("rtt_max"),
+                "jitter": s.get("rtt_mdev") if s.get("rtt_mdev") is not None else s.get("jitter"),
+                "ob_avg": s.get("ob_avg"), "ib_avg": s.get("ib_avg"),
+                "encap_ok": bool(s.get("encap_ok", True)),
+                "denied": denied.get(key, False),
+                "err": s.get("err"),
+                "age_s": rep_age,
+            }
+        paths.append({**p, "health": health})
+    return {"updated": now, "name": fab.get("name"), "shape": fab.get("shape"),
+            "sources": srcinfo, "n_reporting": len(srcinfo), "paths": paths}
+
+# ---- HTTP ------------------------------------------------------------------
+class Handler(SimpleHTTPRequestHandler):
+    server_version = "mrc-gui/1.0"
+    vars_path = "fabric_vars.json"     # set per-process below
+
+    def log_message(self, fmt, *args):
+        # quiet the per-request noise; keep it to one tidy line
+        print(f"[gui] {self.address_string()} {fmt % args}")
+
+    # -- helpers --
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return {}
+
+    def _fab(self):
+        return load_fabric(self.vars_path) or {}
+
+    # -- routing --
+    def do_GET(self):
+        u = urlparse(self.path)
+        path = u.path
+        if path == "/api/topology":
+            return self._send_json({"hosts": gpu_hosts(self._fab())})
+        if path == "/api/mesh-plan":
+            src = (parse_qs(u.query).get("src") or [""])[0]
+            return self._send_json({"src": src, "paths": plan_for(self._fab(), src)})
+        if path == "/api/mesh":
+            return self._send_json(mesh_view(self._fab()))
+        if path == "/api/reports":           # debug: raw posted health
+            with _LOCK:
+                return self._send_json(_REPORTS)
+        if path == "/api/profile/stream":
+            return self._sse()
+        if path in ("/", ""):                # land on the viewer
+            self.send_response(302)
+            self.send_header("Location", "/gui/topology.html")
+            self.end_headers()
+            return
+        return super().do_GET()              # static files from --root
+
+    def do_HEAD(self):
+        if self.path.startswith("/api/"):
+            return self._send_json({})
+        return super().do_HEAD()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        body = self._read_body()
+        if path == "/api/mesh-health":
+            host = body.get("host")
+            if host:
+                with _LOCK:
+                    _REPORTS[host] = {"ts": body.get("ts"), "received_at": time.time(),
+                                      "peers": body.get("peers") or [],
+                                      "weigher": body.get("weigher") or {}}
+            return self._send_json({"ok": True})
+        # NIC also posts these to a controller; accept and drop so it doesn't error.
+        if path in ("/api/metrics", "/api/ev-stats", "/api/probe-tx",
+                    "/api/jobs/status"):
+            return self._send_json({"ok": True})
+        return self._send_json({"error": "not found"}, code=404)
+
+    def _sse(self):
+        """Keepalive-only event stream. An attached NIC subscribes here for live
+        profiles; this lab pushes none, so we just hold the socket open with
+        comments so its reconnect loop stays quiet."""
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b": mrc-gui connected\n\n")
+            self.wfile.flush()
+            while not _STOP.is_set():
+                if _STOP.wait(5.0):
+                    break
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="mrc-gui backend (static viewer + path-health API)")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("GUI_PORT", "8080")))
+    ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--root", default=os.environ.get("GUI_ROOT", "."),
+                    help="directory served as the web root (the repo root)")
+    ap.add_argument("--vars", default=None,
+                    help="path to fabric_vars.json (default: <root>/fabric_vars.json)")
+    a = ap.parse_args()
+
+    root = os.path.abspath(a.root)
+    Handler.vars_path = a.vars or os.path.join(root, "fabric_vars.json")
+    fab = load_fabric(Handler.vars_path)
+    npaths = len((fab or {}).get("paths") or [])
+    print(f"[gui] root={root}")
+    print(f"[gui] fabric_vars={Handler.vars_path}  ({npaths} paths, "
+          f"{len(gpu_hosts(fab or {}))} gpus)")
+    if npaths == 0:
+        print("[gui] NOTE: no paths[] in fabric_vars.json — regenerate with the current "
+              "gen_clab_topology.py so the paths table has data.")
+
+    handler = partial(Handler, directory=root)
+    httpd = ThreadingHTTPServer((a.bind, a.port), handler)
+    httpd.daemon_threads = True
+    print(f"[gui] serving http://{a.bind}:{a.port}/gui/topology.html")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _STOP.set()
+        httpd.shutdown()
+
+
+if __name__ == "__main__":
+    main()

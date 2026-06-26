@@ -89,6 +89,12 @@ def main():
                     help="how to program SRv6 SIDs in --frr-linux mode: 'kernel' = direct "
                          "ip seg6local routes via a bind-mounted seg6.sh (works on ANY FRR, "
                          "incl. 8.4); 'frr' = FRR static-sids in frr.conf (needs FRR >= 9.1).")
+    ap.add_argument("--controller", default=None,
+                    help="controller/GUI-backend base URL (e.g. http://172.20.20.1:8080). When "
+                         "set, each GPU's mrc-nic is launched with --controller/--host so it "
+                         "attaches, runs the full-mesh per-path test probe, and POSTs path health "
+                         "to the backend's /api/mesh-health (feeds the GUI paths table). Default "
+                         "off = standalone NICs, byte-identical to before.")
     a = ap.parse_args()
     if a.frr_linux:
         a.kind = "linux"
@@ -802,9 +808,13 @@ def main():
                        ">/dev/null 2>&1; fi'")
             # start the standalone virtual NIC: reads profile.json, programs per-EV pinned encap
             # + its own End.DT6 decap. tenant + gateway passed explicitly (deterministic).
+            # When --controller is set, also attach to the backend (--controller/--host) so the
+            # NIC runs the always-on full-mesh per-path test probe and POSTs path health for the
+            # GUI paths table. Without it the NIC stays standalone (no mesh), exactly as before.
+            ctrl = (f"--controller {a.controller} --host {name} " if a.controller else "")
             out.append(f"        - sh -c 'nohup python3 /usr/local/bin/mrc-nic run --tenant {tenant} "
                        f"--gateway {gw} --underlay eth1 --profile /etc/mrc-nic/profile.json "
-                       f">/var/log/mrc-nic.log 2>&1 &'")
+                       f"{ctrl}>/var/log/mrc-nic.log 2>&1 &'")
         lbl = f'role: "{r["role"]}"'
         if r["plane"]:
             lbl += f', plane: "{r["plane"]}"'
@@ -817,11 +827,65 @@ def main():
     with open(clab_path, "w") as f:
         f.write("\n".join(out) + "\n")
 
+    # ================= build the symmetric path inventory =================
+    # Every GPU-to-GPU carrier the fabric can take: one record per
+    # (src gpu, dst gpu, plane, spine). This is the AUTHORITATIVE list of paths
+    # the mesh test-probe sweeps — emitted into fabric_vars.json so the GUI can
+    # table every path (and join live probe health to it via the backend) and the
+    # controller can hand each NIC its per-path probe plan WITHOUT re-deriving the
+    # uSID carriers. Same carrier math as the per-GPU NIC profiles above, but as a
+    # flat, source-agnostic list. "Symmetric" = both directions are present: a
+    # path src->dst via a spine and its reverse dst->src via that same spine are
+    # two records (each NIC probes its own outbound direction).
+    #
+    # fwmark is globally unique (monotonic) so a single value names exactly one
+    # path; the NIC installs one fwmark->table->seg6 route per path to pin the
+    # probe to that carrier. path_id is unique within a (src,dst) pair (the spine
+    # node name for cross-leaf, "direct-<leaf>" for same-leaf) — the key the NIC
+    # reports health under. Only homed mode has spine-transited carriers.
+    paths = []
+    if homed:
+        fw = 49001
+        for sg in range(1, G + 1):
+            sgn, sl = gname(sg), home_leaf(sg)
+            for dg in range(1, G + 1):
+                if dg == sg:
+                    continue
+                dgn, dl = gname(dg), home_leaf(dg)
+                for p in range(1, P + 1):
+                    dleaf = lname(dl, p)
+                    if dl == sl:
+                        # same-leaf: no spine transit (leaf plain-forwards the /64).
+                        if spec:
+                            carrier = gpu_decap_sid(dg)
+                        else:
+                            dst_dt6 = nodes[dleaf]["srv6"]["end_dt6"]
+                            block = ipaddress.IPv6Address(srv6_loc("leaf", p, 1)).exploded.split(":")[0:2]
+                            carrier = ipaddress.IPv6Address(
+                                ":".join(block + _csid_pair(dst_dt6) + ["0", "0", "0", "0"])).compressed
+                        paths.append(dict(
+                            src=sgn, dst=dgn, src_addr=gpu_addr_h(1, sg), dst_addr=gpu_addr_h(1, dg),
+                            plane=p, spine=None, src_leaf=lname(sl, p), dst_leaf=dleaf,
+                            kind="same-leaf", fwmark=fw, path_id=f"direct-{dleaf}", usid=carrier))
+                        fw += 1
+                    else:
+                        # cross-leaf: one path per spine (the per-path spray analog).
+                        for s in range(1, S + 1):
+                            sp = sname(s, p)
+                            carrier = (mrc_carrier_spec(p, dleaf, sp, dg) if spec
+                                       else mrc_carrier(p, dleaf, sp))
+                            paths.append(dict(
+                                src=sgn, dst=dgn, src_addr=gpu_addr_h(1, sg), dst_addr=gpu_addr_h(1, dg),
+                                plane=p, spine=sp, src_leaf=lname(sl, p), dst_leaf=dleaf,
+                                kind="cross-leaf", fwmark=fw, path_id=sp, usid=carrier))
+                            fw += 1
+
     # ================= emit fabric_vars.json =================
     vars_path = f"{a.out}_vars.json"
     with open(vars_path, "w") as f:
         json.dump(dict(name=a.name, shape=dict(gpus=G, leaves=L, spines=S, planes=P),
-                       plan=plan, nodes=nodes, links=[dict(a=x, b=y) for x, y in links]),
+                       plan=plan, nodes=nodes, links=[dict(a=x, b=y) for x, y in links],
+                       paths=paths),
                   f, indent=2)
 
     # ================= emit human-readable address map =================

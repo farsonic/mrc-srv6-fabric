@@ -4,7 +4,10 @@ fabric_vars.json
 fabric_address_map.txt
 clab-*/
 .clab/
-mrc-nic/          # generated per-deploy profile dir (the binary lives in nic/)
+# generated per-node FRR configs
+frr/
+# generated per-deploy profile dir (the binary lives in nic/)
+mrc-nic/
 __pycache__/
 *.pyc
 *.tgz
