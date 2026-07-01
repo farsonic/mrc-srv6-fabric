@@ -1,0 +1,65 @@
+# mrc-srv6-fabric — independent 1-plane 2-spine x 2-leaf SRv6 uSID CLOS.
+#
+# SONiC switches run the validated community image (docker-sonic-vs:latest);
+# hosts are plain ubuntu:22.04 doing host-side SRv6 (End.DT6 decap via iproute2 —
+# no custom image needed). Self-contained: deploy with ./deploy.sh (or the
+# ansible/ playbook), which pushes the per-node configs under config/.
+#
+# Switch configs were produced by the Apache-2.0 segment-routing/srv6-mrc-emulator
+# generator (1p-2x2 variant) and are authoritative for the uSID + static-route math.
+#
+# Independent of the sonic01 lab: own mgmt net (172.20.18.0/24), own node names.
+name: mrc-srv6
+prefix: ""
+
+mgmt:
+  network: mrcsrv6_mgmt
+  ipv4-subnet: 172.20.18.0/24
+
+topology:
+  nodes:
+
+    p0-spine00:
+      kind: linux
+      image: docker-sonic-vs:latest
+      mgmt-ipv4: 172.20.18.10
+
+    p0-spine01:
+      kind: linux
+      image: docker-sonic-vs:latest
+      mgmt-ipv4: 172.20.18.11
+
+    p0-leaf00:
+      kind: linux
+      image: docker-sonic-vs:latest
+      mgmt-ipv4: 172.20.18.50
+
+    p0-leaf01:
+      kind: linux
+      image: docker-sonic-vs:latest
+      mgmt-ipv4: 172.20.18.51
+
+    # Hosts: plain ubuntu (host-side SRv6 via iproute2). host00 sits on leaf00,
+    # host01 on leaf01. Each does End.DT6 decap of its tenant uSID (fc00:0:d001).
+    host00:
+      kind: linux
+      image: ubuntu:22.04
+      mgmt-ipv4: 172.20.18.200
+      # SRv6 host config (addr/route/End.DT6) is applied by deploy.sh / the hosts
+      # playbook, which first installs iproute2 (base ubuntu has no `ip`).
+
+    host01:
+      kind: linux
+      image: ubuntu:22.04
+      mgmt-ipv4: 172.20.18.201
+      # SRv6 host config applied by deploy.sh / the hosts playbook.
+
+  links:
+    # fabric (each leaf to both spines = the two steerable paths)
+    - endpoints: ["p0-leaf00:eth1", "p0-spine00:eth1"]    # leaf00<->spine00  fab:0000
+    - endpoints: ["p0-leaf01:eth1", "p0-spine00:eth2"]    # leaf01<->spine00  fab:0001
+    - endpoints: ["p0-leaf00:eth2", "p0-spine01:eth1"]    # leaf00<->spine01  fab:0002
+    - endpoints: ["p0-leaf01:eth2", "p0-spine01:eth2"]    # leaf01<->spine01  fab:0003
+    # hosts (leaf eth10 == Ethernet36, the tenant port in the generated config)
+    - endpoints: ["p0-leaf00:eth10", "host00:eth1"]
+    - endpoints: ["p0-leaf01:eth10", "host01:eth1"]

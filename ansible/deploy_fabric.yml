@@ -1,0 +1,106 @@
+---
+# Declarative deploy of the SRv6 fabric (alternative to ../deploy.sh).
+# Pushes each switch's generated config_db.json + frr.conf and confirms the
+# uSID SIDs land in the kernel FIB. Run AFTER `containerlab deploy`.
+#
+#   ansible-galaxy collection install community.docker
+#   ansible-playbook -i inventory.yml deploy_fabric.yml
+
+- name: Configure SRv6 uSID fabric on community SONiC
+  hosts: srv6_switches
+  gather_facts: false
+  vars:
+    config_root: "{{ playbook_dir }}/../config"
+    frr_dir: /etc/frr
+    expected_sids: "{{ lookup('file', config_root ~ '/' ~ inventory_hostname ~ '/frr.conf') | regex_findall('(?m)^\\s+sid\\s') | length }}"
+  tasks:
+    - name: sudo passthrough shim (community image ships none)
+      ansible.builtin.copy:
+        dest: /usr/local/bin/sudo
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          exec "$@"
+
+    - name: Push config_db.json
+      ansible.builtin.copy:
+        src: "{{ config_root }}/{{ inventory_hostname }}/config_db.json"
+        dest: /etc/sonic/config_db.json
+
+    - name: Apply config_db + SRv6 dataplane prerequisites
+      ansible.builtin.shell: |
+        ip link show Loopback0 >/dev/null 2>&1 || { ip link add Loopback0 type dummy && ip link set Loopback0 up; }
+        sonic-cfggen -j /etc/sonic/config_db.json --write-to-db
+        supervisorctl restart all
+        ip link add vrfdefault type vrf table main 2>/dev/null || true; ip link set vrfdefault up 2>/dev/null || true
+        ip link add sr0 type dummy 2>/dev/null || true; ip link set sr0 up 2>/dev/null || true
+        sysctl -w net.vrf.strict_mode=1 || true
+        sysctl -w net.ipv6.conf.all.forwarding=1
+        for p in $(sonic-cfggen -d --var-json PORT | python3 -c "import sys,json;print(' '.join(json.load(sys.stdin)))"); do config interface startup $p 2>/dev/null || true; done
+      changed_when: false
+
+    - name: Wait for FRR
+      ansible.builtin.command: vtysh -c "show version"
+      register: frr_up
+      until: frr_up.rc == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Push frr.conf
+      ansible.builtin.copy:
+        src: "{{ config_root }}/{{ inventory_hostname }}/frr.conf"
+        dest: "{{ frr_dir }}/frr.conf"
+
+    - name: Load frr.conf and confirm SIDs reach the kernel FIB (staticd-race retry)
+      ansible.builtin.shell: |
+        supervisorctl stop bgpd zebra staticd >/dev/null 2>&1 || true
+        sleep 2
+        supervisorctl start bgpd zebra staticd >/dev/null 2>&1 || true
+        sleep 3
+        for asn in 65000 65001 65100; do vtysh -c 'configure terminal' -c "no router bgp $asn" -c exit >/dev/null 2>&1 || true; done
+        vtysh -f {{ frr_dir }}/frr.conf >/dev/null 2>&1 || true
+        sleep 2
+        ip -6 route show table all | grep -c seg6local || true
+      register: sidc
+      changed_when: false
+      retries: 3
+      delay: 3
+      until: sidc.stdout | trim | int >= (expected_sids | int)
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ sidc.stdout | trim }}/{{ expected_sids }} seg6local SIDs programmed"
+
+    - name: Assert dataplane programmed
+      ansible.builtin.assert:
+        that: "sidc.stdout | trim | int >= (expected_sids | int)"
+        fail_msg: "{{ inventory_hostname }}: SIDs not programmed — see vtysh 'show segment-routing srv6 sid'"
+        success_msg: "{{ inventory_hostname }}: SRv6 uSID dataplane up"
+
+# ----------------------------------------------------------------------------
+# Hosts: plain ubuntu has no python (so no command/shell/apt modules) and no
+# `ip` — use raw to install iproute2, then set addressing + End.DT6 decap.
+# ----------------------------------------------------------------------------
+- name: Configure SRv6 hosts
+  hosts: srv6_hosts
+  gather_facts: false
+  tasks:
+    - name: Ensure iproute2 + program host SRv6 (raw — no python on host)
+      ansible.builtin.raw: |
+        command -v ip >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 iputils-ping)
+        ip -6 addr replace {{ tenant_pfx }}::2/64 dev eth1
+        ip -6 addr replace {{ tenant_pfx }}::2/128 dev lo
+        sysctl -w net.ipv6.conf.all.forwarding=1
+        ip -6 route replace fc00:0000::/32 via {{ tenant_pfx }}::1 dev eth1
+        ip -6 route replace 2001:db8:cccc::/48 via {{ tenant_pfx }}::1 dev eth1
+        ip -6 route replace fc00:0000:d001::/48 dev eth1 encap seg6local action End.DT6 table 0
+      register: hostcfg
+      changed_when: false
+
+    - name: Show host eth1 addressing
+      ansible.builtin.raw: ip -6 addr show dev eth1 | awk '/inet6/{print $2}'
+      register: hostaddr
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ hostaddr.stdout_lines | reject('search','fe80') | list }}"

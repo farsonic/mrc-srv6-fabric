@@ -1,0 +1,18 @@
+# Switches and hosts reached via the docker connection plugin (containers).
+#   ansible-galaxy collection install community.docker
+all:
+  children:
+    srv6_switches:
+      vars:
+        ansible_connection: community.docker.docker
+      hosts:
+        p0-spine00: {}
+        p0-spine01: {}
+        p0-leaf00: {}
+        p0-leaf01: {}
+    srv6_hosts:
+      vars:
+        ansible_connection: community.docker.docker
+      hosts:
+        host00: { tenant_pfx: "2001:db8:cccc:00" }
+        host01: { tenant_pfx: "2001:db8:cccc:01" }

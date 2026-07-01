@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""
+mrc-meshprobe — standalone per-path test probe for the MRC NIC.
+
+Separation of concerns:
+  * mrc-nic  owns the DATAPLANE — it reads profile.json and programs one
+    SO_MARK->table->seg6 encap route per EV (path), plus its own End.DT6 decap.
+    It does no probing.
+  * mrc-meshprobe (this app) owns MEASUREMENT — it reads the NIC's state file to
+    learn every configured path, sends one SO_MARK-pinned ICMPv6 probe burst per
+    path (so each burst rides exactly that path's carrier via the NIC's per-EV
+    encap route), and POSTs per-path health (RTT / jitter / loss) to the GUI
+    backend's /api/mesh-health. It programs NO routes.
+
+Because it stamps SO_MARK = the EV's entropy — the same value mrc-nic used as the
+fwmark/table for that path — each probe is pinned to one uSID carrier, so the
+health is truly per-path, not an ECMP-hashed average.
+
+Usage:
+  mrc-meshprobe --controller http://<gui-host>:8080 --host gpu1
+  mrc-meshprobe --controller URL --host gpu1 --once     # one sweep, then exit
+"""
+
+import argparse, json, os, socket, struct, sys, time
+from urllib import request as urlreq, error as urlerr
+
+DEFAULT_STATE  = "/run/mrc-agent.json"
+FALLBACK_STATE = "/tmp/mrc-agent.json"
+
+def read_state(path):
+    for p in [path, FALLBACK_STATE]:
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            continue
+        except (ValueError, OSError):
+            return None
+    return None
+
+def ping6(addr, count, timeout, mark):
+    """One raw-ICMPv6 echo burst, SO_MARK-pinned so it rides the NIC's per-EV
+    encap route for `mark`. Returns dict(up, loss_pct, rtt_min/avg/max, rtt_mdev).
+    Raw sockets need CAP_NET_RAW — fine, the probe runs as root like the NIC.
+    Bounded: a dead path costs count*timeout, kept short so a sweep stays quick."""
+    res = {"up": False, "loss_pct": 100.0, "rtt_min": None, "rtt_avg": None,
+           "rtt_max": None, "rtt_mdev": None}
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    except OSError as e:
+        res["err"] = f"raw icmpv6 socket: {e}"
+        return res
+    if mark:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(mark))
+        except OSError as e:
+            res["err"] = f"SO_MARK {mark}: {e}"
+    s.settimeout(timeout)
+    ident = os.getpid() & 0xFFFF
+    try:
+        ai = socket.getaddrinfo(addr, None, socket.AF_INET6, socket.SOCK_RAW)[0][4]
+    except OSError as e:
+        res["err"] = f"resolve {addr}: {e}"
+        s.close()
+        return res
+    rtts = []
+    for seq in range(count):
+        # type 128 = echo request; kernel fills the ICMPv6 checksum on raw sockets.
+        pkt = struct.pack(">BBHHH", 128, 0, 0, ident, seq & 0xFFFF) + b"mrc-probe" + struct.pack(">d", time.time())
+        t0 = time.monotonic()
+        try:
+            s.sendto(pkt, ai)
+            while True:
+                data, _ = s.recvfrom(1024)
+                if len(data) >= 8 and data[0] == 129 and struct.unpack(">H", data[4:6])[0] == ident:
+                    rtts.append((time.monotonic() - t0) * 1000.0)
+                    break
+        except socket.timeout:
+            pass
+        except OSError as e:
+            res["err"] = f"icmpv6 send/recv: {e}"
+            break
+        time.sleep(0.02)
+    s.close()
+    rx = len(rtts)
+    res["loss_pct"] = round(100.0 * (count - rx) / count, 1) if count else 100.0
+    res["up"] = rx > 0
+    if rtts:
+        res["rtt_min"] = round(min(rtts), 3)
+        res["rtt_max"] = round(max(rtts), 3)
+        avg = sum(rtts) / len(rtts)
+        res["rtt_avg"] = round(avg, 3)
+        res["rtt_mdev"] = round((sum((x - avg) ** 2 for x in rtts) / len(rtts)) ** 0.5, 3)
+        res.pop("err", None)
+    return res
+
+def paths_from_state(state):
+    """Every path the NIC has configured: (dst_name, dst_addr, plane, spine, entropy).
+    The NIC accumulates one entry per peer in state['peers'][dst_addr] with the
+    full EV-set; entropy is the SO_MARK that pins the probe to that carrier."""
+    out = []
+    peers = (state or {}).get("peers") or {}
+    if isinstance(peers, dict) and peers:
+        for dst_addr, v in peers.items():
+            flow = v.get("flow") or {}
+            dst_name = flow.get("dst") or dst_addr
+            for e in v.get("active_evs") or []:
+                out.append((dst_name, v.get("dst") or dst_addr,
+                            e.get("plane"), e.get("spine"), e.get("entropy")))
+        return out
+    # fallback: a single 'profile' slot (e.g. controller pushed one flow)
+    prof = (state or {}).get("profile") or {}
+    if prof:
+        flow = prof.get("flow") or {}
+        dst_addr = prof.get("active_dst") or flow.get("dst_addr")
+        for e in prof.get("active_evs") or []:
+            out.append((flow.get("dst"), dst_addr, e.get("plane"),
+                        e.get("spine"), e.get("entropy")))
+    return out
+
+def post(controller, host, samples):
+    body = json.dumps({"host": host, "ts": time.time(), "peers": samples}).encode()
+    req = urlreq.Request(f"{controller.rstrip('/')}/api/mesh-health", data=body,
+                         headers={"Content-Type": "application/json"})
+    try:
+        urlreq.urlopen(req, timeout=3).read()
+        return True
+    except (urlerr.URLError, OSError):
+        return False
+
+def main():
+    ap = argparse.ArgumentParser(prog="mrc-meshprobe", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--controller", required=True, help="GUI/health backend base URL")
+    ap.add_argument("--host", required=True, help="this host's name (the path src label)")
+    ap.add_argument("--state", default=DEFAULT_STATE, help=f"NIC state file (default {DEFAULT_STATE})")
+    ap.add_argument("--interval", type=float, default=5.0, help="seconds between sweeps")
+    ap.add_argument("--count", type=int, default=10, help="probe packets per path per sweep")
+    ap.add_argument("--timeout", type=float, default=0.3, help="per-packet timeout (s)")
+    ap.add_argument("--once", action="store_true", help="run one sweep and exit (diagnostic)")
+    a = ap.parse_args()
+
+    print(f"[meshprobe] {a.host} -> {a.controller}  every {a.interval}s, "
+          f"{a.count} pkts/path, timeout {a.timeout}s", file=sys.stderr, flush=True)
+    first = True
+    while True:
+        paths = paths_from_state(read_state(a.state))
+        if not paths and first:
+            print(f"[meshprobe] no paths in {a.state} yet — is mrc-nic running "
+                  f"standalone and programming profile.json?", file=sys.stderr, flush=True)
+        samples = []
+        for (dst_name, dst_addr, plane, spine, entropy) in paths:
+            if not dst_addr:
+                continue
+            r = ping6(dst_addr, a.count, a.timeout, entropy or 0)
+            samples.append({"peer": dst_name, "addr": dst_addr,
+                            "plane": plane, "spine": spine, "entropy": entropy, **r})
+        if samples:
+            ok = post(a.controller, a.host, samples)
+            if first:
+                up = sum(1 for s in samples if s["up"])
+                print(f"[meshprobe] first sweep: {up}/{len(samples)} paths up "
+                      f"(post {'ok' if ok else 'FAILED — controller unreachable'})",
+                      file=sys.stderr, flush=True)
+                first = False
+        if a.once:
+            break
+        time.sleep(a.interval)
+
+if __name__ == "__main__":
+    main()
