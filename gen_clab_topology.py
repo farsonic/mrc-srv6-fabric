@@ -816,6 +816,25 @@ def main():
             # localhost/ip6 specials, append the fabric block).
             out.append("        - sh -c 'keep=$(grep -E \"localhost|ip6-|^ff0|^fe00\" /etc/hosts); "
                        "{ printf \"%s\\n\" \"$keep\"; cat /etc/hosts.fabric; } > /etc/hosts'")
+            # underlay loopback routes: reach each plane's switch loopbacks via THAT
+            # plane's gateway so `mtr <switch>` traces the native underlay (the SRv6
+            # tunnel to a GPU hides transit hops; loopbacks are natively routed). The
+            # planes are isolated, so each plane's /56 loopback block routes out its
+            # own interface. GPUs otherwise have no route to the loopbacks.
+            import ipaddress as _ipa
+            _gifs = {i["plane"]: i for i in nodes[name].get("interfaces", [])
+                     if i.get("plane") and i.get("gateway")}
+            _lbr = {}
+            for _sw, _swnd in nodes.items():
+                if _swnd.get("role") not in ("leaf", "spine"):
+                    continue
+                _lo, _pl = _swnd.get("loopback"), _swnd.get("plane")
+                if not _lo or _pl not in _gifs:
+                    continue
+                _net = str(_ipa.ip_network(_lo + "/56", strict=False))
+                _lbr[_net] = (_gifs[_pl]["name"], _gifs[_pl]["gateway"])
+            for _net, (_ifc, _gw) in sorted(_lbr.items()):
+                out.append(f"        - sh -c 'ip -6 route replace {_net} via {_gw} dev {_ifc}'")
             out.append("        - sh -c 'echo 1 > /proc/sys/net/ipv6/conf/all/forwarding'")
             out.append("        - sh -c 'for d in /proc/sys/net/ipv6/conf/*/seg6_enabled; do echo 1 > \"$d\"; done'")
             # copy staged binary -> real in-container file (NOT a mount, so re-readable)
