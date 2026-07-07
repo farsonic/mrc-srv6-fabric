@@ -218,9 +218,17 @@
   .hoverdetail{position:absolute;left:14px;bottom:14px;max-width:calc(100% - 28px);
     display:none;gap:10px;align-items:flex-end;flex-wrap:wrap;z-index:6}
   .hoverdetail.show{display:flex}
-  .linkdetail,.carrierdetail{max-height:46vh;overflow:auto;background:rgba(9,15,21,.97);
+  .linkdetail,.carrierdetail,.carrierexplain{max-height:46vh;overflow:auto;background:rgba(9,15,21,.97);
     border:1px solid var(--rule);border-radius:8px;box-shadow:0 12px 34px rgba(0,0,0,.5);padding:8px 10px}
   .carrierdetail{display:none}
+  .carrierexplain{display:none;max-width:300px}
+  .carrierexplain.show{display:block}
+  .carrierexplain .xk{font-size:13px;font-weight:600;margin:2px 0 6px}
+  .carrierexplain .xbody{font-size:11.5px;line-height:1.5;color:var(--ink);white-space:normal}
+  .carrierexplain .xhint{font-size:10.5px;color:var(--dim);margin-top:7px;white-space:normal}
+  .carrierdetail .actbtn{cursor:pointer;border-bottom:1px dotted currentColor}
+  .carrierdetail .actbtn:hover{filter:brightness(1.25)}
+  .carrierdetail .actbtn.on{background:#1b2a3a;border-radius:4px;padding:0 4px;border-bottom-color:transparent}
   .ld-title{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:0 0 6px 2px}
   .hoverdetail table{border-collapse:collapse;font-size:11px;width:100%}
   .hoverdetail th{color:var(--dim);font-weight:600;text-align:left;padding:2px 9px;white-space:nowrap}
@@ -267,6 +275,7 @@
   <div class="hoverdetail" id="hoverDetail">
     <div class="linkdetail" id="linkDetail"></div>
     <div class="carrierdetail" id="carrierDetail"></div>
+    <div class="carrierexplain" id="carrierExplain"></div>
   </div>
   <div class="vdrag" id="vdrag" title="drag to resize the inspector"></div>
   <aside id="aside">
@@ -869,30 +878,63 @@ function carrierProgression(rec){
   const c=rec.usid;
   if(!rec.spine){                      // same-leaf: single uSID (dst decap block), no shift
     return [
-      {node:rec.src,      act:'encap · push SRH', da:c},
-      {node:rec.src_leaf, act:'transit',          da:c},
-      {node:rec.dst,      act:'End.DT6 · decap',  da:null, decap:true},
+      {node:rec.src,      act:'encap · push SRH', da:c, kind:'encap'},
+      {node:rec.src_leaf, act:'transit',          da:c, kind:'transit'},
+      {node:rec.dst,      act:'End.DT6 · decap',  da:null, decap:true, kind:'enddt6'},
     ];
   }
   const shifted=usidShift(c);
   return [
-    {node:rec.src,      act:'encap · push SRH',      da:c},
-    {node:rec.src_leaf, act:'transit',               da:c},
-    {node:rec.spine,    act:'End.X · uSID shift',    da:shifted, shift:true},
-    {node:rec.dst_leaf, act:'transit',               da:shifted},
-    {node:rec.dst,      act:'End.DT6 · decap',       da:null, decap:true},
+    {node:rec.src,      act:'encap · push SRH',      da:c, kind:'encap'},
+    {node:rec.src_leaf, act:'transit',               da:c, kind:'transit'},
+    {node:rec.spine,    act:'End.X · uSID shift',    da:shifted, shift:true, kind:'endx'},
+    {node:rec.dst_leaf, act:'transit',               da:shifted, kind:'transit'},
+    {node:rec.dst,      act:'End.DT6 · decap',       da:null, decap:true, kind:'enddt6'},
   ];
+}
+// plain-English explanation of each SRv6 action — shown when you click one
+const ACTION_EXPLAIN={
+  encap:{t:'Encap · push SRH',b:'The source virtual NIC wraps the inner GPU→GPU packet in a new '+
+    'outer IPv6 header and pushes a Segment Routing Header. The outer destination is the uSID '+
+    '<b>carrier</b> — the entire source-chosen path packed into one 128-bit address.',
+    h:'This is the ONLY place a path is chosen. Everything downstream just forwards.'},
+  transit:{t:'Transit · plain forward',b:'This switch is not an endpoint for the leading uSID. It does '+
+    'an ordinary longest-prefix-match on the outer destination and forwards toward the switch that '+
+    '<b>owns</b> that uSID. No SRv6 action, no per-flow state.',
+    h:'This is why the core stays “dumb” — transit hops need no MRC/SRv6 knowledge.'},
+  endx:{t:'End.X · uSID shift',b:'This spine owns the leading uSID. It runs <b>End.X</b> with '+
+    'NEXT-C-SID: it strips its own 32-bit uSID off the front of the destination, exposing the next '+
+    'uSID (the destination GPU’s decap SID), and forwards out the End.X-programmed link toward the '+
+    'destination leaf.',
+    h:'Watch the outer destination change on this row — that is the shift.'},
+  enddt6:{t:'End.DT6 · decap',b:'The carrier’s final uSID has reached its owner — the destination '+
+    'GPU’s NIC. <b>End.DT6</b> removes the outer IPv6 header + SRH and looks the inner packet up in '+
+    'table 255 (the local/decap table), delivering it to the GPU.',
+    h:'The tunnel ends here; the inner packet is handed to the GPU.'},
+};
+function showActionExplain(kind,el){
+  const box=document.getElementById('carrierExplain'); if(!box) return;
+  const e=ACTION_EXPLAIN[kind]; if(!e){ box.classList.remove('show'); return; }
+  document.querySelectorAll('#carrierDetail .actbtn.on').forEach(a=>a.classList.remove('on'));
+  if(el) el.classList.add('on');
+  box.innerHTML=`<div class="ld-title">what happens here</div>`+
+    `<div class="xk">${e.t}</div><div class="xbody">${e.b}</div><div class="xhint">${e.h}</div>`;
+  box.classList.add('show');
 }
 function showCarrierDetail(rec){
   const box=document.getElementById('carrierDetail'); if(!box) return;
-  if(!rec||!rec.usid){ box.style.display='none'; return; }
+  const ex=document.getElementById('carrierExplain');
+  if(!rec||!rec.usid){ box.style.display='none'; if(ex) ex.classList.remove('show'); return; }
+  if(ex) ex.classList.remove('show');   // reset when a new path is shown
   const rows=carrierProgression(rec).map(h=>{
     const da = h.da==null ? '<span class="zz">inner packet → '+rec.dst+'</span>' : h.da;
     return `<tr class="${h.shift?'shift':(h.decap?'decap':'')}"><td class="nd"><b>${h.node}</b></td>`+
-           `<td class="act">${h.act}</td><td class="da">${da}</td></tr>`;
+           `<td class="act"><span class="actbtn" data-kind="${h.kind}">${h.act}</span></td>`+
+           `<td class="da">${da}</td></tr>`;
   }).join('');
-  box.innerHTML=`<div class="ld-title">SRv6 carrier · outer DA per hop</div><table>`+
+  box.innerHTML=`<div class="ld-title">SRv6 carrier · outer DA per hop <span style="text-transform:none;color:var(--dim)">— click an action</span></div><table>`+
     `<tr><th>node</th><th>action</th><th>outer destination (carrier uSID)</th></tr>`+rows+`</table>`;
+  box.onclick=(ev)=>{ const a=ev.target.closest('.actbtn'); if(a) showActionExplain(a.dataset.kind,a); };
   box.style.display='block';
 }
 let ldTimer=null;
