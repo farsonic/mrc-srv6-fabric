@@ -20,6 +20,9 @@ Full engineering notes: [`docs/MRC_SRV6_DESIGN.md`](docs/MRC_SRV6_DESIGN.md).
 - [Bring the lab up](#bring-the-lab-up)
 - [Use the fabric](#use-the-fabric)
 - [Inspect what the NIC is doing](#inspect-what-the-nic-is-doing)
+- [Topology GUI](#topology-gui)
+- [Maintenance drain](#maintenance-drain)
+- [Live packet capture (Edgeshark)](#live-packet-capture-edgeshark)
 - [Tear the lab down](#tear-the-lab-down)
 - [How it scales](#how-it-scales)
 - [Troubleshooting](#troubleshooting)
@@ -34,11 +37,18 @@ host runs a software **virtual NIC** (`mrc-nic`) that:
 
 1. builds an SRv6 uSID **carrier** for every destination — one carrier per path,
 2. **encapsulates** outbound traffic into that carrier,
-3. **decapsulates** (`End.DT6`) its own arriving traffic.
+3. **decapsulates** (`End.DT6`) its own arriving traffic,
+4. **probes every path continuously** (an SO_MARK-pinned test probe per uSID
+   carrier) and reports per-path RTT / loss / jitter so path health is always live.
 
 The switches only ever do plain IPv6 longest-prefix forwarding on `/48` / `/36`
 prefixes. A leaf-nested uSID address plan keeps core routing state proportional to
 the **fabric** (leaves + spines), never to the **number of GPUs**.
+
+An optional [**topology GUI**](#topology-gui) turns the probe stream into a live
+dashboard (per-path health, per-node config/console, maintenance drain), and
+[**Edgeshark**](#live-packet-capture-edgeshark) adds in-browser Wireshark capture
+on any fabric link.
 
 Two modes, selected at deploy time:
 
@@ -109,6 +119,19 @@ ansible-playbook site-frr.yml \
 | `spec_mode` | `true` = NIC decap; `false` = leaf decap | `true` |
 | `gpu_image` | GPU host container image | `debian:bookworm` |
 | `switch_image` | FRR switch image | `quay.io/frrouting/frr:10.6.1` |
+| `do_gui` | start the [topology GUI](#topology-gui) + probe dashboard on `:8080` | `true` |
+| `gui_console` | let the GUI open an in-browser shell / run commands on nodes (mounts the host Docker socket — **lab-only**) | `true` |
+| `do_edgeshark` | deploy [Edgeshark](#live-packet-capture-edgeshark) for live per-link capture on `:5001` (**lab-only**) | `true` |
+
+When `do_gui=true`, each NIC attaches to the GUI backend and streams its live
+per-path probe health into the dashboard. A full-featured deploy:
+
+```bash
+ansible-playbook site-frr.yml \
+  -e gpus_per_leaf=2 -e leaves=2 -e spines=2 -e planes=2 \
+  -e spec_mode=true -e gpu_image=debian:bookworm \
+  -e do_gui=true -e gui_console=true -e do_edgeshark=true
+```
 
 A larger example (8 leaves x 8 GPUs, 4 spines, spec mode):
 
@@ -141,15 +164,28 @@ carrier-block route — everything needed to diagnose a decap problem in one sho
 
 ### Test connectivity
 
-Same-leaf (gpu1 -> gpu2) and cross-leaf (gpu1 -> gpu3):
+Each GPU's `/etc/hosts` resolves fabric node names to their **fabric IPv6** (a
+GPU's tenant address, a switch's loopback) rather than the mgmt network, so a
+ping between GPUs **rides the SRv6 underlay**:
 
 ```bash
-docker exec clab-srv6lab-gpu1 ping6 -c3 fd00:9:1:102::2   # gpu2 (same leaf)
-docker exec clab-srv6lab-gpu1 ping6 -c3 fd00:9:1:201::2   # gpu3 (cross leaf)
+docker exec clab-srv6lab-gpu1 ping -c3 gpu2   # same leaf  -> native over the fabric
+docker exec clab-srv6lab-gpu1 ping -c3 gpu3   # cross leaf -> SRv6-encapped (spine transit)
 ```
 
 GPU host addresses follow `fd00:9:<plane>:<leaf><gpu>::2`. Use the address map
 printed at generation time (or `fabric_address_map.txt`) to find any GPU.
+
+### Trace the underlay
+
+A traceroute to a GPU shows only the endpoint — the SRv6 tunnel hides the
+transit hops (the core only decrements the *outer* header's hop-limit). To see
+the real underlay path, trace a **switch loopback** (each GPU has routes to
+them), which is natively routed:
+
+```bash
+docker exec clab-srv6lab-gpu1 mtr -6 -r -c3 leaf2-p1   # gpu1 -> leaf1 -> spine -> leaf2
+```
 
 ---
 
@@ -180,6 +216,24 @@ docker exec clab-srv6lab-gpu1 /usr/local/bin/mrc-nic paths --decode
 Breaks every carrier into its component uSIDs and labels what each one does and
 which node processes it (spine locator / End.X shift / GPU decap block).
 
+### Live path health
+
+Every NIC runs an always-on per-path test probe. `status` shows the controller
+link, the programmed EVs, the kernel route, and a full `MESH HEALTH` block —
+per-path RTT / loss, with any [drained](#maintenance-drain) path clearly marked:
+
+```bash
+docker exec clab-srv6lab-gpu1 /usr/local/bin/mrc-nic status
+```
+
+```
+  MESH HEALTH  8/10 paths up · 2 drained · swept now
+    [✓] gpu2                     loss   0.0%   rtt 0.07 ms
+    [~] gpu3     via spine1-p1   DRAINED  loss   0.0%   rtt 0.10 ms
+    [✓] gpu3     via spine2-p1   loss   0.0%   rtt 0.09 ms
+    ...
+```
+
 ### See the dumb core
 
 ```bash
@@ -195,7 +249,8 @@ total GPU count.
 
 ## Topology GUI
 
-Bring up a browser-based topology viewer alongside the lab:
+Bring up a browser-based topology viewer + live operations dashboard alongside
+the lab:
 
 ```bash
 cd ansible
@@ -203,8 +258,69 @@ ansible-playbook site-frr.yml -e gpus_per_leaf=2 -e leaves=2 -e spines=2 -e do_g
 ```
 
 Then open `http://<this-host>:8080/gui/topology.html`. It renders each plane as a
-CLOS layer with the GPUs threading up into every plane; hover to highlight a
-node's links, click to pin its details. See [`gui/README.md`](gui/README.md).
+CLOS layer with the GPUs threading up into every plane, and provides:
+
+- **Live test-probe health** — the paths table shows every path's forward/return
+  RTT and loss, updated as each NIC reports (`up` / `down` / `drained`).
+- **Path & link inspection** — hover a node or a path to pop a detail table
+  showing each link's interface names + IPv6, plus (for a path) an **SRv6 carrier
+  progression** box tracing how the outer uSID shifts hop-by-hop (encap → transit
+  → `End.X` shift at the spine → `End.DT6` decap).
+- **Per-node config** — click a node to view its `frr.conf` / NIC profile; the
+  header has a one-click **download of all configs** as a `.tar.gz`.
+- **Node console** (`-e gui_console=true`) — an in-browser terminal (xterm.js over
+  a websocket to `docker exec`) plus a quick command runner per node.
+- **Maintenance drain** — see [below](#maintenance-drain).
+- **Edgeshark link** — a header button opens [Edgeshark](#live-packet-capture-edgeshark).
+- Resizable inspector / paths panels.
+
+See [`gui/README.md`](gui/README.md).
+
+> **`gui_console` mounts the host Docker socket** into the GUI container so the
+> web UI can exec into nodes — it grants that container control of the host's
+> Docker, so only enable it on a trusted lab host.
+
+---
+
+## Maintenance drain
+
+Select a **node** (click it → **Bypass**) or a whole **plane** (click the plane
+label) in the GUI to drain it for maintenance: every NIC steers its data traffic
+(the weighted SRv6 spray) off any path transiting the drained node/plane within
+~2 s, **while still probing those paths** so you can see when it is healthy and
+safe to restore. Drained paths are marked `drained` in the GUI and `[~] DRAINED`
+in `mrc-nic status` / `mrc-nic paths`. A last-path guard prevents a full drain
+(e.g. draining the only plane) from black-holing a flow.
+
+The same works over the API:
+
+```bash
+curl -X POST http://<host>:8080/api/bypass -d '{"node":"spine1-p1","on":true}'
+curl -X POST http://<host>:8080/api/bypass -d '{"plane":2,"on":true}'
+curl -X POST http://<host>:8080/api/bypass -d '{"planes":[]}'          # restore all
+```
+
+---
+
+## Live packet capture (Edgeshark)
+
+Deploy [Siemens Edgeshark](https://github.com/siemens/edgeshark) for live
+per-link packet capture across every container in the fabric:
+
+```bash
+ansible-playbook site-frr.yml -e gpus_per_leaf=2 -e leaves=2 -e spines=2 \
+  -e do_gui=true -e do_edgeshark=true
+# or standalone: docker compose -f edgeshark/docker-compose.yml -p edgeshark up -d
+```
+
+Open `http://<this-host>:5001` (the GUI header also links to it). Edgeshark
+discovers every clab node's interfaces and hands a chosen link off to Wireshark
+in the browser — install the one-time **Edgeshark browser extension**
+(`cshargextcap`) for the Wireshark handoff; the in-browser topology/interface
+view works without it.
+
+> Edgeshark runs privileged host-level containers (`pid:host` + scoped caps), so
+> it is **lab-only** and off by default.
 
 ---
 
@@ -278,17 +394,27 @@ start. A prebuilt GPU image avoids this.
 ## Repository layout
 
 ```
-gen_clab_topology.py   topology + FRR + NIC-profile generator
+gen_clab_topology.py   topology + FRR + NIC-profile generator (also emits the
+                       IPv6 /etc/hosts, underlay loopback routes, per-GPU config)
 address_plan.json      addressing scheme (block, locators, GPU uSID layout)
 nic/
-  mrc-nic              virtual NIC: SRv6 source, per-path carriers, End.DT6 decap
+  mrc-nic              virtual NIC: SRv6 source, per-path carriers, End.DT6 decap,
+                       always-on test probe + weighted spray + maintenance drain
+  mrc-meshprobe        standalone full-mesh probe helper
   mrc-probe            traffic generator (per-path probing)
   mrc-sink             traffic sink
+gui/
+  server.py            GUI backend: probe-health aggregate + config / bypass /
+                       exec / websocket-console API (stdlib only)
+  topology.html        the dashboard (topology, live paths, inspector, console)
+  vendor/              xterm.js (vendored, MIT) for the in-browser console
+edgeshark/
+  docker-compose.yml   Siemens Edgeshark stack for live per-link capture
 ansible/
-  site-frr.yml         main deploy playbook
+  site-frr.yml         main deploy playbook (fabric + GUI + Edgeshark)
   roles/sonic_frr/     switch (FRR) config role
   roles/gpu_host/      GPU host bootstrap (image-agnostic iproute2/python3)
-  group_vars/all.yml   defaults (mrc_nic, spec_mode, ...)
+  group_vars/all.yml   defaults (spec_mode, do_gui, gui_console, do_edgeshark, ...)
 scripts/
   srv6-test.sh         end-to-end connectivity test
   srv6-walk.sh         hop-by-hop SRv6 walk
@@ -306,9 +432,11 @@ docs/
 
 Reference / research design, validated end-to-end on an all-Linux fabric (Linux
 kernel 6.8, FRR 10.6, iproute2 6.1). The virtual NIC demonstrates the addressing,
-forwarding, scaling, and state model; production per-packet spray and
-congestion-reactive rebalancing are properties of smart-NIC silicon and are not
-reproduced here.
+forwarding, scaling, and state model, plus a software emulation of the control
+loop — always-on per-path probing, adaptive weighted spray, and maintenance
+drain — surfaced through the GUI. True per-packet spray and hardware-timescale
+congestion-reactive rebalancing are properties of smart-NIC silicon and are
+approximated, not reproduced, here.
 
 ## License
 
