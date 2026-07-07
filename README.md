@@ -373,6 +373,29 @@ curl -X POST http://<host>:8080/api/bypass -d '{"planes":[]}'          # restore
 
 ---
 
+## Port-status denylist (Clustermapper)
+
+Beyond reactive loss-based path failure, MRC pre-avoids paths through a **known-down
+port** (whitepaper §Clustermapper: *"we ensure all nodes have all NIC ports
+operational … MRC supports a denylist"*). Each NIC agent reports its own per-plane
+NIC-port state; the controller aggregates them into a map and hands every sender
+the **down ports of its peers**, so a sender **pre-denies EVs to a peer's failed
+port** — before it would ever infer the failure from probe loss.
+
+```bash
+curl -s http://<host>:8080/api/ports        # the aggregated NIC-port map (per host, per plane)
+# fail a peer's plane-2 NIC and watch it propagate:
+docker exec clab-srv6lab-gpu3 ip link set eth2 down
+```
+
+Result (verified live): `gpu3` reports plane 2 down → the map shows it → peers'
+mesh-plans carry `peer_ports: {gpu3:[2]}` → each peer zeroes its plane-2 EVs to
+`gpu3` (weight 0) **with `auto_denied` still empty** — the map beat loss-inference.
+The GUI marks those paths `port↓` in the probe table and the per-GPU formula view;
+bringing the port back up clears it (resurrection).
+
+---
+
 ## Collective partners (model a training run)
 
 By default every GPU meshes with every other GPU. Real jobs don't — they talk to

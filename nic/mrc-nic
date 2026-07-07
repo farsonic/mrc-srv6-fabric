@@ -1072,6 +1072,33 @@ class MeshHealth(threading.Thread):
         self.auto_denied = set()  # path_ids the agent has auto-denied (local)
         self.path_health = []     # full-mesh list: [{peer, path_id, spine, up, loss_pct, rtt_min, rtt_avg, rtt_max, jitter, ob_avg, ib_avg, bad, good, denied}]
         self.drained_ids = set()  # path_ids the controller says transit a bypassed (maintenance) node
+        # --- port-status denylist (MRC spec §Clustermapper) ----------------
+        # Each node's agent reports its own per-plane NIC port state; the
+        # controller aggregates and tells us which PEER ports are down, so we
+        # pre-deny EVs to a peer's down port instead of only inferring it from
+        # loss. self.underlays gives us our own per-plane ifaces to report.
+        self.underlays = {}       # plane(str) -> {iface, gateway} (from the mesh-plan)
+        self.port_denied_evs = set()  # fwmarks/EVs whose dst peer's plane-port is down
+
+    def _read_ports(self):
+        """This node's own NIC port status, one per plane: {plane: up_bool}.
+        Read from the kernel oper-state of each plane's underlay interface — the
+        'all NIC ports operational' check the MRC spec runs at job startup."""
+        ports = {}
+        ul = dict(self.underlays or {})
+        if not ul and self.dp is not None:      # single-plane / pre-plan: the primary
+            ul = {"1": {"iface": self.dp.underlay}}
+        for pl, u in ul.items():
+            ifc = (u or {}).get("iface")
+            up = True
+            if ifc:
+                try:
+                    with open(f"/sys/class/net/{ifc}/operstate") as f:
+                        up = f.read().strip() == "up"
+                except OSError:
+                    up = False
+            ports[str(pl)] = up
+        return ports
 
     def _apply_autodeny(self, samples, active_ids, flow_dst=None):
         """Closed-loop path failure handling (MRC #1). Given this sweep's per-path
@@ -1327,6 +1354,12 @@ class MeshHealth(threading.Thread):
                 self._plan_marks.discard(fw)
                 self._encap_ok.pop(fw, None)
         self.plan = plan
+        self.underlays = underlays          # remember per-plane ifaces (to report our own ports)
+        # port-status denylist: the controller flags a path whose DST peer's
+        # plane-port is down. Pre-deny those EVs (by fwmark) so we steer off them
+        # immediately, without waiting to infer the failure from probe loss.
+        self.port_denied_evs = {p.get("fwmark") for p in plan
+                                if p.get("port_down") and p.get("fwmark") is not None}
         # maintenance drain: the controller flags paths transiting a bypassed
         # node. We keep PROBING them (so the dashboard shows when the node is
         # safe to return) but steer data traffic off them below.
@@ -1538,6 +1571,11 @@ class MeshHealth(threading.Thread):
                 if not self.peers and first:
                     print("[mesh] no peers yet from /api/topology", file=sys.stderr)
                 samples = []
+                # our own NIC port status this sweep; planes whose local port is
+                # DOWN can't egress, so we skip probing them (avoids a stalled
+                # sweep on a dead interface) and mark them down directly.
+                myports = self._read_ports()
+                down_local = {int(pl) for pl, up in myports.items() if not up}
                 if self.plan:
                     # SRv6 per-path TWAMP probing: one bounded TWAMP-light burst
                     # per path, SO_MARK-pinned to that path's fwmark route, so we
@@ -1545,6 +1583,13 @@ class MeshHealth(threading.Thread):
                     # path between the GPUs (not one ECMP-hashed aggregate).
                     for p in self.plan:
                         if self.stop.is_set(): break
+                        if p.get("plane") in down_local:      # local egress port down
+                            samples.append({"peer": p["peer"], "addr": p["dst"],
+                                            "spine": p["spine"], "path_id": p["path_id"],
+                                            "encap_ok": self._encap_ok.get(p["fwmark"], True),
+                                            "up": False, "rx": 0, "tx": 0,
+                                            "loss_pct": 100.0, "err": "local port down"})
+                            continue
                         r = self._probe_path(p["dst"], PROBE_COUNT, mark=p["fwmark"])
                         samples.append({"peer": p["peer"], "addr": p["dst"],
                                         "spine": p["spine"], "path_id": p["path_id"],
@@ -1604,7 +1649,8 @@ class MeshHealth(threading.Thread):
                             # every EV whose path transits a drained node, zeroed in
                             # the published weights (keyed per-EV, so BOTH peers on a
                             # shared spine path_id are drained, not just one).
-                            drained_evs = self._drained_ev_set(active_evs)
+                            # deny drained EVs AND EVs whose dst peer's port is down
+                            drained_evs = self._drained_ev_set(active_evs) | set(self.port_denied_evs)
                             self._last_active_ids = spray_ids    # cache for fast republish
                             self._last_full_active = list(active_ids)
                             self._last_id_to_ev   = dict(id_to_ev)
@@ -1660,7 +1706,8 @@ class MeshHealth(threading.Thread):
                 self._maybe_fast_rebalance()   # apply drain/balance change now
 
     def _post(self, samples, weigher=None):
-        payload = {"host": self.host, "ts": time.time(), "peers": samples}
+        payload = {"host": self.host, "ts": time.time(), "peers": samples,
+                   "ports": self._read_ports()}   # our own per-plane NIC port status
         if weigher is not None:
             # include the live adaptive-spray state so the dashboard can show
             # per-path cost + weight without a separate endpoint
@@ -1742,16 +1789,19 @@ def _normalize_plan(doc):
     blocks = _expand_fabric(doc, fab.get("sparse"), fab.get("spray"))
     bypass = {n for n in (doc.get("bypass") or []) if n}          # drained node names
     bplanes = set(doc.get("bypass_planes") or [])                 # drained plane ids
+    # {peer: {down planes}} — the peer NIC-port status from the Clustermapper map
+    pports = {k: set(v or []) for k, v in (doc.get("peer_ports") or {}).items()}
     paths = []
     for b in blocks:
         peer, dst = b["flow"]["dst"], b["active_dst"]
         for e in b["active_evs"]:
             nodes = {e.get("spine"), e.get("src_leaf"), e.get("dst_leaf")}
             drained = (e.get("plane") in bplanes) or bool(bypass & {n for n in nodes if n})
+            port_down = e.get("plane") in pports.get(peer, ())    # dst peer's plane-port is down
             paths.append({"peer": peer, "dst": dst, "spine": e.get("spine"),
                           "path_id": e.get("path_id"), "fwmark": e.get("entropy"),
                           "probe_sid": e.get("usid"), "usid": e.get("usid"),
-                          "plane": e.get("plane"), "drained": drained})
+                          "plane": e.get("plane"), "drained": drained, "port_down": port_down})
     return {"src": doc.get("src"), "decap_sid": doc.get("decap_sid"),
             "underlays": doc.get("underlays") or {},
             "bypass": doc.get("bypass") or [], "bypass_planes": doc.get("bypass_planes") or [],

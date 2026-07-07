@@ -252,6 +252,7 @@ class _WSReader:
 # ---- live state ------------------------------------------------------------
 _LOCK = threading.Lock()
 _REPORTS = {}          # host -> {"ts","received_at","peers":[...],"weigher":{...}}
+_PORTS = {}            # host -> {"ports":{plane:up_bool},"ts"} — the Clustermapper NIC-port map
 _BYPASS = set()        # node names an operator has drained for maintenance
 _BYPASS_PLANES = set() # whole planes (ints) an operator has drained for maintenance
 _COLLECTIVES = {"config": None, "map": {}}  # active parallelism partner set (see collectives())
@@ -370,6 +371,37 @@ def collectives_stats(cmap, n):
 def _collectives_now():
     with _LOCK:
         return _COLLECTIVES.get("config"), dict(_COLLECTIVES.get("map") or {})
+
+
+# ---- port-status map (Clustermapper: which NIC ports are down) -------------
+PORT_STALE_S = 60      # a report older than this is treated as unknown (assume up).
+                       # (the port report piggybacks the per-path probe sweep, which
+                       # is probe-time-dominated ~15-25s; keep the window well above it)
+
+def _ports_now():
+    with _LOCK:
+        return {h: dict(v) for h, v in _PORTS.items()}
+
+def down_planes(host, now=None):
+    """Planes whose NIC port `host` currently reports DOWN. A stale/absent report
+    means 'assume up' — we never deny a path on missing data."""
+    rec = _PORTS.get(host)
+    if not rec:
+        return []
+    if (now or time.time()) - (rec.get("ts") or 0) > PORT_STALE_S:
+        return []
+    return sorted(int(k) for k, up in (rec.get("ports") or {}).items() if not up)
+
+def peer_ports_down(hosts):
+    """{host: [down planes]} for the given hosts, omitting the all-up ones — the
+    compact denylist a sender needs to pre-avoid a peer's failed port."""
+    now = time.time()
+    out = {}
+    for h in hosts:
+        dp = down_planes(h, now)
+        if dp:
+            out[h] = dp
+    return out
 
 # ---- fabric_vars.json (reloaded on mtime change) ---------------------------
 _FAB = {"path": None, "mtime": 0.0, "data": None}
@@ -596,6 +628,7 @@ def mesh_view(fab):
     bn, bp = _bypass_now()
     _ccfg, cmap = _collectives_now()
     now = time.time()
+    dpc = {}   # dst -> down planes, cached per view
     paths = []
     for p in (fab.get("paths") or []):
         key = (p["src"], p["dst"], p["path_id"])
@@ -617,7 +650,11 @@ def mesh_view(fab):
                 "age_s": rep_age,
             }
         coll = path_collective(cmap, p["src"], p["dst"]) if cmap else None
+        dst = p["dst"]
+        if dst not in dpc:
+            dpc[dst] = down_planes(dst, now)
         paths.append({**p, "health": health, "drained": is_drained(p, bn, bp),
+                      "port_down": p.get("plane") in dpc[dst],
                       "collective": (coll or {}).get("group"),
                       "collective_pattern": (coll or {}).get("pattern")})
     return {"updated": now, "name": fab.get("name"), "shape": fab.get("shape"),
@@ -693,6 +730,10 @@ class Handler(SimpleHTTPRequestHandler):
             partners = None
             if cmap:
                 partners = [e["peer"] for e in cmap.get(src, [])]
+            # peer NIC-port denylist: down planes for this src's destinations
+            dst_hosts = partners if partners is not None else \
+                [h["name"] for h in gpu_hosts(fab) if h["name"] != src]
+            pports = peer_ports_down(dst_hosts)
             desc = computed_descriptor(self.root_dir, src)
             if desc:
                 # compute-carriers: hand over the compact descriptor; the NIC
@@ -707,7 +748,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "tenant": desc.get("tenant"), "gateway": desc.get("gateway"),
                     "decap_sid": desc.get("decap_sid"),
                     "underlays": underlays_for(fab, src),
-                    "bypass": sorted(bn), "bypass_planes": sorted(bp)}
+                    "bypass": sorted(bn), "bypass_planes": sorted(bp),
+                    "peer_ports": pports}
                 # expand=1: also return the carriers the formula derives from this
                 # descriptor (so the GUI can show inputs -> outputs for a GPU).
                 if (parse_qs(u.query).get("expand") or [""])[0] and _MRC_USID:
@@ -720,10 +762,12 @@ class Handler(SimpleHTTPRequestHandler):
             if partners is not None:
                 pset = set(partners)
                 paths = [p for p in paths if p.get("peer") in pset]
+            for p in paths:   # flag paths whose dst peer's plane-port is down
+                p["port_down"] = p.get("plane") in pports.get(p.get("peer"), ())
             return self._send_json({"src": src, "decap_sid": decap_sid_for(fab, src),
                                     "underlays": underlays_for(fab, src),
                                     "bypass": sorted(bn), "bypass_planes": sorted(bp),
-                                    "paths": paths})
+                                    "peer_ports": pports, "paths": paths})
         if path == "/api/mesh":
             return self._send_json(mesh_view(self._fab()))
         if path == "/api/collectives":
@@ -731,6 +775,15 @@ class Handler(SimpleHTTPRequestHandler):
             n = len(gpu_hosts(self._fab()))
             return self._send_json({"config": cfg, "map": cmap,
                                     "stats": collectives_stats(cmap, n) if cmap else None})
+        if path == "/api/ports":
+            # the Clustermapper NIC-port map: per host, per-plane up/down + age
+            now = time.time()
+            out = {}
+            for h, rec in _ports_now().items():
+                out[h] = {"ports": rec.get("ports") or {},
+                          "down": down_planes(h, now),
+                          "age_s": round(now - (rec.get("ts") or now), 1)}
+            return self._send_json({"ports": out})
         if path == "/api/nodes":
             return self._send_json({"nodes": nodes_index(self._fab())})
         if path == "/api/config":
@@ -795,6 +848,8 @@ class Handler(SimpleHTTPRequestHandler):
                     _REPORTS[host] = {"ts": body.get("ts"), "received_at": time.time(),
                                       "peers": body.get("peers") or [],
                                       "weigher": body.get("weigher") or {}}
+                    if isinstance(body.get("ports"), dict):
+                        _PORTS[host] = {"ports": body["ports"], "ts": time.time()}
             return self._send_json({"ok": True})
         if path == "/api/bypass":
             # Maintenance drain: mark node(s) or whole plane(s) so NICs steer

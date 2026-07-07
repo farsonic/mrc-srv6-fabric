@@ -645,14 +645,23 @@ function renderFormula(name){
       const bypN=new Set(d.bypass||[]), bypP=new Set((d.bypass_planes||[]).map(Number));
       const isDr=e=>bypN.has(e.spine)||bypP.has(Number(e.plane));
       const nDr=der.reduce((a,b)=>a+(b.active_evs||[]).filter(isDr).length,0);
+      // peer NIC-port denylist (Clustermapper map): a carrier is port-down if the
+      // dst peer's plane-port is down — pre-denied without waiting for probe loss.
+      const pp=d.peer_ports||{};
+      const isPD=(peer,e)=>(pp[peer]||[]).includes(Number(e.plane));
+      const nPD=der.reduce((a,b)=>a+(b.active_evs||[]).filter(e=>isPD(b.flow.dst,e)).length,0);
+      const downPeers=Object.keys(pp).filter(p=>(pp[p]||[]).length);
       const rows=[
         ["tenant",d.tenant],["decap SID",d.decap_sid||'—'],["gateway",d.gateway||'—'],
         ["block",f.block],
         ["this GPU",`gpu${sg} → home-leaf ${homeLeaf}, local ${local}`],
         ["shape",`${f.planes} plane · ${f.spines} spine · ${K} GPU/leaf · ${f.gpus} GPU`],
         ["peers",f.peers?('['+f.peers.map(p=>'gpu'+p).join(', ')+']'):('full mesh ('+(f.gpus-1)+')')],
-        ["derives",`${nEV} carriers → ${der.length} peer(s)`+(nDr?` · <span style="color:#f0a060">${nDr} drained</span>`:'')],
+        ["derives",`${nEV} carriers → ${der.length} peer(s)`+(nDr?` · <span style="color:#f0a060">${nDr} drained</span>`:'')+
+          (nPD?` · <span style="color:#ff9a9a">${nPD} port-down</span>`:'')],
       ];
+      if(downPeers.length) rows.push(["peer ports ↓",
+        downPeers.map(p=>`${p}: plane ${pp[p].join(',')}`).join(' · ')]);
       let html='<div class="kv">'+rows.map(([k,v])=>
         `<div class="k">${k}</div><div class="v" style="font-family:monospace;word-break:break-all">${v}</div>`).join("")+'</div>';
       if(der.length){
@@ -660,9 +669,11 @@ function renderFormula(name){
           '<table style="width:100%;font-size:11px;border-collapse:collapse">';
         let shown=0;
         for(const b of der){ for(const e of (b.active_evs||[])){ if(shown++>=6) break;
-          const dr=isDr(e);
-          html+=`<tr style="${dr?'opacity:.55':''}"><td style="color:#8fb0d0;padding-right:6px">${b.flow.dst}</td>`+
-            `<td style="color:var(--dim);padding-right:6px">${e.path_id}${dr?' <span class="draintag">drained</span>':''}</td>`+
+          const dr=isDr(e), pd=isPD(b.flow.dst,e);
+          const tag=pd?' <span class="draintag" style="background:#3a1010;color:#ff9a9a">port↓</span>'
+                      :(dr?' <span class="draintag">drained</span>':'');
+          html+=`<tr style="${(dr||pd)?'opacity:.55':''}"><td style="color:#8fb0d0;padding-right:6px">${b.flow.dst}</td>`+
+            `<td style="color:var(--dim);padding-right:6px">${e.path_id}${tag}</td>`+
             `<td style="color:#8fd0b0;font-family:monospace">${e.usid}</td></tr>`; } if(shown>=6) break; }
         html+='</table>'+(nEV>6?`<div style="color:var(--dim);font-size:11px;margin-top:3px">… ${nEV-6} more in the probe table</div>`:'');
         if(nDr) html+='<div style="color:var(--dim);font-size:10.5px;margin-top:4px">drained = a bypassed spine/plane; '+
@@ -1019,6 +1030,17 @@ function collCell(a,b){
   return c ? `<td><span class="colltag k${c.pat||'grp'}" title="collective ${c.name} · ${c.pat||''}">${c.name}</span></td>`
            : `<td><span class="miss">·</span></td>`;
 }
+// paths whose dst peer's plane-port is down (Clustermapper denylist), from MESH
+let PORTDOWN={};
+function portDownIndex(){
+  const P={}; const s=(MESH&&MESH.paths)?MESH.paths:null;
+  if(s) s.forEach(p=>{ if(p.port_down){ P[p.src+'|'+p.dst+'|'+p.path_id]=true; } });
+  return P;
+}
+function portTag(rec){
+  return PORTDOWN[rec.src+'|'+rec.dst+'|'+rec.path_id]
+    ? ' <span class="draintag" style="background:#3a1010;color:#ff9a9a" title="dst NIC port down — pre-denied">port↓</span>' : '';
+}
 
 function rebuildPaths(){
   const base=(DATA&&DATA.paths)||[];
@@ -1036,6 +1058,7 @@ function rebuildPaths(){
   tbl.style.display=''; empty.style.display='none';
   const H=healthIndex();
   PATHCOLL=collIndex();
+  PORTDOWN=portDownIndex();
   const sym=document.getElementById('symToggle').checked;
   sym?renderSym(base,H,thead,tb):renderDirected(base,H,thead,tb);
   updateMeshStat();
@@ -1052,9 +1075,10 @@ function worstJit(a,b){ const j=[a&&a.jitter,b&&b.jitter].filter(v=>v!=null); re
 function maxReord(a,b){ return Math.max((a&&a.reorder)||0,(b&&b.reorder)||0); }
 function viaCell(rec){
   const dr=rec.drained?' <span class="draintag">drained</span>':'';
+  const pd=portTag(rec);
   return rec.spine
-    ? `<b>${shortName(rec.spine)}</b>${dr}<br><span class="carrier">${rec.usid}</span>`
-    : `<span class="st-none">direct</span>${dr}<br><span class="carrier">${rec.usid}</span>`;
+    ? `<b>${shortName(rec.spine)}</b>${dr}${pd}<br><span class="carrier">${rec.usid}</span>`
+    : `<span class="st-none">direct</span>${dr}${pd}<br><span class="carrier">${rec.usid}</span>`;
 }
 function statusCell(s){ return `<span class="dot ${s.cls}"></span><span class="st-${s.cls}">${s.label}</span>`; }
 
