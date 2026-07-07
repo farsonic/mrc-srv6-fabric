@@ -33,7 +33,7 @@
   header .spacer{flex:1}
   .stat{color:var(--dim);font-size:12px}
   .stat b{color:var(--ink);font-weight:600}
-  .wrap{display:flex;height:calc(100vh - 53px)}
+  .wrap{display:flex}
   .stage{flex:1;overflow:auto;padding:26px}
   svg{display:block;margin:0 auto}
   /* nodes */
@@ -57,7 +57,8 @@
   .node,.edge{transition:opacity .15s}
   /* side panel */
   aside{
-    width:320px;border-left:1px solid var(--rule);background:var(--panel);
+    width:320px;flex:0 0 auto;min-width:200px;max-width:70vw;
+    border-left:1px solid var(--rule);background:var(--panel);
     padding:18px 18px 28px;overflow:auto
   }
   aside h2{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin:0 0 12px}
@@ -75,6 +76,7 @@
   .links-list{margin-top:6px;font-size:11.5px;color:var(--dim)}
   .links-list div{padding:3px 0;border-top:1px solid var(--rule)}
   .links-list b{color:var(--ink);font-weight:600}
+  .links-list .lip{color:#bcd0e4;font-size:10.5px}
   /* node actions + config viewer + maintenance */
   .panel-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}
   .btn{background:#16212c;color:var(--ink);border:1px solid var(--rule);border-radius:6px;
@@ -110,8 +112,8 @@
   .err{color:#ff8e8e;font-size:12px;padding:20px}
   /* ---- layout: topology on top, paths table beneath ---- */
   body{display:flex;flex-direction:column;overflow:hidden}
-  .wrap{flex:1 1 56%;min-height:0}
-  .paths{flex:0 0 44%;min-height:0;display:flex;flex-direction:column;
+  .wrap{flex:1 1 auto;min-height:120px}
+  .paths{flex:0 0 44%;min-height:80px;display:flex;flex-direction:column;
          border-top:1px solid var(--rule);background:#0a0f15}
   .paths-head{display:flex;align-items:baseline;gap:14px;padding:9px 20px;
               border-bottom:1px solid var(--rule)}
@@ -174,6 +176,27 @@
   pre.runout{flex:1;margin:0;overflow:auto;background:#070c11;padding:12px 14px;
              font-size:11.5px;line-height:1.5;color:#cfe0f0;white-space:pre-wrap}
   .conn{font-size:11px;color:var(--dim)} .conn.ok{color:var(--link-hot)} .conn.err{color:#ff7a7a}
+  /* resize handles */
+  .wrap{position:relative}
+  .vdrag{flex:0 0 6px;cursor:col-resize;background:var(--rule);opacity:.5}
+  .vdrag:hover,.vdrag.drag{background:var(--accent);opacity:1}
+  .hdrag{flex:0 0 6px;cursor:row-resize;background:var(--rule);opacity:.5}
+  .hdrag:hover,.hdrag.drag{background:var(--accent);opacity:1}
+  body.resizing{cursor:col-resize;user-select:none}
+  body.resizing *{pointer-events:none}
+  /* hover link-detail: interfaces + IPv6 on each link, floats over topology */
+  .linkdetail{position:absolute;left:14px;bottom:14px;max-width:min(72%,780px);max-height:44%;
+    overflow:auto;background:rgba(9,15,21,.97);border:1px solid var(--rule);border-radius:8px;
+    box-shadow:0 12px 34px rgba(0,0,0,.5);padding:8px 10px;display:none;z-index:6}
+  .linkdetail.show{display:block}
+  .linkdetail .ld-title{font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--dim);margin:0 0 6px 2px}
+  .linkdetail table{border-collapse:collapse;font-size:11px;width:100%}
+  .linkdetail th{color:var(--dim);font-weight:600;text-align:left;padding:2px 9px;white-space:nowrap}
+  .linkdetail td{padding:2px 9px;white-space:nowrap}
+  .linkdetail td.if{color:var(--leaf)} .linkdetail td.ip{color:#bcd0e4;font-variant-numeric:tabular-nums}
+  .linkdetail td.nd b{color:var(--ink)} .linkdetail .arrow{color:var(--dim);text-align:center}
+  .linkdetail tr.hop td{border-top:1px solid #14202b}
 </style>
 <link rel="stylesheet" href="/gui/vendor/xterm.css">
 <script src="/gui/vendor/xterm.js"></script>
@@ -196,14 +219,16 @@
   </div>
 </header>
 
-<div class="wrap">
+<div class="wrap" id="wrap">
   <div class="stage" id="stage">
     <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
   </div>
-  <aside>
+  <div class="linkdetail" id="linkDetail"></div>
+  <div class="vdrag" id="vdrag" title="drag to resize the inspector"></div>
+  <aside id="aside">
     <h2>Inspector</h2>
     <div id="panel" class="empty">
-      Hover a node to highlight its links.<br>Click to pin its details here.
+      Hover a node or a path to see its links (interfaces + IPv6).<br>Click to pin its details here.
       <div class="legend">
         <span><i style="background:#f0a830"></i>spine</span>
         <span><i style="background:#3fb6d3"></i>leaf</span>
@@ -212,8 +237,9 @@
     </div>
   </aside>
 </div>
+<div class="hdrag" id="hdrag" title="drag to resize the paths panel"></div>
 
-<section class="paths">
+<section class="paths" id="pathsSection">
   <div class="paths-head">
     <h2>Paths — <b>test-probe</b> health</h2>
     <span class="meshstat" id="meshStat">—</span>
@@ -385,8 +411,9 @@ function render(data){
       if(nd.loopback)
         g.appendChild(el("text",{x:p.x,y:p.y+9,class:"sub"},loStr(nd.loopback)));
     }
-    g.addEventListener("mouseenter",()=>highlight(name,edges));
-    g.addEventListener("mouseleave",()=>{ if(!pinned) clearHi(edges); });
+    g.addEventListener("mouseenter",()=>{ highlight(name,edges);
+      showLinkDetail(`links · ${name}`, nodeLinks(name)); });
+    g.addEventListener("mouseleave",()=>{ if(!pinned) clearHi(edges); scheduleHideLD(); });
     g.addEventListener("click",()=>{ pinned=name; showInfo(name,nodes); highlight(name,edges); });
     nodeLayer.appendChild(g);
     byName[name]=g;
@@ -448,7 +475,9 @@ function showInfo(name,nodes){
     .map(l=>{
       const me=l.a.split(":")[0]===name?l:{a:l.b,b:l.a};
       const myIf=me.a.split(":")[1]||"", peer=me.b.split(":")[0], peerIf=me.b.split(":")[1]||"";
-      return `<div><b>${myIf}</b> → ${peer} <span style="color:var(--dim)">${peerIf}</span></div>`;
+      const myAddr=ifAddr(name,myIf), peerAddr=ifAddr(peer,peerIf);
+      return `<div><b>${myIf}</b> <span class="lip">${myAddr||''}</span> → `+
+             `${peer} <span style="color:var(--dim)">${peerIf}</span> <span class="lip">${peerAddr||''}</span></div>`;
     }).join("");
   const kv=[];
   kv.push(["role",nd.role]);
@@ -641,6 +670,54 @@ function pathHops(rec){
   const seq=[rec.src,rec.src_leaf,rec.spine,rec.dst_leaf,rec.dst].filter(Boolean);
   return seq.filter((h,i)=>i===0||h!==seq[i-1]);   // collapse repeats (same-leaf)
 }
+
+// ---- link detail (interface names + IPv6 on each link) ----
+function ifAddr(node,ifn){
+  const nd=DATA&&DATA.nodes&&DATA.nodes[node]; if(!nd) return null;
+  const itf=(nd.interfaces||[]).find(i=>i.name===ifn);
+  return itf?itf.ipv6:null;
+}
+function findLink(x,y){   // the link between x and y, oriented x -> y
+  for(const l of ((DATA&&DATA.links)||[])){
+    const an=l.a.split(':')[0], ai=l.a.split(':')[1]||'', bn=l.b.split(':')[0], bi=l.b.split(':')[1]||'';
+    if(an===x&&bn===y) return {aNode:an,aIf:ai,bNode:bn,bIf:bi};
+    if(an===y&&bn===x) return {aNode:bn,aIf:bi,bNode:an,bIf:ai};
+  }
+  return null;
+}
+function nodeLinks(name){
+  const out=[];
+  for(const l of ((DATA&&DATA.links)||[])){
+    const an=l.a.split(':')[0], ai=l.a.split(':')[1]||'', bn=l.b.split(':')[0], bi=l.b.split(':')[1]||'';
+    if(an===name) out.push({aNode:an,aIf:ai,bNode:bn,bIf:bi});
+    else if(bn===name) out.push({aNode:bn,aIf:bi,bNode:an,bIf:ai});
+  }
+  return out;
+}
+function pathLinks(rec){
+  const hops=pathHops(rec), out=[];
+  for(let i=0;i+1<hops.length;i++){ const lk=findLink(hops[i],hops[i+1]); if(lk) out.push(lk); }
+  return out;
+}
+let ldTimer=null;
+function showLinkDetail(title,links){
+  clearTimeout(ldTimer);
+  const box=document.getElementById('linkDetail'); if(!box) return;
+  if(!links||!links.length){ box.classList.remove('show'); return; }
+  const rows=links.map(l=>
+    `<tr class="hop"><td class="nd"><b>${l.aNode}</b></td><td class="if">${l.aIf||'·'}</td>`+
+    `<td class="ip">${ifAddr(l.aNode,l.aIf)||'·'}</td><td class="arrow">↔</td>`+
+    `<td class="nd"><b>${l.bNode}</b></td><td class="if">${l.bIf||'·'}</td>`+
+    `<td class="ip">${ifAddr(l.bNode,l.bIf)||'·'}</td></tr>`).join('');
+  box.innerHTML=`<div class="ld-title">${title}</div><table>`+
+    `<tr><th>node</th><th>if</th><th>IPv6</th><th></th><th>node</th><th>if</th><th>IPv6</th></tr>`+
+    rows+`</table>`;
+  box.classList.add('show');
+}
+function scheduleHideLD(){ clearTimeout(ldTimer);
+  ldTimer=setTimeout(()=>{ const b=document.getElementById('linkDetail'); if(b) b.classList.remove('show'); },400); }
+function hideLinkDetail(){ clearTimeout(ldTimer);
+  const b=document.getElementById('linkDetail'); if(b) b.classList.remove('show'); }
 function highlightPath(rec){
   if(!EDGES) return;
   const seq=pathHops(rec), want=new Set(), nodes=new Set(seq);
@@ -757,15 +834,20 @@ function renderDirected(base,H,thead,tb){
   }
 }
 
+function pathTitle(rec){
+  return `path · ${rec.src} → ${rec.dst} · `+
+         `${rec.spine?('via '+rec.spine):'direct'} · plane ${rec.plane}`;
+}
 function wireRow(tr,rec,key){
   if(key===selPathKey) tr.classList.add('sel');
-  tr.addEventListener('mouseenter',()=>{ if(!selPathKey) highlightPath(rec); });
-  tr.addEventListener('mouseleave',()=>{ if(!selPathKey) clearPathHi(); });
+  tr.addEventListener('mouseenter',()=>{ if(!selPathKey) highlightPath(rec);
+    showLinkDetail(pathTitle(rec), pathLinks(rec)); });
+  tr.addEventListener('mouseleave',()=>{ if(!selPathKey) clearPathHi(); scheduleHideLD(); });
   tr.addEventListener('click',()=>{
-    if(selPathKey===key){ selPathKey=null; tr.classList.remove('sel'); clearPathHi(); }
+    if(selPathKey===key){ selPathKey=null; tr.classList.remove('sel'); clearPathHi(); hideLinkDetail(true); }
     else{ selPathKey=key;
       document.querySelectorAll('#pathsTable tr.sel').forEach(r=>r.classList.remove('sel'));
-      tr.classList.add('sel'); highlightPath(rec); }
+      tr.classList.add('sel'); highlightPath(rec); showLinkDetail(pathTitle(rec), pathLinks(rec)); }
   });
 }
 
@@ -834,6 +916,34 @@ document.getElementById("runBtn").addEventListener("click",runCmd);
 document.getElementById("runInput").addEventListener("keydown",e=>{ if(e.key==="Enter") runCmd(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&
   document.getElementById("consoleModal").classList.contains("open")) closeConsole(); });
+// keep the link-detail panel open while the cursor is over it (so it's readable/scrollable)
+(function(){
+  const box=document.getElementById("linkDetail");
+  box.addEventListener("mouseenter",()=>clearTimeout(ldTimer));
+  box.addEventListener("mouseleave",hideLinkDetail);
+})();
+// resizable inspector (vertical drag) + paths panel (horizontal drag)
+(function(){
+  const aside=document.getElementById("aside"), vdrag=document.getElementById("vdrag");
+  const paths=document.getElementById("pathsSection"), hdrag=document.getElementById("hdrag");
+  let mode=null,x0=0,y0=0,w0=0,h0=0;
+  function down(m,e){ mode=m; x0=e.clientX; y0=e.clientY;
+    w0=aside.getBoundingClientRect().width; h0=paths.getBoundingClientRect().height;
+    document.body.classList.add("resizing");
+    document.body.style.cursor = m==="v" ? "col-resize" : "row-resize";
+    (m==="v"?vdrag:hdrag).classList.add("drag"); e.preventDefault(); }
+  function move(e){
+    if(mode==="v"){ let w=w0-(e.clientX-x0); w=Math.max(200,Math.min(innerWidth*0.7,w)); aside.style.width=w+"px"; }
+    else if(mode==="h"){ let h=h0-(e.clientY-y0); h=Math.max(80,Math.min(innerHeight*0.8,h)); paths.style.flexBasis=h+"px"; }
+    if(mode&&window._fit) window._fit(); }
+  function up(){ if(!mode) return; mode=null; document.body.classList.remove("resizing");
+    document.body.style.cursor=""; vdrag.classList.remove("drag"); hdrag.classList.remove("drag");
+    if(window._fit) window._fit(); }
+  vdrag.addEventListener("mousedown",e=>down("v",e));
+  hdrag.addEventListener("mousedown",e=>down("h",e));
+  window.addEventListener("mousemove",move);
+  window.addEventListener("mouseup",up);
+})();
 boot();
 pollMesh();                         // live probe health (no-op when no backend)
 setInterval(pollMesh,3000);
