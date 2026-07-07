@@ -27,7 +27,7 @@ import argparse, json, os, re, signal, socket, struct, subprocess, sys, tempfile
 from urllib import request as urlreq, error as urlerr
 
 DEFAULT_IFACE   = "mrc0"
-MRC_NIC_BUILD   = "2026-06-25-g13-aggregated-routes"  # bump on every change; printed at startup
+MRC_NIC_BUILD   = "2026-07-07-g21-reply-carrier"  # bump on every change; printed at startup
 DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
 METRICS_PERIOD  = 1.0
 RECONNECT_BASE  = 1.0
@@ -292,9 +292,17 @@ class Dataplane:
         if spec_sid and spec_sid not in decap_targets:
             decap_targets.append(spec_sid)
         for tgt in decap_targets:
-            # /64 for a uSID decap SID (block:9LLL:GGGG::/64), /128 for the tenant host SID.
-            prefixlen = "64" if (spec_sid and tgt == spec_sid) else "128"
-            sidpfx = f"{tgt}/{prefixlen}"
+            # The decap SID may arrive already-suffixed: the controller serves
+            # decap_sid as "block:9LLL:GGGG::/64" while the standalone profile
+            # gives it bare. Only append a prefix length when one isn't present,
+            # else we build "…::/64/64" and every route replace fails (leaving no
+            # SID-block decap, so every cross-host probe reports 100% loss).
+            # /64 for a uSID decap SID, /128 for the tenant host SID.
+            if "/" in tgt:
+                sidpfx = tgt
+            else:
+                prefixlen = "64" if (spec_sid and tgt == spec_sid) else "128"
+                sidpfx = f"{tgt}/{prefixlen}"
             # (a) steer the SID prefix to the localsid table. Delete any stale copy first
             #     (rule adds are not idempotent; a silent dup or leftover blocks the path).
             self._ip(["-6", "rule", "del", "prio", "50", "to", sidpfx, "lookup", LOCALSID_TABLE])
@@ -474,10 +482,17 @@ class Dataplane:
             r1 = run(["ip", "-6", "route", "replace", f"{peer_dst}/128",
                       "encap", "seg6", "mode", "encap", "segs", usid,
                       "dev", self.underlay, "table", str(table)], capture=True)
+            # rule adds are not idempotent: an agent restart (no full redeploy)
+            # leaves the previous run's fwmark rule behind, so a bare `rule add`
+            # returns EEXIST and the whole per-EV install (incl. the plane carrier
+            # route) is treated as failed. Delete any stale copy first.
+            run(["ip", "-6", "rule", "del", "fwmark", str(ev),
+                 "table", str(table), "pref", "100"], capture=True)
             r2 = run(["ip", "-6", "rule", "add", "fwmark", str(ev),
                       "table", str(table), "pref", "100"], capture=True)
             if r1.returncode == 0 and r2.returncode == 0:
                 self._installed_marks.add(ev); per_ev_ok += 1
+                self.install_plane_carrier(e.get("gw"), e.get("iface"), usid, table)
             else:
                 msg = (r1.stderr or "").strip() or (r2.stderr or "").strip()
                 sys.stderr.write(f"[dp] per-EV install for ev={ev} failed: {msg}\n")
@@ -488,6 +503,60 @@ class Dataplane:
         print(f"[dp] srv6 route -> {peer_dst} via {kind} "
               f"({len(usid_stacks)} path) + {per_ev_ok} per-EV fwmark rules")
         return True, None
+
+    @staticmethod
+    def _carrier_block(usid):
+        """The /48 locator block of a uSID carrier — its first three hextets,
+        e.g. fcbb:bb00:1201:e002:9002:1:: -> fcbb:bb00:1201::/48. The encapped
+        probe's OUTER destination is this carrier; routing the block toward the
+        right plane's gateway is what steers egress to the correct underlay."""
+        if not usid:
+            return None
+        parts = usid.split(":")
+        if len(parts) < 3 or not (parts[0] and parts[1] and parts[2]):
+            return None
+        return f"{parts[0]}:{parts[1]}:{parts[2]}::/48"
+
+    def install_plane_carrier(self, gw, iface, usid, table):
+        """Dual-plane egress: pin one path's encapped probe out the underlay its
+        uSID traverses. seg6 encap `via/dev` only picks the source address — the
+        OUTER packet's egress is a fresh FIB lookup on the first segment, and it
+        retains the socket's SO_MARK, so it re-looks-up in this path's private
+        table. We install the carrier /48 THERE, via the path's plane gateway, so
+        the outer packet leaves the correct NIC (eth1 for plane 1, eth2 for
+        plane 2, ...). Per-path tables mean two paths to the same peer on
+        different planes (which share a destination block) never clash. No-op
+        when no plane gateway/iface is known (controller didn't supply underlays;
+        plane 1 is already covered by the default carrier route)."""
+        blk = self._carrier_block(usid)
+        if not (gw and iface and blk):
+            return
+        if self.dry:
+            print(f"[dry] ip -6 route replace {blk} via {gw} dev {iface} table {table}")
+            return
+        # best-effort neighbor prime on the plane iface so the first probe of the
+        # first sweep isn't lost to ND (the route add itself doesn't need it).
+        run(["ping6", "-c", "1", "-W", "1", "-I", iface, gw], capture=True)
+        r = run(["ip", "-6", "route", "replace", blk, "via", gw, "dev", iface,
+                 "table", str(table)], capture=True)
+        if r.returncode != 0:
+            sys.stderr.write(f"[dp] plane carrier {blk} via {gw} dev {iface} "
+                             f"(table {table}) failed: {r.stderr.strip()}\n")
+        # Cross-leaf transit (spine) locators are globally unique per plane, so
+        # also steer them in the MAIN table. This is what lets the RESPONDER's
+        # unmarked SRv6 reply egress the correct plane: a peer's reply route is a
+        # plain seg6 encap whose outer DA is a spine block, and without a main
+        # carrier it falls through to the default plane-1 gateway and black-holes
+        # (the forward probe is up, yet the path still reads 100% loss). GPU
+        # blocks (9xxx) are shared across planes for same-leaf peers, so we never
+        # touch MAIN for those — their same-leaf reply is delivered natively.
+        block_id = blk.split(":")[2]
+        if block_id and not block_id.startswith("9"):
+            rm = run(["ip", "-6", "route", "replace", blk, "via", gw, "dev", iface],
+                     capture=True)
+            if rm.returncode != 0:
+                sys.stderr.write(f"[dp] plane carrier {blk} via {gw} dev {iface} "
+                                 f"(main) failed: {rm.stderr.strip()}\n")
 
     def _clear_per_ev_marks(self):
         """Remove all per-EV fwmark rules + their route tables installed by
@@ -1159,7 +1228,9 @@ class MeshHealth(threading.Thread):
             return
         try:
             with urlreq.urlopen(f"{self.controller}/api/mesh-plan?src={self.host}", timeout=4) as r:
-                plan = json.loads(r.read()).get("paths", [])
+                _doc = json.loads(r.read())
+                plan = _doc.get("paths", [])
+                underlays = _doc.get("underlays") or {}
         except Exception:
             return
         # install a dedicated route table per (peer, spine) keyed by fwmark
@@ -1188,6 +1259,15 @@ class MeshHealth(threading.Thread):
                               f"{(rr.stderr or '').strip()[:120]}", file=sys.stderr)
                     run(["ip", "-6", "rule", "add", "fwmark", str(fw),
                          "table", str(fw), "pref", "90"], capture=True)
+                    # dual-plane: the SO_MARK'd probe egresses the plane its uSID
+                    # traverses. The post-encap outer packet keeps the fwmark and
+                    # re-looks-up in table <fw>, so the carrier /48 lives HERE, via
+                    # this path's plane gateway. Without it every plane-2 probe
+                    # leaves the wrong NIC and reports 100% loss.
+                    u = underlays.get(str(p.get("plane"))) if p.get("plane") is not None else None
+                    if u:
+                        self.dp.install_plane_carrier(u.get("gateway"), u.get("iface"),
+                                                      usid, fw)
                     self._plan_marks.add(fw)
                 except Exception:
                     pass
@@ -1606,6 +1686,82 @@ class FileProfileSource:
 
 
 # ---- driver ---------------------------------------------------------------
+def _pull_mesh_from_controller(controller, host, on_profile, dp=None):
+    """Controller-driven bootstrap: fetch the authoritative full mesh for this
+    host from /api/mesh-plan, group the flat path list by peer, and feed one
+    synthesized srv6 profile per peer through on_profile(). Programs every path
+    AND populates peers[] so paths/status show the whole mesh. The controller is
+    the source of truth; the NIC forwards independently after programming."""
+    from urllib import request as _urlreq
+    url = controller.rstrip("/") + "/api/mesh-plan?src=" + host
+    # mesh-bootstrap retry: the NIC may boot before the controller is up / in DNS,
+    # so retry instead of giving up after one miss (fixes the startup ordering race).
+    paths = None
+    attempts = 15
+    for _i in range(attempts):
+        try:
+            with _urlreq.urlopen(url, timeout=5) as r:
+                _plan = json.loads(r.read())
+                paths = _plan.get("paths", [])
+            break
+        except Exception as e:
+            if _i == 0 or _i == attempts - 1:
+                sys.stderr.write("[mesh-bootstrap] waiting for controller at " + str(url)
+                                 + " (attempt " + str(_i + 1) + "/" + str(attempts) + "): " + str(e) + chr(10))
+            time.sleep(2)
+    if paths is None:
+        sys.stderr.write("[mesh-bootstrap] controller unreachable after retries; running standalone" + chr(10))
+        return 0
+    # plane -> {iface, gateway} for this host's underlays, so each per-path probe
+    # can egress the underlay its uSID actually traverses (dual-plane fabric).
+    underlays = _plan.get("underlays") or {}
+    by_peer = {}
+    for p in paths:
+        dst = p.get("dst")
+        if not dst:
+            continue
+        b = by_peer.setdefault(dst, {"peer": p.get("peer"), "evs": []})
+        ev = {"usid": p.get("usid") or p.get("probe_sid"),
+              "spine": p.get("spine"),
+              "path": p.get("path_id") or (p.get("spine") or "same-leaf")}
+        fm = p.get("fwmark")
+        ev["entropy"] = int(fm) if isinstance(fm, int) else len(b["evs"]) + 1
+        # dual-plane egress: tag the EV with its plane's underlay iface + gateway
+        # so program_srv6 pins the encapped probe out the correct NIC (the outer
+        # carrier lookup, not the seg6 encap dev, decides egress).
+        pl = p.get("plane")
+        u = underlays.get(str(pl)) if pl is not None else None
+        if u:
+            ev["plane"] = pl
+            ev["gw"] = u.get("gateway")
+            ev["iface"] = u.get("iface")
+        b["evs"].append(ev)
+    for dst, b in by_peer.items():
+        prof = {"mode": "srv6",
+                "flow": {"src": host, "dst": b.get("peer"), "dst_addr": dst},
+                "active_dst": dst,
+                "active_evs": b["evs"]}
+        on_profile(prof)
+    # g16: the controller serves this host's uSID decap block; hand it to the
+    # dataplane and re-run install_decap so End.DT6 keys on the SID (the spec
+    # branch that was dormant), not the tenant address. install_decap() is
+    # idempotent (route replace + rule del/add) and — crucially — installs the
+    # End.DT6 inner lookup in the LOCAL table (255): the arriving carrier's inner
+    # DA is this GPU's own tenant address, which only resolves as a *local* route
+    # in table 255. A main-table (254) inner lookup finds just the connected /64,
+    # sends the decapped packet down the FORWARD path, and it dies in ND for the
+    # GPU's own address (every cross-host probe then reports 100% loss).
+    _dsid = _plan.get("decap_sid")
+    if _dsid and dp is not None:
+        dp.decap_sid = _dsid
+        dp.install_decap()
+        print("[mesh-bootstrap] SID decap installed via install_decap "
+              "(End.DT6, inner table local): %s" % _dsid)
+    print("[mesh-bootstrap] programmed %d peer(s) from controller %s"
+          % (len(by_peer), controller))
+    return len(by_peer)
+
+
 def cmd_run(args):
     print(f"[mrc-nic] build {MRC_NIC_BUILD} starting (pid {os.getpid()})")
     # In standalone mode, allow tenant, underlay, and gateway to come from the
@@ -1764,6 +1920,10 @@ def cmd_run(args):
             src = FileProfileSource(args.profile, on_profile, on_status, stop)
             src.run()
         else:
+            # Controller-driven bootstrap: pull the authoritative full mesh now so
+            # every path is programmed and peers[] is populated immediately.
+            _pull_mesh_from_controller(args.controller, args.host, on_profile, dp=dp)
+
             # jobs channel: a second SSE subscription that lets this host run probes
             # on demand from the Web UI test runner.
             jobrunner = JobRunner(args.controller, args.host, stop)

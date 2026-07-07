@@ -77,6 +77,24 @@ def gpu_hosts(fab):
         hosts.append({"name": name, "addr_v6": addr6, "addr_v4": None})
     return hosts
 
+def decap_sid_for(fab, src):
+    """g16: the host's own uSID decap block (what arriving carriers bear after
+    the spine shift), served to the NIC so install_decap keys End.DT6 on it.
+    Derived from the authoritative paths[] — a same-leaf usid TO this host IS
+    the bare block; otherwise take the last two hextets of any inbound usid."""
+    inbound = [p for p in (fab.get("paths") or []) if p.get("dst") == src]
+    if not inbound:
+        return None
+    for p in inbound:                       # same-leaf carrier = the bare block
+        if p.get("kind") == "same-leaf" and p.get("usid"):
+            return p["usid"].rstrip(":") + "::/64" if not p["usid"].endswith("::") else p["usid"] + "/64"
+    u = (inbound[0].get("usid") or "").rstrip(":")
+    hx = [h for h in u.split(":") if h]     # e.g. fcbb bb00 1101 e002 9002 1
+    if len(hx) >= 4:
+        return f"{hx[0]}:{hx[1]}:{hx[-2]}:{hx[-1]}::/64"
+    return None
+
+
 def plan_for(fab, src):
     """The per-path probe plan for one source host: every path whose src is this
     host, shaped for the NIC's /api/mesh-plan consumer."""
@@ -88,7 +106,25 @@ def plan_for(fab, src):
             "peer": p["dst"], "dst": p["dst_addr"],
             "spine": p.get("spine"), "path_id": p["path_id"],
             "fwmark": p["fwmark"], "probe_sid": p["usid"], "usid": p["usid"],
+            "plane": p.get("plane"),   # which underlay plane this path egresses (dual-plane)
         })
+    return out
+
+def underlays_for(fab, src):
+    """{ "<plane>": {"iface","gateway"} } for the source host's underlay NICs.
+
+    In a multi-plane fabric each GPU homes into every plane (eth1=plane1,
+    eth2=plane2, ...). A path's encapped probe must egress the plane its uSID
+    traverses, so the NIC needs plane -> (iface, gateway) to install a per-path
+    carrier route on the right underlay. Derived from fabric_vars nodes[src]."""
+    node = (fab.get("nodes") or {}).get(src) or {}
+    out = {}
+    for itf in node.get("interfaces", []):
+        pl = itf.get("plane")
+        if pl is None or itf.get("role") != "host":
+            continue
+        if itf.get("name") and itf.get("gateway"):
+            out[str(pl)] = {"iface": itf["name"], "gateway": itf["gateway"]}
     return out
 
 # ---- health join -----------------------------------------------------------
@@ -182,7 +218,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json({"hosts": gpu_hosts(self._fab())})
         if path == "/api/mesh-plan":
             src = (parse_qs(u.query).get("src") or [""])[0]
-            return self._send_json({"src": src, "paths": plan_for(self._fab(), src)})
+            fab = self._fab()
+            return self._send_json({"src": src, "decap_sid": decap_sid_for(fab, src),
+                                    "underlays": underlays_for(fab, src),
+                                    "paths": plan_for(fab, src)})
         if path == "/api/mesh":
             return self._send_json(mesh_view(self._fab()))
         if path == "/api/reports":           # debug: raw posted health

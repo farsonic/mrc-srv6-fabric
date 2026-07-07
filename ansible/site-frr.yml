@@ -250,6 +250,7 @@
       ansible.builtin.command:
         cmd: >
           docker run -d --name {{ gui_name }}
+          --network {{ fabric_name }}-mgmt
           --restart unless-stopped
           -p {{ gui_port }}:8080
           -v {{ proj | realpath }}:/srv:ro
@@ -276,6 +277,6 @@
           - "Topology GUI:  http://{{ ansible_default_ipv4.address | default('<this-host-ip>') }}:{{ gui_port }}/gui/topology.html"
           - "It auto-loads fabric_vars.json and polls /api/mesh for live test-probe health."
           - "Paths table is populated only when the NICs attach to this backend:"
-          - "  redeploy with -e mesh_controller_url=http://<this-host-ip>:{{ gui_port }}"
+          - "  NICs attach at http://mrc-gui:{{ gui_port }} (on the mgmt network)"
           - "  (currently: {{ mesh_controller_url | default('') | ternary(mesh_controller_url, 'unset — NICs run standalone, table shows the path inventory only') }})"
       when: do_gui | bool
