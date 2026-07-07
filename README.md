@@ -216,15 +216,27 @@ docker exec clab-srv6lab-gpu1 /usr/local/bin/mrc-nic paths --decode
 Breaks every carrier into its component uSIDs and labels what each one does and
 which node processes it (spine locator / End.X shift / GPU decap block).
 
-### Live path health
+### Live path health (mrc-probe)
 
-Every NIC runs an always-on per-path test probe. It uses **TWAMP** when the
-`mrc-twamp` reflector is reachable on each peer (the deploy starts one on every
-GPU), which adds **one-way** delay (`ob` = outbound over the pinned SRv6 path,
-`ib` = return) on top of round-trip; if the reflector is absent it falls back to
-a built-in SO_MARK-pinned ICMPv6 probe (round-trip only). `status` shows the
-controller link, the programmed EVs, the kernel route, and a full `MESH HEALTH`
-block, with any [drained](#maintenance-drain) path clearly marked:
+Every NIC runs an always-on **`mrc-probe`** per path. Following the MRC
+whitepaper, each burst is **source-routed** — `SO_MARK`-pinned to one SRv6 uSID
+carrier, the exact path the data plane takes — so there is "no ambiguity about
+which path a probe packet takes" (ground truth about the forwarding plane).
+Against a small reflector on every peer (the deploy starts one) it measures the
+per-path signals MRC reacts to:
+
+| Signal | Field(s) | MRC use |
+|--------|----------|---------|
+| loss / liveness | `loss_pct`, up/down | bad path → EV removed; probes resurrect it |
+| latency | `rtt_min/avg/max` | tail-latency / path cost |
+| one-way delay | `ob` (outbound, the pinned path), `ib` (return) | localize direction |
+| jitter | `rtt_mdev` | path quality |
+| out-of-order | `reorder` | MRC expects & tolerates reordering |
+
+If the reflector is absent it falls back to a built-in `SO_MARK`-pinned ICMPv6
+probe (round-trip only). `status` shows the controller link, programmed EVs,
+kernel route, and a full `MESH HEALTH` block, with any
+[drained](#maintenance-drain) path marked:
 
 ```bash
 docker exec clab-srv6lab-gpu1 /usr/local/bin/mrc-nic status
@@ -232,11 +244,18 @@ docker exec clab-srv6lab-gpu1 /usr/local/bin/mrc-nic status
 
 ```
   MESH HEALTH  10/10 paths up · swept now
-    [✓] gpu2                     loss   0.0%   rtt 0.21 · 1-way 0.12/0.10 ms
-    [✓] gpu3     via spine1-p1   loss   0.0%   rtt 0.23 · 1-way 0.12/0.11 ms
-    [~] gpu4     via spine1-p1   DRAINED  loss   0.0%   rtt 0.25 · 1-way 0.13/0.12 ms
+    [✓] gpu2                     loss   0.0%   rtt 0.21 · jit 0.05 · 1-way 0.12/0.10 ms
+    [✓] gpu3     via spine1-p1   loss   0.0%   rtt 0.23 · jit 0.06 · 1-way 0.12/0.11 ms
+    [~] gpu4     via spine1-p1   DRAINED  loss   0.0%   rtt 0.25 · jit 0.06 · 1-way 0.13/0.12 ms
     ...
 ```
+
+The GUI paths table surfaces the same columns (rtt / loss / one-way / jitter /
+reorder). Loss feeds the NIC's adaptive-spray and auto-deny/restore loop — the
+software analogue of MRC removing and resurrecting EVs. *Not* reproduced here
+are the transport/silicon parts of MRC (ECN-based congestion control, SACK/NACK
+loss recovery, per-packet spray, port-state bitmaps) and full Clustermapper-style
+switch self-probing for T0/T1 fault localization.
 
 ### See the dumb core
 
@@ -404,9 +423,10 @@ address_plan.json      addressing scheme (block, locators, GPU uSID layout)
 nic/
   mrc-nic              virtual NIC: SRv6 source, per-path carriers, End.DT6 decap,
                        always-on test probe + weighted spray + maintenance drain
-  mrc-twamp            TWAMP-light reflector + probe (per-path one-way delay)
+  mrc-probe            per-path health probe: source-routed reflector + client
+                       (loss, RTT, one-way delay, jitter, out-of-order)
   mrc-meshprobe        standalone full-mesh probe helper
-  mrc-probe            traffic generator (per-path probing)
+  mrc-traffic          MRC-aware synthetic UDP traffic generator (+ mrc-sink)
   mrc-sink             traffic sink
 gui/
   server.py            GUI backend: probe-health aggregate + config / bypass /

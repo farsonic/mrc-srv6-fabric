@@ -832,9 +832,15 @@ function rebuildPaths(){
   updateMeshStat();
 }
 
-function hCell(h){   // forward/return metric cells: rtt + loss
-  return `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td><td class="num">${fmtPct(h&&h.loss_pct)}</td>`;
+function hCell(h){   // forward/return metric cells: rtt + loss + one-way (outbound)
+  return `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td><td class="num">${fmtPct(h&&h.loss_pct)}</td>`+
+         `<td class="num" title="outbound one-way delay — the pinned SRv6 path">${fmtMs(h&&h.ob_avg)}</td>`;
 }
+function reordCell(n){   // out-of-order arrivals (0 shown dim, >0 amber)
+  return (n)?`<td class="num st-deg">${n}</td>`:`<td class="num"><span class="miss">·</span></td>`;
+}
+function worstJit(a,b){ const j=[a&&a.jitter,b&&b.jitter].filter(v=>v!=null); return j.length?Math.max(...j):null; }
+function maxReord(a,b){ return Math.max((a&&a.reorder)||0,(b&&b.reorder)||0); }
 function viaCell(rec){
   const dr=rec.drained?' <span class="draintag">drained</span>':'';
   return rec.spine
@@ -846,11 +852,12 @@ function statusCell(s){ return `<span class="dot ${s.cls}"></span><span class="s
 function renderSym(base,H,thead,tb){
   thead.innerHTML=
     '<tr><th>path</th><th>plane</th><th>via / carrier uSID</th>'+
-    '<th class="grp" colspan="2">→ forward</th><th class="grp" colspan="2">← return</th>'+
-    '<th>status</th></tr>'+
+    '<th class="grp" colspan="3">→ forward</th><th class="grp" colspan="3">← return</th>'+
+    '<th class="grp" colspan="2">jitter · reorder</th><th>status</th></tr>'+
     '<tr><th></th><th></th><th></th>'+
-    '<th class="num dir">rtt ms</th><th class="num">loss%</th>'+
-    '<th class="num dir">rtt ms</th><th class="num">loss%</th><th></th></tr>';
+    '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
+    '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
+    '<th class="num dir">jit ms</th><th class="num">reord</th><th></th></tr>';
   // group by unordered pair + plane + carrier(path_id)
   const groups=new Map();
   base.forEach(rec=>{
@@ -874,6 +881,7 @@ function renderSym(base,H,thead,tb){
       `<td><span class="pl">${g.plane}</span></td>`+
       `<td>${viaCell(rec)}</td>`+
       hCell(hf)+hCell(hr)+
+      `<td class="num dir">${fmtMs(worstJit(hf,hr))}</td>`+reordCell(maxReord(hf,hr))+
       `<td>${statusCell(s)}</td>`;
     wireRow(tr,rec,g.key);
     tb.appendChild(tr);
@@ -884,6 +892,8 @@ function renderDirected(base,H,thead,tb){
   thead.innerHTML=
     '<tr><th>flow</th><th>plane</th><th>via / carrier uSID</th>'+
     '<th class="num dir">rtt ms</th><th class="num">loss%</th><th class="num">jitter</th>'+
+    '<th class="num dir" title="one-way delay: outbound (pinned path) / inbound (return)">1-way ob/ib</th>'+
+    '<th class="num">reord</th>'+
     '<th class="num">age</th><th>status</th></tr>';
   const rows=[...base].sort((x,y)=>
     natCmp(x.src,y.src)||natCmp(x.dst,y.dst)||x.plane-y.plane||natCmp(x.path_id,y.path_id));
@@ -898,6 +908,8 @@ function renderDirected(base,H,thead,tb){
       `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td>`+
       `<td class="num">${fmtPct(h&&h.loss_pct)}</td>`+
       `<td class="num">${fmtMs(h&&h.jitter)}</td>`+
+      `<td class="num dir">${fmtMs(h&&h.ob_avg)}/${fmtMs(h&&h.ib_avg)}</td>`+
+      reordCell(h&&h.reorder)+
       `<td class="num">${(h&&h.age_s!=null)?h.age_s+'s':'<span class=miss>·</span>'}</td>`+
       `<td>${statusCell(s)}</td>`;
     wireRow(tr,rec,rec.src+'>'+rec.dst+'|'+rec.path_id);

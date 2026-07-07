@@ -454,6 +454,7 @@ def mesh_view(fab):
                 "rtt_max": s.get("rtt_max"),
                 "jitter": s.get("rtt_mdev") if s.get("rtt_mdev") is not None else s.get("jitter"),
                 "ob_avg": s.get("ob_avg"), "ib_avg": s.get("ib_avg"),
+                "reorder": s.get("reorder"), "reorder_pct": s.get("reorder_pct"),
                 "encap_ok": bool(s.get("encap_ok", True)),
                 "denied": denied.get(key, False),
                 "err": s.get("err"),

@@ -751,10 +751,10 @@ def main():
             _sh.copyfile(nic_src, os.path.join(nic_dir, "mrc-nic"))
             os.chmod(os.path.join(nic_dir, "mrc-nic"), 0o755)
             # stage the TWAMP reflector alongside it (same dir as the NIC source)
-            tw_src = os.path.join(os.path.dirname(nic_src), "mrc-twamp")
+            tw_src = os.path.join(os.path.dirname(nic_src), "mrc-probe")
             if os.path.isfile(tw_src):
-                _sh.copyfile(tw_src, os.path.join(nic_dir, "mrc-twamp"))
-                os.chmod(os.path.join(nic_dir, "mrc-twamp"), 0o755)
+                _sh.copyfile(tw_src, os.path.join(nic_dir, "mrc-probe"))
+                os.chmod(os.path.join(nic_dir, "mrc-probe"), 0o755)
         else:
             print("WARNING: mrc-nic binary not found to stage into ./mrc-nic/ — "
                   "place it there before deploy (bind-mount expects mrc-nic/mrc-nic).",
@@ -814,7 +814,7 @@ def main():
             # Instead we mount to /opt and copy to a real file at startup, so the
             # running process always loads the latest staged binary.
             out.append("        - mrc-nic/mrc-nic:/opt/mrc-nic.bin:ro")
-            out.append("        - mrc-nic/mrc-twamp:/opt/mrc-twamp.bin:ro")
+            out.append("        - mrc-nic/mrc-probe:/opt/mrc-probe.bin:ro")
             out.append("        - mrc-nic/hosts.fabric:/etc/hosts.fabric:ro")
             out.append("      exec:")
             # resolve fabric node names to their IPv6 (SRv6 underlay) instead of the
@@ -860,9 +860,9 @@ def main():
             # probe-mode check finds it and uses TWAMP (two-way + one-way delay per
             # SRv6 path) instead of the built-in ICMPv6 fallback. Needs python3 (just
             # installed above); listens on [::]:20001, unprivileged.
-            out.append("        - sh -c 'install -m 0755 /opt/mrc-twamp.bin /usr/local/bin/mrc-twamp'")
-            out.append("        - sh -c 'nohup /usr/local/bin/mrc-twamp responder "
-                       ">/var/log/mrc-twamp.log 2>&1 &'")
+            out.append("        - sh -c 'install -m 0755 /opt/mrc-probe.bin /usr/local/bin/mrc-probe'")
+            out.append("        - sh -c 'nohup /usr/local/bin/mrc-probe responder "
+                       ">/var/log/mrc-probe.log 2>&1 &'")
             # start the standalone virtual NIC: reads profile.json, programs per-EV pinned encap
             # + its own End.DT6 decap. tenant + gateway passed explicitly (deterministic).
             # When --controller is set, also attach to the backend (--controller/--host) so the

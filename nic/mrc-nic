@@ -27,7 +27,7 @@ import argparse, json, os, re, signal, socket, struct, subprocess, sys, tempfile
 from urllib import request as urlreq, error as urlerr
 
 DEFAULT_IFACE   = "mrc0"
-MRC_NIC_BUILD   = "2026-07-07-g31-twamp-oneway"  # bump on every change; printed at startup
+MRC_NIC_BUILD   = "2026-07-07-g32-mrc-probe"  # bump on every change; printed at startup
 DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
 METRICS_PERIOD  = 1.0
 RECONNECT_BASE  = 1.0
@@ -802,13 +802,13 @@ MESH_INTERVAL = float(os.environ.get("MRC_MESH_INTERVAL", "0.2")) # spacing betw
 
 # TWAMP mesh-health (replaces the ICMPv6 echo probe). A ~2s continuous burst
 # per path per sweep: 20 packets at 100ms = 2.0s window, well inside MESH_PERIOD.
-TWAMP_BIN      = os.environ.get("MRC_TWAMP_BIN", "/usr/local/bin/mrc-twamp")
-TWAMP_PORT     = int(os.environ.get("MRC_TWAMP_PORT", "20001"))   # responder port
-TWAMP_COUNT    = int(os.environ.get("MRC_TWAMP_COUNT", "20"))     # packets per burst
-TWAMP_INTERVAL = float(os.environ.get("MRC_TWAMP_INTERVAL", "0.1"))  # s between packets
-TWAMP_TIMEOUT  = float(os.environ.get("MRC_TWAMP_TIMEOUT", "6.0"))   # hard cap per burst
+PROBE_BIN      = os.environ.get("MRC_PROBE_BIN", "/usr/local/bin/mrc-probe")
+PROBE_PORT     = int(os.environ.get("MRC_PROBE_PORT", "20001"))   # responder port
+PROBE_COUNT    = int(os.environ.get("MRC_PROBE_COUNT", "20"))     # packets per burst
+PROBE_INTERVAL = float(os.environ.get("MRC_PROBE_INTERVAL", "0.1"))  # s between packets
+PROBE_TIMEOUT  = float(os.environ.get("MRC_PROBE_TIMEOUT", "6.0"))   # hard cap per burst
 
-def _twamp_available():
+def _probe_helper_ok():
     """Is the mrc-twamp binary actually present? Resolved ONCE and cached. TWAMP
     gives two-way + one-way delay, but it needs the responder binary deployed on
     every peer. When it's absent (it isn't shipped in the base image), the mesh
@@ -816,14 +816,14 @@ def _twamp_available():
     fwmark route exactly like the TWAMP probe — so per-path RTT/jitter/loss still
     works with nothing but python3 + CAP_NET_RAW (which the agent already has)."""
     import shutil
-    if getattr(_twamp_available, "_cached", None) is None:
-        path = TWAMP_BIN if os.path.isabs(TWAMP_BIN) else (shutil.which(TWAMP_BIN) or "")
-        _twamp_available._cached = bool(path) and os.path.exists(path) and os.access(path, os.X_OK)
-        if not _twamp_available._cached:
-            print(f"[mesh] {TWAMP_BIN} not found — per-path probe uses built-in raw ICMPv6 "
-                  f"(SO_MARK-pinned). Set MRC_TWAMP_BIN to enable TWAMP one-way delay.",
+    if getattr(_probe_helper_ok, "_cached", None) is None:
+        path = PROBE_BIN if os.path.isabs(PROBE_BIN) else (shutil.which(PROBE_BIN) or "")
+        _probe_helper_ok._cached = bool(path) and os.path.exists(path) and os.access(path, os.X_OK)
+        if not _probe_helper_ok._cached:
+            print(f"[mesh] {PROBE_BIN} not found — per-path probe uses built-in raw ICMPv6 "
+                  f"(SO_MARK-pinned). Deploy mrc-probe (responder) for two-way + one-way delay.",
                   file=sys.stderr)
-    return _twamp_available._cached
+    return _probe_helper_ok._cached
 
 # --- adaptive weighted spray (SRv6 only) -----------------------------------
 # The agent senses per-path latency via the per-path TWAMP sweep and shifts the
@@ -1109,8 +1109,10 @@ class MeshHealth(threading.Thread):
                 "rtt_avg": s.get("rtt_avg"),
                 "rtt_max": s.get("rtt_max"),
                 "jitter":  s.get("rtt_mdev"),    # RFC1889 jitter (mdev)
-                "ob_avg":  s.get("ob_avg"),       # one-way outbound (TWAMP)
-                "ib_avg":  s.get("ib_avg"),       # one-way inbound  (TWAMP)
+                "ob_avg":  s.get("ob_avg"),       # one-way outbound (pinned path)
+                "ib_avg":  s.get("ib_avg"),       # one-way inbound  (return path)
+                "reorder": s.get("reorder"),      # out-of-order arrivals (count)
+                "reorder_pct": s.get("reorder_pct"),
                 "encap_ok": bool(s.get("encap_ok", True)),  # did seg6 route install?
                 "bad": 0, "good": 0, "denied": False,
             })
@@ -1358,27 +1360,26 @@ class MeshHealth(threading.Thread):
         ob_avg/ib_avg delay), else the built-in raw-ICMPv6 pinger. Both honour
         SO_MARK so the probe is pinned to this path's fwmark route — same carrier
         the data plane takes. Returns the common probe dict either way."""
-        if _twamp_available():
-            return MeshHealth._twamp_probe(addr, count, mark=mark)
+        if _probe_helper_ok():
+            return MeshHealth._probe_reflect(addr, count, mark=mark)
         return MeshHealth._ping6_raw(addr, count, mark=mark)
 
     @staticmethod
-    def _twamp_probe(addr, count, mark=0, interval_ms=None, timeout=None):
-        """Run one bounded IPv6 TWAMP-light burst via the mrc-twamp wrapper and
-        return the same dict shape the ICMPv6 probe used (rtt_min/avg/max,
-        rtt_mdev=jitter, loss_pct, tx/rx) so the controller/dashboard need no
-        changes. If mark>0 the burst is SO_MARK-pinned to that SRv6 path's
-        fwmark route. The far end runs `twampy responder :20001`.
-
-        TWAMP replaces the old ICMPv6 mesh probe: it measures real two-way
-        delay + RFC1889 jitter + loss per SRv6 path, not just echo RTT."""
-        ivl = TWAMP_INTERVAL if interval_ms is None else interval_ms
-        tmo = TWAMP_TIMEOUT if timeout is None else timeout
-        # bracket bare IPv6 literals; mrc-twamp appends :20001 if no port given
+    def _probe_reflect(addr, count, mark=0, interval_ms=None, timeout=None):
+        """Run one bounded reflected burst via the mrc-probe helper and return the
+        same dict shape the ICMPv6 probe used (rtt_min/avg/max, rtt_mdev=jitter,
+        loss_pct, tx/rx) plus one-way delay (ob/ib) and reordering, so the
+        controller/dashboard need no changes. If mark>0 the burst is SO_MARK-pinned
+        to that SRv6 path's fwmark route (ground truth per MRC). The far end runs
+        `mrc-probe responder :20001`. Measures real two-way + one-way delay,
+        RFC1889 jitter, loss and out-of-order per SRv6 path, not just echo RTT."""
+        ivl = PROBE_INTERVAL if interval_ms is None else interval_ms
+        tmo = PROBE_TIMEOUT if timeout is None else timeout
+        # bracket bare IPv6 literals; mrc-probe appends :20001 if no port given
         tgt = addr
         if ":" in tgt and not tgt.startswith("["):
-            tgt = f"[{tgt}]:{TWAMP_PORT}"
-        cmd = [TWAMP_BIN, "probe", tgt,
+            tgt = f"[{tgt}]:{PROBE_PORT}"
+        cmd = [PROBE_BIN, "probe", tgt,
                "--count", str(count), "--interval", str(int(ivl * 1000)),
                "--timeout", str(tmo)]
         if mark:
@@ -1394,11 +1395,12 @@ class MeshHealth(threading.Thread):
                     "rtt_min": d.get("rtt_min"), "rtt_avg": d.get("rtt_avg"),
                     "rtt_max": d.get("rtt_max"), "rtt_mdev": d.get("rtt_mdev"),
                     "ob_avg": d.get("ob_avg"), "ib_avg": d.get("ib_avg"),
+                    "reorder": d.get("reorder"), "reorder_pct": d.get("reorder_pct"),
                     "err": None if d.get("ok") else d.get("err")}
         except Exception as e:
             return {"tx": count, "rx": 0, "loss_pct": 100.0,
                     "rtt_min": None, "rtt_avg": None, "rtt_max": None,
-                    "rtt_mdev": None, "err": f"twamp: {e}"}
+                    "rtt_mdev": None, "err": f"probe: {e}"}
 
     @staticmethod
     def _ping6_raw(addr, count, timeout=1.0, mark=0):
@@ -1519,11 +1521,11 @@ class MeshHealth(threading.Thread):
     def run(self):
         # small initial stagger so all hosts don't sweep in lockstep
         self.stop.wait(0.5 + (hash(self.host) % 1000) / 1000.0)
-        # report the ACTUAL probe mode: TWAMP (two-way + one-way delay) when the
-        # mrc-twamp responder is reachable, else the built-in raw-ICMPv6 fallback.
-        _mode = "TWAMP (2-way + 1-way delay)" if _twamp_available() else "raw-ICMPv6 (2-way)"
+        # report the ACTUAL probe mode: mrc-probe reflection (two-way + one-way
+        # delay + reorder) when the responder is reachable, else the ICMPv6 fallback.
+        _mode = "mrc-probe (2-way + 1-way + reorder)" if _probe_helper_ok() else "raw-ICMPv6 (2-way)"
         print(f"[mesh] started on {self.host}: {_mode} per-path every {MESH_PERIOD}s, "
-              f"{TWAMP_COUNT} pkts/burst @ {int(TWAMP_INTERVAL*1000)}ms",
+              f"{PROBE_COUNT} pkts/burst @ {int(PROBE_INTERVAL*1000)}ms",
               file=sys.stderr)
         threading.Thread(target=self._drain_watch, daemon=True).start()
         first = True
@@ -1541,7 +1543,7 @@ class MeshHealth(threading.Thread):
                     # path between the GPUs (not one ECMP-hashed aggregate).
                     for p in self.plan:
                         if self.stop.is_set(): break
-                        r = self._probe_path(p["dst"], TWAMP_COUNT, mark=p["fwmark"])
+                        r = self._probe_path(p["dst"], PROBE_COUNT, mark=p["fwmark"])
                         samples.append({"peer": p["peer"], "addr": p["dst"],
                                         "spine": p["spine"], "path_id": p["path_id"],
                                         "encap_ok": self._encap_ok.get(p["fwmark"], True),
@@ -1550,7 +1552,7 @@ class MeshHealth(threading.Thread):
                     # no per-path plan yet: per-peer TWAMP burst (unpinned)
                     for name, addr in list(self.peers.items()):
                         if self.stop.is_set(): break
-                        r = self._probe_path(addr, TWAMP_COUNT)
+                        r = self._probe_path(addr, PROBE_COUNT)
                         samples.append({"peer": name, "addr": addr,
                                         "up": r.get("rx", 0) > 0, **r})
                 if samples:
@@ -1620,8 +1622,9 @@ class MeshHealth(threading.Thread):
                             samples=[{"peer": s["peer"], "spine": s.get("spine"),
                                       "path_id": s.get("path_id"),
                                       "up": s["up"], "loss_pct": s.get("loss_pct"),
-                                      "rtt_avg": s.get("rtt_avg"),
+                                      "rtt_avg": s.get("rtt_avg"), "jitter": s.get("rtt_mdev"),
                                       "ob_avg": s.get("ob_avg"), "ib_avg": s.get("ib_avg"),
+                                      "reorder": s.get("reorder"),
                                       "err": s.get("err")} for s in samples])
                     if first:
                         up = sum(1 for s in samples if s["up"])
@@ -2170,16 +2173,21 @@ def render_status(s):
         for sm in smx:
             tag = (" via " + sm["spine"]) if sm.get("spine") else ""
             rtt = sm.get("rtt_avg")
-            # TWAMP one-way delay (outbound = the pinned SRv6 path, inbound = return)
-            ob, ib = sm.get("ob_avg"), sm.get("ib_avg")
-            ow = f" · 1-way {ob:.2f}/{ib:.2f}" if (ob is not None and ib is not None) else ""
+            # per-path MRC signals: latency, jitter, one-way delay (ob = pinned
+            # path, ib = return), and out-of-order (reorder).
+            jit, ob, ib, ro = sm.get("jitter"), sm.get("ob_avg"), sm.get("ib_avg"), sm.get("reorder")
+            det = ""
+            if rtt is not None:
+                det = f"   rtt {rtt:.2f}"
+                if jit is not None:            det += f" · jit {jit:.2f}"
+                if ob is not None and ib is not None: det += f" · 1-way {ob:.2f}/{ib:.2f}"
+                det += " ms"
+                if ro:                          det += f" · reorder {ro}"
             if _is_drained(sm):
-                # drained for maintenance — still probed (rtt/loss shown), traffic off it
-                lines.append(f"    [~] {sm['peer']:<8}{tag:<16} DRAINED  loss {sm.get('loss_pct',0):>5.1f}%"
-                             + (f"   rtt {rtt:.2f}{ow} ms" if rtt is not None else ""))
+                # drained for maintenance — still probed (metrics shown), traffic off it
+                lines.append(f"    [~] {sm['peer']:<8}{tag:<16} DRAINED  loss {sm.get('loss_pct',0):>5.1f}%" + det)
             elif sm.get("up"):
-                lines.append(f"    [✓] {sm['peer']:<8}{tag:<16} loss {sm.get('loss_pct',0):>5.1f}%"
-                             + (f"   rtt {rtt:.2f}{ow} ms" if rtt is not None else ""))
+                lines.append(f"    [✓] {sm['peer']:<8}{tag:<16} loss {sm.get('loss_pct',0):>5.1f}%" + det)
             else:
                 why = sm.get("err") or "unreachable"
                 lines.append(f"    [✗] {sm['peer']:<8}{tag:<16} {why}")
