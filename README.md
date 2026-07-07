@@ -522,6 +522,13 @@ formula + fabric map and computes carriers, rather than storing an all-to-all
 table. `--sparse`/`--spray` compose with it to emit only a training-run's live
 peer set.
 
+**In controller mode too** (`do_gui=true`): `mrc-gui` serves each NIC the compact
+descriptor over `/api/mesh-plan` (not an enumerated path list), and the NIC
+expands its own carriers via the same `mrc_usid.expand`. So every NIC builds its
+carriers from the formula whether it's standalone or controller-driven — the
+controller→NIC wire stays O(1), and drain/planes/spines still work (the NIC
+computes each path's `drained` flag from the bypass set).
+
 ---
 
 ## Troubleshooting

@@ -1273,7 +1273,7 @@ class MeshHealth(threading.Thread):
             return
         try:
             with urlreq.urlopen(f"{self.controller}/api/mesh-plan?src={self.host}", timeout=4) as r:
-                _doc = json.loads(r.read())
+                _doc = _normalize_plan(json.loads(r.read()))
                 plan = _doc.get("paths", [])
                 underlays = _doc.get("underlays") or {}
         except Exception:
@@ -1508,7 +1508,7 @@ class MeshHealth(threading.Thread):
                 break
             try:
                 with urlreq.urlopen(url, timeout=3) as r:
-                    paths = json.loads(r.read()).get("paths", [])
+                    paths = _normalize_plan(json.loads(r.read())).get("paths", [])
             except (urlerr.URLError, socket.timeout, ValueError):
                 continue
             new = {p.get("path_id") for p in paths if p.get("drained")}
@@ -1717,6 +1717,34 @@ def _expand_fabric(doc, sparse, spray):
     return _MRC_USID.expand(doc, sparse=sparse, spray=spray)
 
 
+def _normalize_plan(doc):
+    """Controller compute-carriers path: if /api/mesh-plan sent a compact fabric
+    descriptor instead of an enumerated `paths` list, the NIC expands its OWN
+    carriers here and shapes them into the exact `paths` the mesh-plan consumers
+    expect (fwmark=entropy, drained computed from the bypass set). Non-computed
+    responses pass straight through, so nothing else changes."""
+    if not (isinstance(doc, dict) and doc.get("computed") and doc.get("fabric")):
+        return doc
+    fab = doc["fabric"]
+    blocks = _expand_fabric(doc, fab.get("sparse"), fab.get("spray"))
+    bypass = {n for n in (doc.get("bypass") or []) if n}          # drained node names
+    bplanes = set(doc.get("bypass_planes") or [])                 # drained plane ids
+    paths = []
+    for b in blocks:
+        peer, dst = b["flow"]["dst"], b["active_dst"]
+        for e in b["active_evs"]:
+            nodes = {e.get("spine"), e.get("src_leaf"), e.get("dst_leaf")}
+            drained = (e.get("plane") in bplanes) or bool(bypass & {n for n in nodes if n})
+            paths.append({"peer": peer, "dst": dst, "spine": e.get("spine"),
+                          "path_id": e.get("path_id"), "fwmark": e.get("entropy"),
+                          "probe_sid": e.get("usid"), "usid": e.get("usid"),
+                          "plane": e.get("plane"), "drained": drained})
+    return {"src": doc.get("src"), "decap_sid": doc.get("decap_sid"),
+            "underlays": doc.get("underlays") or {},
+            "bypass": doc.get("bypass") or [], "bypass_planes": doc.get("bypass_planes") or [],
+            "paths": paths}
+
+
 # ---- file profile source (standalone, no controller) ----------------------
 class FileProfileSource:
     """Standalone profile feed: reads a generator-produced profile JSON from
@@ -1822,7 +1850,7 @@ def _pull_mesh_from_controller(controller, host, on_profile, dp=None):
     for _i in range(attempts):
         try:
             with _urlreq.urlopen(url, timeout=5) as r:
-                _plan = json.loads(r.read())
+                _plan = _normalize_plan(json.loads(r.read()))
                 paths = _plan.get("paths", [])
             break
         except Exception as e:

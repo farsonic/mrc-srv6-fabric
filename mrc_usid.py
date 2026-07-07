@@ -78,6 +78,7 @@ def expand(desc, sparse=None, spray=None):
         dgn = gname(dg)
         evs = []
         for p in range(1, P + 1):
+            slf, dlf = lname(sl, p), lname(dl, p)   # plane-tagged leaf names (mesh keys)
             if dl == sl:
                 # same-leaf: no spine transit (one path per plane)
                 if spec:
@@ -85,8 +86,9 @@ def expand(desc, sparse=None, spray=None):
                     path = f"{sgn}->{dgn} same-leaf -> {dgn} decap uSID"
                 else:
                     usid = _addr(blk + [rpii(r_lf, p, dl), dt6, "0", "0", "0", "0"])
-                    path = f"{sgn}->{dgn} same-leaf {lname(dl, p)} End.DT6"
-                evs.append(dict(entropy=ev, usid=usid, plane=p, spine=None, path=path))
+                    path = f"{sgn}->{dgn} same-leaf {dlf} End.DT6"
+                evs.append(dict(entropy=ev, usid=usid, plane=p, spine=None, path=path,
+                                path_id=f"direct-{dlf}", src_leaf=slf, dst_leaf=dlf))
                 ev += 1
             else:
                 # cross-leaf: one EV per spine path (bounded by `fan`)
@@ -95,12 +97,13 @@ def expand(desc, sparse=None, spray=None):
                     if spec:
                         usid = _addr(blk + [rpii(r_sp, p, s), f"{endx + dl:x}",
                                             f"{(nib << 12) + dl:x}", f"{dloc:x}", "0", "0"])
-                        path = f"{sgn}->{dgn} via {spn} -> {lname(dl, p)} -> {dgn} decap (NIC)"
+                        path = f"{sgn}->{dgn} via {spn} -> {dlf} -> {dgn} decap (NIC)"
                     else:
                         usid = _addr(blk + [rpii(r_sp, p, s), f"{endx + dl:x}",
                                             rpii(r_lf, p, dl), dt6, "0", "0"])
-                        path = f"{sgn}->{dgn} via {spn} -> {lname(dl, p)}"
-                    evs.append(dict(entropy=ev, usid=usid, plane=p, spine=spn, path=path))
+                        path = f"{sgn}->{dgn} via {spn} -> {dlf}"
+                    evs.append(dict(entropy=ev, usid=usid, plane=p, spine=spn, path=path,
+                                    path_id=spn, src_leaf=slf, dst_leaf=dlf))
                     ev += 1
         profiles.append(dict(mode="srv6", flow=dict(src=sgn, dst=dgn),
                              active_dst=gpu_addr(dg), active_evs=evs))

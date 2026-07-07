@@ -356,6 +356,20 @@ def fabric_planes(fab):
             planes.add(pl)
     return planes
 
+def computed_descriptor(root, src):
+    """If src's on-disk profile is a COMPUTED fabric descriptor (compute-carriers
+    mode), return it — the controller hands it to the NIC to expand its own
+    carriers (mrc_usid.expand), keeping the wire O(1) instead of O(paths)."""
+    p = os.path.join(root, "mrc-nic", f"{src}.json")
+    try:
+        with open(p) as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if isinstance(doc, dict) and "fabric" in doc and "profiles" not in doc:
+        return doc
+    return None
+
 def underlays_for(fab, src):
     """{ "<plane>": {"iface","gateway"} } for the source host's underlay NICs.
 
@@ -540,6 +554,17 @@ class Handler(SimpleHTTPRequestHandler):
             src = (parse_qs(u.query).get("src") or [""])[0]
             fab = self._fab()
             bn, bp = _bypass_now()
+            desc = computed_descriptor(self.root_dir, src)
+            if desc:
+                # compute-carriers: hand over the compact descriptor; the NIC
+                # expands the carriers itself. Drain travels as the bypass set,
+                # which the NIC applies per-EV (it knows each path's plane/nodes).
+                return self._send_json({
+                    "src": src, "computed": True, "fabric": desc.get("fabric"),
+                    "tenant": desc.get("tenant"), "gateway": desc.get("gateway"),
+                    "decap_sid": desc.get("decap_sid"),
+                    "underlays": underlays_for(fab, src),
+                    "bypass": sorted(bn), "bypass_planes": sorted(bp)})
             return self._send_json({"src": src, "decap_sid": decap_sid_for(fab, src),
                                     "underlays": underlays_for(fab, src),
                                     "bypass": sorted(bn), "bypass_planes": sorted(bp),
