@@ -218,19 +218,23 @@ which node processes it (spine locator / End.X shift / GPU decap block).
 
 ### Live path health
 
-Every NIC runs an always-on per-path test probe. `status` shows the controller
-link, the programmed EVs, the kernel route, and a full `MESH HEALTH` block —
-per-path RTT / loss, with any [drained](#maintenance-drain) path clearly marked:
+Every NIC runs an always-on per-path test probe. It uses **TWAMP** when the
+`mrc-twamp` reflector is reachable on each peer (the deploy starts one on every
+GPU), which adds **one-way** delay (`ob` = outbound over the pinned SRv6 path,
+`ib` = return) on top of round-trip; if the reflector is absent it falls back to
+a built-in SO_MARK-pinned ICMPv6 probe (round-trip only). `status` shows the
+controller link, the programmed EVs, the kernel route, and a full `MESH HEALTH`
+block, with any [drained](#maintenance-drain) path clearly marked:
 
 ```bash
 docker exec clab-srv6lab-gpu1 /usr/local/bin/mrc-nic status
 ```
 
 ```
-  MESH HEALTH  8/10 paths up · 2 drained · swept now
-    [✓] gpu2                     loss   0.0%   rtt 0.07 ms
-    [~] gpu3     via spine1-p1   DRAINED  loss   0.0%   rtt 0.10 ms
-    [✓] gpu3     via spine2-p1   loss   0.0%   rtt 0.09 ms
+  MESH HEALTH  10/10 paths up · swept now
+    [✓] gpu2                     loss   0.0%   rtt 0.21 · 1-way 0.12/0.10 ms
+    [✓] gpu3     via spine1-p1   loss   0.0%   rtt 0.23 · 1-way 0.12/0.11 ms
+    [~] gpu4     via spine1-p1   DRAINED  loss   0.0%   rtt 0.25 · 1-way 0.13/0.12 ms
     ...
 ```
 
@@ -400,6 +404,7 @@ address_plan.json      addressing scheme (block, locators, GPU uSID layout)
 nic/
   mrc-nic              virtual NIC: SRv6 source, per-path carriers, End.DT6 decap,
                        always-on test probe + weighted spray + maintenance drain
+  mrc-twamp            TWAMP-light reflector + probe (per-path one-way delay)
   mrc-meshprobe        standalone full-mesh probe helper
   mrc-probe            traffic generator (per-path probing)
   mrc-sink             traffic sink
