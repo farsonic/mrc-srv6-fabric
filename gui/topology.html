@@ -174,7 +174,17 @@
                   font-size:17px;padding:7px 9px;width:100%;box-sizing:border-box;font-variant-numeric:tabular-nums}
   .collgrid input:focus{outline:none;border-color:var(--accent)}
   #collResult .grp{background:#101a24;border:1px solid var(--rule);border-radius:6px;padding:8px 11px;margin:6px 0}
-  #collResult .ktp{color:#8fd0b0}#collResult .kdp{color:#f0a830}#collResult .kpp{color:#5aa0f0}#collResult .kep{color:#c98ff0}
+  #collResult .ktp{color:#8fd0b0}#collResult .kdp{color:#f0a830}#collResult .kpp{color:#5aa0f0}#collResult .kep{color:#c98ff0}#collResult .kgrp{color:#5aa0f0}
+  .collsep{border-top:1px solid var(--rule);margin:16px 0 0;padding-top:14px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+  .chips .chip{background:#0b1219;border:1px solid var(--rule);border-radius:14px;padding:4px 12px;
+               font-size:12.5px;color:var(--dim);cursor:pointer;user-select:none}
+  .chips .chip:hover{border-color:#3a5772}
+  .chips .chip.sel{border-color:#5aa0f0;color:#bcd9ff;background:#14283a}
+  #collGroups .g{background:#101a24;border:1px solid var(--rule);border-radius:6px;padding:6px 11px;margin:5px 0;
+                 display:flex;align-items:center;gap:8px;font-size:13px}
+  #collGroups .g .rm{margin-left:auto;color:var(--dim);cursor:pointer;font-size:15px}
+  #collGroups .g .rm:hover{color:#f06b6b}
   .modal-body{flex:1;min-height:0;position:relative}
   .pane{position:absolute;inset:0;display:none;flex-direction:column}
   .pane.active{display:flex}
@@ -324,11 +334,27 @@
         <label>EP <span>expert · all-to-all</span><input type="number" id="collEP" min="1" value="1"></label>
       </div>
       <div style="margin:14px 0;display:flex;gap:10px;align-items:center">
-        <button class="btn on" id="collApply">Apply — live</button>
+        <button class="btn on" id="collApply">Apply presets — live</button>
         <button class="btn" id="collClear">Clear (full mesh)</button>
         <span id="collState" style="font-size:12px;color:var(--dim)"></span>
       </div>
-      <div id="collResult" style="font-size:13px;color:var(--ink)"></div>
+
+      <div class="collsep">
+        <div style="color:var(--dim);font-size:12px;margin-bottom:2px">
+          <b style="color:var(--ink)">Or build explicit groups.</b> Click GPUs to select, then
+          <b>+ group</b> — each group is all-to-all; GPUs in no group are isolated.
+          (e.g. select <code>gpu1</code> + <code>gpu4</code> → + group → Apply)
+        </div>
+        <div class="chips" id="collChips"></div>
+        <div style="display:flex;gap:10px;align-items:center;margin:8px 0">
+          <button class="btn" id="collAddGrp">+ group from selection</button>
+          <button class="btn on" id="collApplyGrps">Apply groups — live</button>
+          <span id="collGrpState" style="font-size:12px;color:var(--dim)"></span>
+        </div>
+        <div id="collGroups"></div>
+      </div>
+
+      <div id="collResult" style="font-size:13px;color:var(--ink);margin-top:14px"></div>
     </div>
   </div>
 </div>
@@ -1061,6 +1087,7 @@ function collState(msg,ok){ const e=document.getElementById("collState");
 function openColl(){
   const n=gpuCount();
   document.getElementById("collModal").classList.add("open");
+  collResetBuilder();
   collState(n?`${n} GPUs · tp × dp × pp must = ${n}`:"load a fabric first");
   fetch("/api/collectives",{cache:"no-store"}).then(r=>r.json()).then(d=>{
     const c=d.config||{tp:1,dp:1,pp:1,ep:1};
@@ -1099,14 +1126,54 @@ function applyColl(){
 function clearColl(){
   collState("clearing…");
   fetch("/api/collectives",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clear:true})})
-    .then(r=>r.json()).then(()=>{ collState("full mesh restored",true);
+    .then(r=>r.json()).then(()=>{ collState("full mesh restored",true); collResetBuilder();
       renderColl({}); ["TP","DP","PP","EP"].forEach(k=>document.getElementById("coll"+k).value=1); })
     .catch(()=>collState("needs the live backend",false));
 }
+// ---- explicit group builder (click GPUs -> group -> apply) ----
+let collSel=new Set(), collPending=[];
+function collGrpState(msg,ok){ const e=document.getElementById("collGrpState");
+  if(e){ e.textContent=msg; e.style.color = ok===false?"#f06b6b":(ok?"#6be0a0":"var(--dim)"); } }
+function collGpuNames(){ return Object.entries((DATA&&DATA.nodes)||{})
+  .filter(([k,n])=>n.role==="gpu").map(([k])=>k)
+  .sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})); }
+function renderChips(){
+  const box=document.getElementById("collChips"); if(!box) return;
+  const names=collGpuNames(); box.innerHTML="";
+  if(!names.length){ box.innerHTML='<span style="color:var(--dim);font-size:12px">load a fabric to pick GPUs</span>'; return; }
+  names.forEach(g=>{ const c=document.createElement("span");
+    c.className="chip"+(collSel.has(g)?" sel":""); c.textContent=g;
+    c.addEventListener("click",()=>{ collSel.has(g)?collSel.delete(g):collSel.add(g); renderChips(); });
+    box.appendChild(c); });
+}
+function renderPending(){
+  const box=document.getElementById("collGroups"); if(!box) return; box.innerHTML="";
+  collPending.forEach((grp,i)=>{ const d=document.createElement("div"); d.className="g";
+    d.innerHTML=`<b>group ${i+1}</b> <span style="color:#bcd9ff">${grp.join(" · ")}</span><span class="rm" title="remove">×</span>`;
+    d.querySelector(".rm").addEventListener("click",()=>{ collPending.splice(i,1); renderPending(); });
+    box.appendChild(d); });
+}
+function collAddGroup(){
+  if(collSel.size<1){ collGrpState("click some GPUs first",false); return; }
+  collPending.push([...collSel].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})));
+  collSel.clear(); renderChips(); renderPending();
+  collGrpState(`${collPending.length} group(s) staged — click Apply`);
+}
+function applyCollGroups(){
+  if(!collPending.length){ collGrpState("add at least one group first",false); return; }
+  collGrpState("applying…");
+  fetch("/api/collectives",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({groups:collPending})})
+    .then(r=>r.json()).then(d=>{ if(!d.ok){ collGrpState(d.error||"failed",false); return; }
+      collGrpState("applied — NICs re-pull in ~2 s",true); renderColl(d); })
+    .catch(()=>collGrpState("needs the live backend",false));
+}
+function collResetBuilder(){ collSel.clear(); collPending=[]; renderChips(); renderPending(); collGrpState(""); }
 document.getElementById("collBtn").addEventListener("click",openColl);
 document.getElementById("collClose").addEventListener("click",closeColl);
 document.getElementById("collApply").addEventListener("click",applyColl);
 document.getElementById("collClear").addEventListener("click",clearColl);
+document.getElementById("collAddGrp").addEventListener("click",collAddGroup);
+document.getElementById("collApplyGrps").addEventListener("click",applyCollGroups);
 // Edgeshark runs on the same host, port 5001 (live per-link packet capture)
 document.getElementById("edgeshark").href = location.protocol+"//"+location.hostname+":5001/";
 window.addEventListener("resize",()=>window._fit&&window._fit());
