@@ -246,7 +246,62 @@ _LOCK = threading.Lock()
 _REPORTS = {}          # host -> {"ts","received_at","peers":[...],"weigher":{...}}
 _BYPASS = set()        # node names an operator has drained for maintenance
 _BYPASS_PLANES = set() # whole planes (ints) an operator has drained for maintenance
+_COLLECTIVES = {"config": None, "map": {}}  # active parallelism partner set (see collectives())
 _STOP = threading.Event()
+
+
+def partner_map(cfg, n):
+    """Build the per-GPU collective partner set from a parallelism config.
+
+    A job of N GPUs factors as tp*dp*pp (the classic 3D), with an optional MoE
+    expert overlay `ep`. Rank layout is tp-innermost:
+        rank r  ->  tp = r % tp,  dp = (r//tp) % dp,  pp = r // (tp*dp)
+    Communication partners per collective:
+        TP  all-to-all within a tensor group   (every-layer all-reduce)
+        DP  ring across the data dimension     (gradient all-reduce)
+        PP  neighbour across pipeline stages    (activation send/recv)
+        EP  all-to-all within an expert group   (MoE dispatch/combine)
+    Returns {gpuName: [{"peer": gpuName, "kind": "tp|dp|pp|ep"}...]}."""
+    tp = max(1, int(cfg.get("tp", 1))); dp = max(1, int(cfg.get("dp", 1)))
+    pp = max(1, int(cfg.get("pp", 1))); ep = max(1, int(cfg.get("ep", 1)))
+    edges = {r: {} for r in range(n)}   # rank -> {peer_rank: kind}  (first kind wins per pair)
+
+    def add(a, b, kind):
+        if 0 <= b < n and b != a:
+            edges[a].setdefault(b, kind)
+
+    for r in range(n):
+        t, d, p = r % tp, (r // tp) % dp, r // (tp * dp)
+        base = p * tp * dp + d * tp                       # start of this rank's TP group
+        for t2 in range(tp):                              # TP: all-to-all
+            add(r, base + t2, "tp")
+        if dp > 1:                                        # DP: ring
+            for dd in ((d - 1) % dp, (d + 1) % dp):
+                add(r, p * tp * dp + dd * tp + t, "dp")
+        for pp2 in (p - 1, p + 1):                        # PP: neighbour
+            add(r, pp2 * tp * dp + d * tp + t, "pp")
+        if ep > 1 and dp % ep == 0:                       # EP: all-to-all within expert group
+            eb = (d // ep) * ep
+            for dd in range(eb, eb + ep):
+                add(r, p * tp * dp + dd * tp + t, "ep")
+
+    return {f"gpu{r+1}": [{"peer": f"gpu{b+1}", "kind": k} for b, k in sorted(pk.items())]
+            for r, pk in edges.items()}
+
+
+def collectives_stats(cmap, n):
+    """Summary for the GUI: peers/GPU and reduction vs the full mesh."""
+    per = [len(v) for v in cmap.values()]
+    avg = (sum(per) / len(per)) if per else 0
+    full = n - 1
+    return {"gpus": n, "avg_peers": round(avg, 1), "max_peers": max(per) if per else 0,
+            "full_mesh_peers": full,
+            "reduction_pct": round(100 * (1 - avg / full), 1) if full else 0}
+
+
+def _collectives_now():
+    with _LOCK:
+        return _COLLECTIVES.get("config"), dict(_COLLECTIVES.get("map") or {})
 
 # ---- fabric_vars.json (reloaded on mtime change) ---------------------------
 _FAB = {"path": None, "mtime": 0.0, "data": None}
@@ -554,23 +609,41 @@ class Handler(SimpleHTTPRequestHandler):
             src = (parse_qs(u.query).get("src") or [""])[0]
             fab = self._fab()
             bn, bp = _bypass_now()
+            _ccfg, cmap = _collectives_now()
+            # collectives active -> this src only connects to its partners
+            partners = None
+            if cmap:
+                partners = [e["peer"] for e in cmap.get(src, [])]
             desc = computed_descriptor(self.root_dir, src)
             if desc:
                 # compute-carriers: hand over the compact descriptor; the NIC
                 # expands the carriers itself. Drain travels as the bypass set,
                 # which the NIC applies per-EV (it knows each path's plane/nodes).
+                fabblk = dict(desc.get("fabric") or {})
+                if partners is not None:
+                    # restrict the NIC's carriers + probing to the collective peers
+                    fabblk["peers"] = sorted({int(p[3:]) for p in partners if p.startswith("gpu")})
                 return self._send_json({
-                    "src": src, "computed": True, "fabric": desc.get("fabric"),
+                    "src": src, "computed": True, "fabric": fabblk,
                     "tenant": desc.get("tenant"), "gateway": desc.get("gateway"),
                     "decap_sid": desc.get("decap_sid"),
                     "underlays": underlays_for(fab, src),
                     "bypass": sorted(bn), "bypass_planes": sorted(bp)})
+            paths = plan_for(fab, src)
+            if partners is not None:
+                pset = set(partners)
+                paths = [p for p in paths if p.get("peer") in pset]
             return self._send_json({"src": src, "decap_sid": decap_sid_for(fab, src),
                                     "underlays": underlays_for(fab, src),
                                     "bypass": sorted(bn), "bypass_planes": sorted(bp),
-                                    "paths": plan_for(fab, src)})
+                                    "paths": paths})
         if path == "/api/mesh":
             return self._send_json(mesh_view(self._fab()))
+        if path == "/api/collectives":
+            cfg, cmap = _collectives_now()
+            n = len(gpu_hosts(self._fab()))
+            return self._send_json({"config": cfg, "map": cmap,
+                                    "stats": collectives_stats(cmap, n) if cmap else None})
         if path == "/api/nodes":
             return self._send_json({"nodes": nodes_index(self._fab())})
         if path == "/api/config":
@@ -668,6 +741,31 @@ class Handler(SimpleHTTPRequestHandler):
                         _BYPASS_PLANES.discard(pl)
                 nodes = sorted(_BYPASS); planes = sorted(_BYPASS_PLANES)
             return self._send_json({"ok": True, "nodes": nodes, "planes": planes})
+        if path == "/api/collectives":
+            # Set the active collective partner set from a parallelism config.
+            #   {"tp":N,"dp":N,"pp":N,"ep":N}   apply — NICs narrow to partners
+            #   {"clear": true}                 back to full mesh
+            # NICs re-pull /api/mesh-plan (~2s) and reprogram + reprobe just
+            # their partners. Validated against the fabric's GPU count.
+            n = len(gpu_hosts(self._fab()))
+            if body.get("clear"):
+                with _LOCK:
+                    _COLLECTIVES["config"] = None; _COLLECTIVES["map"] = {}
+                return self._send_json({"ok": True, "cleared": True})
+            cfg = {k: int(body.get(k, 1) or 1) for k in ("tp", "dp", "pp", "ep")}
+            if cfg["tp"] * cfg["dp"] * cfg["pp"] != n:
+                return self._send_json(
+                    {"ok": False, "error": f"tp×dp×pp must equal the GPU count "
+                     f"({cfg['tp']}×{cfg['dp']}×{cfg['pp']} ≠ {n})"}, code=400)
+
+            if cfg["ep"] > 1 and cfg["dp"] % cfg["ep"] != 0:
+                return self._send_json(
+                    {"ok": False, "error": f"ep ({cfg['ep']}) must divide dp ({cfg['dp']})"}, code=400)
+            cmap = partner_map(cfg, n)
+            with _LOCK:
+                _COLLECTIVES["config"] = cfg; _COLLECTIVES["map"] = cmap
+            return self._send_json({"ok": True, "config": cfg, "map": cmap,
+                                    "stats": collectives_stats(cmap, n)})
         if path == "/api/exec":
             if not docker_available():
                 return self._send_json({"error": "console disabled (mrc-gui has no "

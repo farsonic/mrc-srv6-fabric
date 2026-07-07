@@ -23,11 +23,15 @@ def _addr(hexts):
     return ipaddress.IPv6Address(":".join(hexts)).compressed
 
 
-def _peer_set(sg, G, K, sparse):
-    """Destination GPUs this source connects to. Full mesh = everyone else.
-    Sparse = a deterministic 'closest K' hot set: same-leaf peers first (cheap,
-    no spine), then nearest GPU indices — a stand-in for a real training run's
-    ring/TP/PP/EP partners."""
+def _peer_set(sg, G, K, sparse, peers=None):
+    """Destination GPUs this source connects to.
+
+    peers (explicit)  = an exact partner list — what a collectives/parallelism
+                        map produces (this GPU's TP/DP/PP/EP partners). Wins.
+    sparse (int)      = deterministic 'closest K' hot set (same-leaf first).
+    neither           = full mesh (everyone else)."""
+    if peers is not None:
+        return sorted({int(g) for g in peers if 1 <= int(g) <= G and int(g) != sg})
     others = [g for g in range(1, G + 1) if g != sg]
     if not sparse or sparse >= len(others):
         return others
@@ -36,15 +40,22 @@ def _peer_set(sg, G, K, sparse):
     return sorted(others[:sparse])
 
 
-def expand(desc, sparse=None, spray=None):
+def expand(desc, sparse=None, spray=None, peers=None):
     """Reconstruct the full `profiles` list from a compact fabric descriptor.
 
     desc["fabric"] carries: mode, block, endx_base, dt6, gpu_nibble, planes,
     spines, gpus_per_leaf, gpus, gpu_base, gpu_host, src_gpu, ev_base,
     role_spine, role_leaf, multi, hp{spine,leaf,gpu,plane_tag}.
-    Optional sparse (peers/GPU) and spray (paths/flow) trim the set exactly like
-    the planner models — omit for the true full mesh."""
+    Optional peers (explicit partner list — from a collectives map), sparse
+    (peers/GPU) and spray (paths/flow) trim the set; omit all for the full mesh.
+    Any may also travel inside desc["fabric"] as peers / sparse / spray."""
     f = desc["fabric"]
+    if peers is None:
+        peers = f.get("peers")
+    if sparse is None:
+        sparse = f.get("sparse")
+    if spray is None:
+        spray = f.get("spray")
     spec = f["mode"] == "spec"
     blk = f["block"].split(":")                       # ["fcbb","bb00"] or ["fc00","0"]
     endx = int(f["endx_base"], 16)                    # 0xe000
@@ -73,7 +84,7 @@ def expand(desc, sparse=None, spray=None):
     sl = home_leaf(sg)
     sgn = gname(sg)
     profiles = []
-    for dg in _peer_set(sg, G, K, sparse):
+    for dg in _peer_set(sg, G, K, sparse, peers):
         dl, dloc = home_leaf(dg), local_idx(dg)
         dgn = gname(dg)
         evs = []

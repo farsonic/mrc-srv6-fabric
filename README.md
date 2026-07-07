@@ -373,6 +373,34 @@ curl -X POST http://<host>:8080/api/bypass -d '{"planes":[]}'          # restore
 
 ---
 
+## Collective partners (model a training run)
+
+By default every GPU meshes with every other GPU. Real jobs don't — they talk to
+a bounded set of **collective partners** set by the parallelism strategy. The GUI
+**◇ Collectives** button models this: enter the tensor / data / pipeline / expert
+group sizes (`tp × dp × pp` must equal the GPU count; `ep` is an optional MoE
+overlay) and each GPU narrows its **carriers and its probing** to just its
+partners:
+
+- **TP** — all-to-all within a tensor group   (every-layer all-reduce)
+- **DP** — ring across the data dimension       (gradient all-reduce)
+- **PP** — neighbour across pipeline stages       (activation send/recv)
+- **EP** — all-to-all within an expert group      (MoE dispatch/combine)
+
+Apply is live: the controller pushes the partner map, NICs re-pull `/api/mesh-plan`
+(~2 s) and reprogram + reprobe only their partners — the same mechanism as
+`--sparse`, but driven by an explicit map. This is what keeps probing (and EV
+state) bounded by the *job's* connection set instead of O(GPUs²).
+
+```bash
+# 8-GPU job as TP=2, DP=2, PP=2  →  each GPU keeps ~3 partners, not 7
+curl -X POST http://<host>:8080/api/collectives -d '{"tp":2,"dp":2,"pp":2,"ep":1}'
+curl -s  http://<host>:8080/api/collectives          # current map + reduction stats
+curl -X POST http://<host>:8080/api/collectives -d '{"clear":true}'   # back to full mesh
+```
+
+---
+
 ## Live packet capture (Edgeshark)
 
 Deploy [Siemens Edgeshark](https://github.com/siemens/edgeshark) for live

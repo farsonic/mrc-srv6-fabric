@@ -167,6 +167,14 @@
   .modal-head .grow{flex:1}
   .modal-head .x{background:none;border:none;color:var(--dim);font-size:20px;cursor:pointer;line-height:1}
   .modal-head .x:hover{color:#fff}
+  .collgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .collgrid label{display:flex;flex-direction:column;gap:3px;font-weight:600;font-size:14px;color:var(--ink)}
+  .collgrid label span{font-weight:400;font-size:10.5px;color:var(--dim)}
+  .collgrid input{background:#0b1219;border:1px solid var(--rule);border-radius:6px;color:var(--ink);
+                  font-size:17px;padding:7px 9px;width:100%;box-sizing:border-box;font-variant-numeric:tabular-nums}
+  .collgrid input:focus{outline:none;border-color:var(--accent)}
+  #collResult .grp{background:#101a24;border:1px solid var(--rule);border-radius:6px;padding:8px 11px;margin:6px 0}
+  #collResult .ktp{color:#8fd0b0}#collResult .kdp{color:#f0a830}#collResult .kpp{color:#5aa0f0}#collResult .kep{color:#c98ff0}
   .modal-body{flex:1;min-height:0;position:relative}
   .pane{position:absolute;inset:0;display:none;flex-direction:column}
   .pane.active{display:flex}
@@ -226,6 +234,7 @@
       <input type="file" id="file" accept=".json">
     </span>
     <button id="dlcfg" title="Download every node config as a .tar.gz">⬇ configs</button>
+    <button id="collBtn" title="Define collective partners (TP/DP/PP/EP) — narrows each NIC's carriers + probing">◇ Collectives</button>
     <a id="edgeshark" class="btn-link" target="_blank" rel="noopener"
        title="Open Edgeshark — live per-link packet capture (Wireshark)">🦈 Edgeshark</a>
     <button id="fit">Fit</button>
@@ -291,6 +300,35 @@
         </div>
         <pre class="runout" id="runOut">Run a command to see its output.</pre>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="collModal">
+  <div class="modal" style="width:min(760px,94vw);height:auto;max-height:88vh">
+    <div class="modal-head">
+      <span class="mname">◇ Collective partners</span>
+      <span class="grow"></span>
+      <button class="x" id="collClose" title="Close (Esc)">×</button>
+    </div>
+    <div class="modal-body" style="display:block;padding:18px 20px;overflow:auto">
+      <p style="color:var(--dim);font-size:13px;margin:0 0 14px;line-height:1.5">
+        Model a training job's communication pattern. Each GPU then connects to — and
+        <b style="color:var(--ink)">probes</b> — only its collective partners, instead of the full mesh.
+        <code>tp × dp × pp</code> must equal the GPU count; <code>ep</code> is an optional MoE overlay.
+      </p>
+      <div class="collgrid">
+        <label>TP <span>tensor · all-to-all</span><input type="number" id="collTP" min="1" value="1"></label>
+        <label>DP <span>data · ring</span><input type="number" id="collDP" min="1" value="1"></label>
+        <label>PP <span>pipeline · neighbour</span><input type="number" id="collPP" min="1" value="1"></label>
+        <label>EP <span>expert · all-to-all</span><input type="number" id="collEP" min="1" value="1"></label>
+      </div>
+      <div style="margin:14px 0;display:flex;gap:10px;align-items:center">
+        <button class="btn on" id="collApply">Apply — live</button>
+        <button class="btn" id="collClear">Clear (full mesh)</button>
+        <span id="collState" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <div id="collResult" style="font-size:13px;color:var(--ink)"></div>
     </div>
   </div>
 </div>
@@ -1016,6 +1054,59 @@ function fit(svg){
 }
 document.getElementById("fit").addEventListener("click",()=>window._fit&&window._fit());
 document.getElementById("dlcfg").addEventListener("click",()=>{ location.href="/api/configs.tar.gz"; });
+// ---- collectives: define TP/DP/PP/EP partner set (narrows NIC carriers + probing) ----
+function gpuCount(){ return Object.values((DATA&&DATA.nodes)||{}).filter(n=>n.role==="gpu").length; }
+function collState(msg,ok){ const e=document.getElementById("collState");
+  if(e){ e.textContent=msg; e.style.color = ok===false?"#f06b6b":(ok?"#6be0a0":"var(--dim)"); } }
+function openColl(){
+  const n=gpuCount();
+  document.getElementById("collModal").classList.add("open");
+  collState(n?`${n} GPUs · tp × dp × pp must = ${n}`:"load a fabric first");
+  fetch("/api/collectives",{cache:"no-store"}).then(r=>r.json()).then(d=>{
+    const c=d.config||{tp:1,dp:1,pp:1,ep:1};
+    ["TP","DP","PP","EP"].forEach(k=>{ const el=document.getElementById("coll"+k);
+      if(el) el.value=c[k.toLowerCase()]||1; });
+    renderColl(d);
+  }).catch(()=>{});
+}
+function closeColl(){ document.getElementById("collModal").classList.remove("open"); }
+function renderColl(d){
+  const box=document.getElementById("collResult"); if(!box) return;
+  if(!d||!d.map||!Object.keys(d.map).length){ box.innerHTML=
+    '<span style="color:var(--dim)">Full mesh — every GPU connects to every other GPU.</span>'; return; }
+  const s=d.stats||{};
+  let html=`<div style="margin:4px 0 10px"><b>${s.avg_peers}</b> partners/GPU `+
+    `(vs <b>${s.full_mesh_peers}</b> full mesh) · <b style="color:#6be0a0">${s.reduction_pct}%</b> fewer carriers &amp; probes</div>`;
+  const names=Object.keys(d.map).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+  html+=names.map(g=>{
+    const ps=d.map[g].map(e=>`<span class="k${e.kind}">${e.peer}<span style="opacity:.6">·${e.kind}</span></span>`).join(", ");
+    return `<div class="grp"><b>${g}</b> → ${ps||'<span style="color:var(--dim)">(none)</span>'}</div>`;
+  }).join("");
+  box.innerHTML=html;
+}
+function applyColl(){
+  const n=gpuCount();
+  const cfg={tp:+document.getElementById("collTP").value||1, dp:+document.getElementById("collDP").value||1,
+             pp:+document.getElementById("collPP").value||1, ep:+document.getElementById("collEP").value||1};
+  if(cfg.tp*cfg.dp*cfg.pp!==n){ collState(`tp×dp×pp = ${cfg.tp*cfg.dp*cfg.pp} ≠ ${n} GPUs`,false); return; }
+  collState("applying…");
+  fetch("/api/collectives",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)})
+    .then(r=>r.json()).then(d=>{
+      if(!d.ok){ collState(d.error||"failed",false); return; }
+      collState("applied — NICs re-pull in ~2 s",true); renderColl(d);
+    }).catch(e=>collState("needs the live backend",false));
+}
+function clearColl(){
+  collState("clearing…");
+  fetch("/api/collectives",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clear:true})})
+    .then(r=>r.json()).then(()=>{ collState("full mesh restored",true);
+      renderColl({}); ["TP","DP","PP","EP"].forEach(k=>document.getElementById("coll"+k).value=1); })
+    .catch(()=>collState("needs the live backend",false));
+}
+document.getElementById("collBtn").addEventListener("click",openColl);
+document.getElementById("collClose").addEventListener("click",closeColl);
+document.getElementById("collApply").addEventListener("click",applyColl);
+document.getElementById("collClear").addEventListener("click",clearColl);
 // Edgeshark runs on the same host, port 5001 (live per-link packet capture)
 document.getElementById("edgeshark").href = location.protocol+"//"+location.hostname+":5001/";
 window.addEventListener("resize",()=>window._fit&&window._fit());
@@ -1025,8 +1116,9 @@ document.getElementById("mClose").addEventListener("click",closeConsole);
 document.querySelectorAll(".modal .tab").forEach(t=>t.addEventListener("click",()=>switchPane(t.dataset.pane)));
 document.getElementById("runBtn").addEventListener("click",runCmd);
 document.getElementById("runInput").addEventListener("keydown",e=>{ if(e.key==="Enter") runCmd(); });
-document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&
-  document.getElementById("consoleModal").classList.contains("open")) closeConsole(); });
+document.addEventListener("keydown",e=>{ if(e.key==="Escape"){
+  if(document.getElementById("consoleModal").classList.contains("open")) closeConsole();
+  if(document.getElementById("collModal").classList.contains("open")) closeColl(); } });
 // detail panels are click-driven now — they stay open until you deselect the
 // node/path (no auto-hide on mouse-leave, so you can read/scroll freely)
 (function(){
