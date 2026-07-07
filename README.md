@@ -399,6 +399,23 @@ curl -s  http://<host>:8080/api/collectives          # current map + reduction s
 curl -X POST http://<host>:8080/api/collectives -d '{"clear":true}'   # back to full mesh
 ```
 
+**Explicit groups (any GPUs, any pattern).** The GUI's group builder — or the API
+directly — lets you stage **multiple groups, each with its own collective
+pattern**, instead of a single rank-derived layout. Click GPUs → pick a pattern →
+**+ group**; GPUs in no group are isolated. Patterns: `mesh` (all-to-all),
+`ring` (all-reduce), `chain` (pipeline stages), `star` (hub = first member).
+Member order matters for ring/chain/star.
+
+```bash
+# two independent jobs on one fabric: a mesh pair and a 4-GPU ring
+curl -X POST http://<host>:8080/api/collectives -d '{"groups":[
+  {"members":["gpu1","gpu2"],"pattern":"mesh"},
+  {"members":["gpu5","gpu6","gpu7","gpu8"],"pattern":"ring"}]}'
+
+# just two GPUs talking, nothing else
+curl -X POST http://<host>:8080/api/collectives -d '{"groups":[["gpu1","gpu4"]]}'
+```
+
 ---
 
 ## Live packet capture (Edgeshark)

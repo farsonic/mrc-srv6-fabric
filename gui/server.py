@@ -289,18 +289,54 @@ def partner_map(cfg, n):
             for r, pk in edges.items()}
 
 
+# collective communication patterns -> the undirected pairs they connect. Order
+# of `members` matters for ring / chain / star (chip-click order in the GUI).
+_PATTERNS = {"mesh", "ring", "chain", "star"}
+
+def _group_pairs(members, pattern):
+    n = len(members)
+    pairs = set()
+    if n < 2:
+        return pairs
+    p = (pattern or "mesh").lower()
+    if p == "ring":                       # each ↔ next, wrapping (all-reduce ring)
+        for i in range(n):
+            pairs.add(frozenset((members[i], members[(i + 1) % n])))
+    elif p == "chain":                    # each ↔ next, no wrap (pipeline stages)
+        for i in range(n - 1):
+            pairs.add(frozenset((members[i], members[i + 1])))
+    elif p == "star":                     # first member is the hub (broadcast / PS)
+        for i in range(1, n):
+            pairs.add(frozenset((members[0], members[i])))
+    else:                                 # mesh: all-to-all (TP / EP)
+        for i in range(n):
+            for j in range(i + 1, n):
+                pairs.add(frozenset((members[i], members[j])))
+    return pairs
+
+
 def groups_map(groups, hosts):
-    """Explicit collectives: each group is all-to-all internally; GPUs in no group
-    get NO partners (isolated — no carriers, no probing). `hosts` = valid names.
-    Use a 2-GPU group to make just those two talk (e.g. [["gpu1","gpu4"]])."""
+    """Explicit collectives: each group connects per its own pattern (mesh / ring /
+    chain / star). Groups may mix patterns. GPUs in no group are isolated (no
+    carriers, no probing). A group is ["gpu1","gpu4"] (defaults to mesh) or
+    {"members":[...],"pattern":"ring"}."""
     valid = set(hosts)
     cmap = {g: [] for g in hosts}                 # present-but-isolated by default
     for grp in (groups or []):
-        members = [m for m in (grp or []) if m in valid]
-        for a in members:
-            peers = {b for b in members if b != a}
-            have = {e["peer"] for e in cmap[a]}
-            cmap[a].extend({"peer": b, "kind": "grp"} for b in sorted(peers - have))
+        if isinstance(grp, dict):
+            members = [m for m in (grp.get("members") or []) if m in valid]
+            pattern = (grp.get("pattern") or "mesh").lower()
+        else:
+            members, pattern = [m for m in (grp or []) if m in valid], "mesh"
+        if pattern not in _PATTERNS:
+            pattern = "mesh"
+        for pair in _group_pairs(members, pattern):
+            a, b = tuple(pair) if len(pair) == 2 else (None, None)
+            for x, y in ((a, b), (b, a)):
+                if x and y and y not in {e["peer"] for e in cmap[x]}:
+                    cmap[x].append({"peer": y, "kind": pattern})
+    for g in cmap:
+        cmap[g].sort(key=lambda e: e["peer"])
     return cmap
 
 
