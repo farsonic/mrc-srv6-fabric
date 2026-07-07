@@ -46,7 +46,10 @@
   .leaf  rect{fill:#0c2630;stroke:var(--leaf)}
   .gpu   rect{fill:#1a1630;stroke:var(--gpu)}
   .planeband{fill-opacity:.32;stroke-opacity:.5;stroke-width:1}
-  .planelabel{fill:var(--dim);font-size:11px;letter-spacing:.18em;text-transform:uppercase}
+  .planeband.drained{stroke:#ff6a6a;stroke-opacity:.95;stroke-width:2.4;stroke-dasharray:7 5}
+  .planelabel{fill:var(--dim);font-size:11px;letter-spacing:.18em;text-transform:uppercase;cursor:pointer}
+  .planelabel:hover{fill:var(--ink);text-decoration:underline}
+  .planelabel.drained{fill:#ff9a9a}
   .edge{stroke:var(--link);stroke-width:1.4;fill:none}
   .edge.gpu{stroke:var(--gpu);stroke-opacity:.45}
   .edge.hot{stroke:var(--link-hot);stroke-width:2.4}
@@ -251,7 +254,7 @@
 
 <script>
 const SVGNS="http://www.w3.org/2000/svg";
-let DATA=null, NODES={}, byName={};
+let DATA=null, NODES={}, byName={}, planeBands={};
 let EDGES=null;        // edge records, for highlighting a carrier path
 let MESH=null;         // latest /api/mesh response (null until backend reached)
 let backendOk=false;   // did the last /api/mesh fetch succeed?
@@ -329,15 +332,21 @@ function render(data){
   const pos={}; // name -> {x,y,r?}
 
   // place plane bands + nodes
+  planeBands={};
   planeIds.forEach((p,pi)=>{
     const ox=PAD+pi*(planeW+PLANE_GAP);
-    // band
+    // band — click to drain/restore the whole plane for maintenance
     const band=el("rect",{x:ox-14,y:planeBandTop-22,width:planeW+28,
       height:planeRowsH+34,rx:12,class:"planeband",
       fill:planeColors[pi%4],stroke:planeColors[pi%4]});
     svg.appendChild(band);
-    svg.appendChild(el("text",{x:ox+planeW/2,y:planeBandTop-30,
-      "text-anchor":"middle",class:"planelabel"},`plane ${p}`));
+    // the label is the click target to drain/restore the whole plane
+    const label=el("text",{x:ox+planeW/2,y:planeBandTop-30,
+      "text-anchor":"middle",class:"planelabel"},`plane ${p}`);
+    label.addEventListener("click",()=>togglePlane(p));
+    label.append(el("title",{},"click to drain / restore this plane"));
+    svg.appendChild(label);
+    planeBands[p]={band,label,name:`plane ${p}`};
 
     const spineY=planeBandTop+NODE_H/2;
     const leafY=planeBandTop+NODE_H+ROW_GAP+NODE_H/2;
@@ -552,19 +561,37 @@ function runCmd(){
 }
 
 // ---- feature 5: maintenance bypass (drain traffic off a node) ----
-let BYPASS=new Set();
+let BYPASS=new Set(), BYPASS_PLANES=new Set();
 function renderBypass(){
   Object.entries(byName).forEach(([n,g])=>g.classList.toggle("bypassed",BYPASS.has(n)));
+  Object.entries(planeBands).forEach(([p,pb])=>{
+    const on=BYPASS_PLANES.has(+p);
+    pb.band.classList.toggle("drained",on);
+    pb.label.classList.toggle("drained",on);
+    pb.label.firstChild && (pb.label.firstChild.textContent = pb.name + (on?" · drained":""));
+  });
   const m=document.getElementById("maint");
-  if(m){ const a=[...BYPASS]; m.innerHTML=a.length?`⚠ maintenance drain: <b>${a.join(", ")}</b>`:""; }
+  if(m){
+    const parts=[...BYPASS];
+    [...BYPASS_PLANES].sort((a,b)=>a-b).forEach(p=>parts.push("plane "+p));
+    m.innerHTML=parts.length?`⚠ maintenance drain: <b>${parts.join(", ")}</b>`:"";
+  }
 }
 function toggleBypass(name){
   const on=!BYPASS.has(name);
   fetch("/api/bypass",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({node:name,on})})
-    .then(r=>r.json()).then(d=>{ BYPASS=new Set(d.nodes||[]); renderBypass();
-      if(pinned===name) showInfo(name,(DATA&&DATA.nodes)||{}); })
+    .then(r=>r.json()).then(d=>{ BYPASS=new Set(d.nodes||[]); BYPASS_PLANES=new Set(d.planes||[]);
+      renderBypass(); if(pinned===name) showInfo(name,(DATA&&DATA.nodes)||{}); })
     .catch(()=>{ const m=document.getElementById("cfgMeta"); if(m) m.textContent="bypass needs the live backend (static server?)"; });
+}
+function togglePlane(p){
+  const on=!BYPASS_PLANES.has(+p);
+  fetch("/api/bypass",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({plane:+p,on})})
+    .then(r=>r.json()).then(d=>{ BYPASS=new Set(d.nodes||[]); BYPASS_PLANES=new Set(d.planes||[]);
+      renderBypass(); })
+    .catch(()=>{});
 }
 
 // ---- feature 2: per-node config viewer (+ per-node download) ----
@@ -760,7 +787,8 @@ async function pollMesh(){
   try{
     const r=await fetch('/api/mesh',{cache:'no-store'});
     if(r.ok){ MESH=await r.json(); backendOk=true;
-      BYPASS=new Set((MESH&&MESH.bypass)||[]); renderBypass(); }
+      BYPASS=new Set((MESH&&MESH.bypass)||[]);
+      BYPASS_PLANES=new Set((MESH&&MESH.bypass_planes)||[]); renderBypass(); }
     else backendOk=false;
   }catch(e){ backendOk=false; }   // static server / file:// — keep inventory view
   rebuildPaths();

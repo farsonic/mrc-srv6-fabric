@@ -227,6 +227,7 @@ class _WSReader:
 _LOCK = threading.Lock()
 _REPORTS = {}          # host -> {"ts","received_at","peers":[...],"weigher":{...}}
 _BYPASS = set()        # node names an operator has drained for maintenance
+_BYPASS_PLANES = set() # whole planes (ints) an operator has drained for maintenance
 _STOP = threading.Event()
 
 # ---- fabric_vars.json (reloaded on mtime change) ---------------------------
@@ -288,14 +289,23 @@ def path_nodes(p):
     drain: bypassing any of them drains the path."""
     return {n for n in (p.get("spine"), p.get("src_leaf"), p.get("dst_leaf")) if n}
 
+def _bypass_now():
+    """A snapshot of the current drain state: (bypassed node names, bypassed
+    plane ids). Read under the lock so a concurrent toggle is atomic."""
+    with _LOCK:
+        return set(_BYPASS), set(_BYPASS_PLANES)
+
+def is_drained(p, bypass_nodes, bypass_planes):
+    """A path is drained if its plane is bypassed OR any node it transits is."""
+    return (p.get("plane") in bypass_planes) or bool(bypass_nodes & path_nodes(p))
+
 def plan_for(fab, src):
     """The per-path probe plan for one source host: every path whose src is this
     host, shaped for the NIC's /api/mesh-plan consumer. `drained` marks a path
-    that transits an operator-bypassed node — the NIC keeps probing it but steers
-    data traffic off it."""
+    that transits an operator-bypassed node OR plane — the NIC keeps probing it
+    but steers data traffic off it."""
     out = []
-    with _LOCK:
-        bypass = set(_BYPASS)
+    bn, bp = _bypass_now()
     for p in (fab.get("paths") or []):
         if p.get("src") != src:
             continue
@@ -304,9 +314,29 @@ def plan_for(fab, src):
             "spine": p.get("spine"), "path_id": p["path_id"],
             "fwmark": p["fwmark"], "probe_sid": p["usid"], "usid": p["usid"],
             "plane": p.get("plane"),   # which underlay plane this path egresses (dual-plane)
-            "drained": bool(bypass & path_nodes(p)),
+            "drained": is_drained(p, bn, bp),
         })
     return out
+
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+def fabric_planes(fab):
+    """The set of plane ids present in the fabric (from nodes), so a drain-plane
+    request can be validated — works for a single-plane deploy too."""
+    planes = set()
+    for nd in (fab.get("nodes") or {}).values():
+        pl = nd.get("plane")
+        if isinstance(pl, int) and pl > 0:
+            planes.add(pl)
+    for p in (fab.get("paths") or []):
+        pl = p.get("plane")
+        if isinstance(pl, int) and pl > 0:
+            planes.add(pl)
+    return planes
 
 def underlays_for(fab, src):
     """{ "<plane>": {"iface","gateway"} } for the source host's underlay NICs.
@@ -408,8 +438,7 @@ def mesh_view(fab):
     """Every path joined to its latest reported probe health. The full path list
     always renders (from fabric_vars); health is null until a NIC reports it."""
     samples, denied, srcinfo = _sample_index()
-    with _LOCK:
-        bypass = set(_BYPASS)
+    bn, bp = _bypass_now()
     now = time.time()
     paths = []
     for p in (fab.get("paths") or []):
@@ -430,11 +459,10 @@ def mesh_view(fab):
                 "err": s.get("err"),
                 "age_s": rep_age,
             }
-        drained = bool(bypass & path_nodes(p))
-        paths.append({**p, "health": health, "drained": drained})
+        paths.append({**p, "health": health, "drained": is_drained(p, bn, bp)})
     return {"updated": now, "name": fab.get("name"), "shape": fab.get("shape"),
             "sources": srcinfo, "n_reporting": len(srcinfo),
-            "bypass": sorted(bypass), "paths": paths}
+            "bypass": sorted(bn), "bypass_planes": sorted(bp), "paths": paths}
 
 # ---- HTTP ------------------------------------------------------------------
 class Handler(SimpleHTTPRequestHandler):
@@ -492,11 +520,10 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/mesh-plan":
             src = (parse_qs(u.query).get("src") or [""])[0]
             fab = self._fab()
-            with _LOCK:
-                bypass = sorted(_BYPASS)
+            bn, bp = _bypass_now()
             return self._send_json({"src": src, "decap_sid": decap_sid_for(fab, src),
                                     "underlays": underlays_for(fab, src),
-                                    "bypass": bypass,
+                                    "bypass": sorted(bn), "bypass_planes": sorted(bp),
                                     "paths": plan_for(fab, src)})
         if path == "/api/mesh":
             return self._send_json(mesh_view(self._fab()))
@@ -512,7 +539,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_tgz()
         if path == "/api/bypass":
             with _LOCK:
-                return self._send_json({"nodes": sorted(_BYPASS)})
+                return self._send_json({"nodes": sorted(_BYPASS),
+                                        "planes": sorted(_BYPASS_PLANES)})
         if path == "/api/console-info":
             return self._send_json({"enabled": docker_available()})
         if path == "/api/console" and \
@@ -548,11 +576,16 @@ class Handler(SimpleHTTPRequestHandler):
                                       "weigher": body.get("weigher") or {}}
             return self._send_json({"ok": True})
         if path == "/api/bypass":
-            # Maintenance drain: mark node(s) so NICs steer traffic around them.
-            # Accepts {"node": "<name>", "on": true|false} to toggle one, or
-            # {"nodes": [...]} to set the whole list. Only real fabric nodes are
-            # accepted (validated against fabric_vars).
-            valid = set((self._fab().get("nodes") or {}).keys())
+            # Maintenance drain: mark node(s) or whole plane(s) so NICs steer
+            # traffic around them (probes keep running). Accepts:
+            #   {"node": "<name>", "on": bool}   toggle one node
+            #   {"nodes": [...]}                 set the node list
+            #   {"plane": <int>, "on": bool}     toggle a whole plane
+            #   {"planes": [...]}                set the plane list
+            # Only real fabric nodes / planes are accepted (validated vs fabric_vars).
+            fab = self._fab()
+            valid = set((fab.get("nodes") or {}).keys())
+            vplanes = fabric_planes(fab)
             with _LOCK:
                 if "nodes" in body and isinstance(body["nodes"], list):
                     _BYPASS.clear()
@@ -562,8 +595,18 @@ class Handler(SimpleHTTPRequestHandler):
                         _BYPASS.add(body["node"])
                     else:
                         _BYPASS.discard(body["node"])
-                nodes = sorted(_BYPASS)
-            return self._send_json({"ok": True, "nodes": nodes})
+                if "planes" in body and isinstance(body["planes"], list):
+                    _BYPASS_PLANES.clear()
+                    _BYPASS_PLANES.update(int(p) for p in body["planes"]
+                                          if _as_int(p) in vplanes)
+                elif body.get("plane") is not None and _as_int(body["plane"]) in vplanes:
+                    pl = _as_int(body["plane"])
+                    if body.get("on", True):
+                        _BYPASS_PLANES.add(pl)
+                    else:
+                        _BYPASS_PLANES.discard(pl)
+                nodes = sorted(_BYPASS); planes = sorted(_BYPASS_PLANES)
+            return self._send_json({"ok": True, "nodes": nodes, "planes": planes})
         if path == "/api/exec":
             if not docker_available():
                 return self._send_json({"error": "console disabled (mrc-gui has no "

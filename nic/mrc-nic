@@ -27,7 +27,7 @@ import argparse, json, os, re, signal, socket, struct, subprocess, sys, tempfile
 from urllib import request as urlreq, error as urlerr
 
 DEFAULT_IFACE   = "mrc0"
-MRC_NIC_BUILD   = "2026-07-07-g25-drain-correct"  # bump on every change; printed at startup
+MRC_NIC_BUILD   = "2026-07-07-g27-drain-safety"  # bump on every change; printed at startup
 DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
 METRICS_PERIOD  = 1.0
 RECONNECT_BASE  = 1.0
@@ -793,6 +793,10 @@ MESH_PERIOD   = float(os.environ.get("MRC_MESH_PERIOD", "5.0"))   # seconds betw
 # keep it short — the plan is tiny and re-pulling is a no-op for the dataplane
 # when the fwmark set is unchanged (it only refreshes the drained-path flags).
 PLAN_REFRESH  = float(os.environ.get("MRC_PLAN_REFRESH", "5.0"))
+# A dedicated watcher polls the controller's per-path drain flags on this fixed
+# cadence, decoupled from the (slower, ~10s+) TWAMP sweep, so a maintenance
+# drain/restore of a node OR a whole plane takes effect in ~DRAIN_POLL seconds.
+DRAIN_POLL    = float(os.environ.get("MRC_DRAIN_POLL", "2.0"))
 MESH_COUNT    = int(os.environ.get("MRC_MESH_COUNT", "5"))        # echoes per peer per sweep
 MESH_INTERVAL = float(os.environ.get("MRC_MESH_INTERVAL", "0.2")) # spacing between echoes
 
@@ -1168,13 +1172,19 @@ class MeshHealth(threading.Thread):
         return spray or list(active_ids)   # never return empty (blackhole guard)
 
     def _drained_ev_set(self, active_evs):
-        """The set of EV entropies whose path transits a drained (bypassed) node.
-        Per-EV (not per-path_id) so a spine path_id shared by two peers drains
-        both of their EVs, not just the one the id_to_ev map happens to keep."""
-        return {e.get("entropy") for e in (active_evs or [])
-                if (e.get("path") in self.drained_ids
-                    or e.get("spine") in self.drained_ids)
-                and isinstance(e.get("entropy"), int)}
+        """The set of EV entropies whose path transits a drained (bypassed) node
+        or plane. Per-EV (not per-path_id) so a spine path_id shared by two peers
+        drains both of their EVs. SAFETY: never returns EVERY EV of a flow — if a
+        drain would zero all of them (e.g. draining the only plane in a
+        single-plane deploy), one EV is kept so the flow isn't blackholed."""
+        evs = [e for e in (active_evs or []) if isinstance(e.get("entropy"), int)]
+        all_evs = {e.get("entropy") for e in evs}
+        drained = {e.get("entropy") for e in evs
+                   if e.get("path") in self.drained_ids
+                   or e.get("spine") in self.drained_ids}
+        if drained and drained >= all_evs:
+            drained.discard(min(all_evs))     # keep one path alive
+        return drained
 
     def _publish_weights(self, weights, active_ids, id_to_ev, drained_evs=None):
         """Map path weights -> per-EV weights, write ev_weights + weigher snapshot
@@ -1485,12 +1495,34 @@ class MeshHealth(threading.Thread):
             res["rtt_max"] = float(m.group(3)); res["rtt_mdev"] = float(m.group(4))
         return res
 
+    def _drain_watch(self):
+        """Poll the controller's per-path drain flags every DRAIN_POLL seconds,
+        independent of the slower TWAMP sweep, so a maintenance drain/restore
+        (node or whole plane) takes effect in ~2s. Only touches drain state — the
+        sweep's _refresh_plan still owns route install/teardown."""
+        url = f"{self.controller}/api/mesh-plan?src={self.host}"
+        while not self.stop.is_set():
+            if self.stop.wait(DRAIN_POLL):
+                break
+            try:
+                with urlreq.urlopen(url, timeout=3) as r:
+                    paths = json.loads(r.read()).get("paths", [])
+            except (urlerr.URLError, socket.timeout, ValueError):
+                continue
+            new = {p.get("path_id") for p in paths if p.get("drained")}
+            if new != self.drained_ids:
+                self.drained_ids = new
+                if self.state is not None:
+                    self.state.set("drained", sorted(new))
+                self._maybe_fast_rebalance()   # steer the spray now, off-sweep
+
     def run(self):
         # small initial stagger so all hosts don't sweep in lockstep
         self.stop.wait(0.5 + (hash(self.host) % 1000) / 1000.0)
         print(f"[mesh] started on {self.host}: TWAMP per-path every {MESH_PERIOD}s, "
               f"{TWAMP_COUNT} pkts/burst @ {int(TWAMP_INTERVAL*1000)}ms",
               file=sys.stderr)
+        threading.Thread(target=self._drain_watch, daemon=True).start()
         first = True
         while not self.stop.is_set():
             try:
@@ -1606,7 +1638,6 @@ class MeshHealth(threading.Thread):
             while waited < MESH_PERIOD and not self.stop.is_set():
                 self.stop.wait(1.0)
                 waited += 1.0
-                self._refresh_plan()          # re-pull drain state on PLAN_REFRESH cadence
                 self._maybe_fast_rebalance()   # apply drain/balance change now
 
     def _post(self, samples, weigher=None):
