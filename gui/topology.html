@@ -101,11 +101,14 @@
   .legend{display:flex;gap:16px;align-items:center;margin-top:14px;font-size:11px;color:var(--dim)}
   .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
   .controls{display:flex;gap:8px;align-items:center}
-  .controls button{
+  .controls button,.controls .btn-link{
     background:#16212c;color:var(--ink);border:1px solid var(--rule);
-    border-radius:6px;padding:5px 11px;font:inherit;font-size:12px;cursor:pointer
+    border-radius:6px;padding:5px 11px;font:inherit;font-size:12px;cursor:pointer;
+    text-decoration:none;display:inline-block;line-height:1.35
   }
-  .controls button:hover{border-color:var(--accent)}
+  .controls button:hover,.controls .btn-link:hover{border-color:var(--accent)}
+  .controls .btn-link{border-color:#2a6b58;color:#7fd6b6}
+  .controls .btn-link[hidden]{display:none}
   .filedrop{color:var(--dim);font-size:11px}
   .filedrop input{display:none}
   .filedrop label{color:var(--leaf);cursor:pointer;text-decoration:underline}
@@ -215,6 +218,8 @@
       <input type="file" id="file" accept=".json">
     </span>
     <button id="dlcfg" title="Download every node config as a .tar.gz">⬇ configs</button>
+    <a id="edgeshark" class="btn-link" target="_blank" rel="noopener"
+       title="Open Edgeshark — live per-link packet capture (Wireshark)">🦈 Edgeshark</a>
     <button id="fit">Fit</button>
   </div>
 </header>
@@ -907,6 +912,8 @@ function fit(svg){
 }
 document.getElementById("fit").addEventListener("click",()=>window._fit&&window._fit());
 document.getElementById("dlcfg").addEventListener("click",()=>{ location.href="/api/configs.tar.gz"; });
+// Edgeshark runs on the same host, port 5001 (live per-link packet capture)
+document.getElementById("edgeshark").href = location.protocol+"//"+location.hostname+":5001/";
 window.addEventListener("resize",()=>window._fit&&window._fit());
 // console modal wiring (feature 4)
 fetchConsoleInfo();

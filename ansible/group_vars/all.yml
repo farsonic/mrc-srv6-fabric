@@ -30,6 +30,11 @@ gui_image: python:3.12-slim  # tiny image used to serve the GUI (runs gui/server
 # SECURITY: this grants the GUI container full control of the host's Docker —
 # only enable on a trusted/lab host. Off by default. Enable with -e gui_console=true
 gui_console: false
+# do_edgeshark deploys Siemens Edgeshark (edgeshark/docker-compose.yml) for live
+# per-link packet capture (Wireshark) across every clab container; the GUI header
+# links to it at http://<host>:5001. Runs privileged host-level containers, so
+# lab-only. Off by default. Enable with -e do_edgeshark=true
+do_edgeshark: false
 # Attach the NICs to the GUI backend so the paths table shows LIVE test-probe
 # health. Empty = NICs run standalone (no mesh; table shows the path inventory
 # only). Set to this host's reachable URL, e.g. http://172.20.20.1:8080
