@@ -42,7 +42,13 @@ from urllib.parse import urlparse, parse_qs
 # mounted socket — no docker CLI needed in the image. Off unless the socket is
 # present (operator mounts it explicitly), so the default GUI stays unprivileged.
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-_DOCKER_API = "v1.43"
+# Versionless Docker Engine API path prefix: the daemon negotiates its own
+# version. A hardcoded version (e.g. /v1.43) 400s ("client version too new") on
+# any daemon whose max API version is older, which broke the console on hosts
+# with an older Docker. Empty = version-agnostic. Override with MRC_DOCKER_API.
+_DOCKER_API = os.environ.get("MRC_DOCKER_API", "").strip("/")
+def _api(path):
+    return (f"/{_DOCKER_API}{path}" if _DOCKER_API else path)
 _CTR_CACHE = {}        # node -> container name (resolved once)
 _CTR_LOCK = threading.Lock()
 
@@ -65,7 +71,7 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
 def _docker_json(method, path, body=None, timeout=15):
     c = _UnixHTTPConnection(timeout=timeout)
     data = json.dumps(body).encode() if body is not None else None
-    c.request(method, f"/{_DOCKER_API}{path}", body=data,
+    c.request(method, _api(path), body=data,
               headers={"Content-Type": "application/json", "Host": "docker"})
     r = c.getresponse()
     raw = r.read()
@@ -80,11 +86,10 @@ def container_for(fab, node):
     with _CTR_LOCK:
         if node in _CTR_CACHE:
             return _CTR_CACHE[node]
-    try:
-        st, arr = _docker_json("GET", "/containers/json?all=1")
-    except Exception:
-        return None
-    if st != 200 or not arr:
+    st, arr = _docker_json("GET", "/containers/json?all=1")   # raises on socket error
+    if st != 200:
+        raise RuntimeError(f"GET /containers/json -> HTTP {st}")
+    if not arr:
         return None
     hit = None
     for ctr in arr:
@@ -122,7 +127,7 @@ def docker_exec(container, argv, timeout=20):
         return 1, f"exec create failed (HTTP {st})"
     eid = ex["Id"]
     c = _UnixHTTPConnection(timeout=timeout)
-    c.request("POST", f"/{_DOCKER_API}/exec/{eid}/start",
+    c.request("POST", _api(f"/exec/{eid}/start"),
               body=json.dumps({"Detach": False, "Tty": False}).encode(),
               headers={"Content-Type": "application/json", "Host": "docker"})
     r = c.getresponse()
@@ -152,7 +157,7 @@ def docker_exec_tty(container):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(DOCKER_SOCK)
     body = json.dumps({"Detach": False, "Tty": True}).encode()
-    req = (f"POST /{_DOCKER_API}/exec/{eid}/start HTTP/1.1\r\nHost: docker\r\n"
+    req = (f"POST {_api('/exec/'+eid+'/start')} HTTP/1.1\r\nHost: docker\r\n"
            "Content-Type: application/json\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n"
            f"Content-Length: {len(body)}\r\n\r\n").encode() + body
     s.sendall(req)
@@ -615,7 +620,10 @@ class Handler(SimpleHTTPRequestHandler):
             fab = self._fab()
             node = body.get("node") or ""
             cmd = (body.get("cmd") or "").strip()
-            ctr = container_for(fab, node)
+            try:
+                ctr = container_for(fab, node)
+            except Exception as e:
+                return self._send_json({"error": f"docker API error: {e}"}, code=502)
             if not ctr:
                 return self._send_json({"error": "unknown node", "node": node}, code=404)
             if not cmd:
@@ -639,28 +647,34 @@ class Handler(SimpleHTTPRequestHandler):
         JSON text frames for {type:'resize',cols,rows}; we stream the TTY output
         back as binary frames. Requires the docker socket (console opt-in)."""
         self.close_connection = True
-        if not docker_available():
-            return self._send_json({"error": "console disabled"}, code=503)
-        ctr = container_for(self._fab(), node)
-        if not ctr:
-            return self._send_json({"error": "unknown node", "node": node}, code=404)
         key = self.headers.get("Sec-WebSocket-Key")
         if not key:
             return self._send_json({"error": "bad websocket handshake"}, code=400)
+        # Upgrade FIRST, then report any problem AS TEXT over the socket, so the
+        # user sees the actual reason in the terminal instead of a silent close.
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", ws_accept_key(key))
         self.end_headers()
         cli = self.connection
+        def fail(msg):
+            ws_send(cli, ("\r\n[console] " + msg + "\r\n").encode(), 0x1)
+        if not docker_available():
+            return fail("disabled — mrc-gui has no docker socket "
+                        "(redeploy with -e gui_console=true)")
+        try:
+            ctr = container_for(self._fab(), node)
+        except Exception as e:
+            return fail(f"docker API error: {e}")
+        if not ctr:
+            return fail(f"no running container found for node '{node}'")
         try:
             eid, dsock, initial = docker_exec_tty(ctr)
         except Exception as e:
-            ws_send(cli, f"\r\n[console] exec failed: {e}\r\n".encode(), 0x1)
-            return
+            return fail(f"exec into {ctr} failed: {e}")
         if not dsock:
-            ws_send(cli, b"\r\n[console] could not open a shell on this node\r\n", 0x1)
-            return
+            return fail(f"could not open a shell on {ctr}")
         if initial:
             ws_send(cli, initial, 0x2)
         self._bridge(cli, dsock, eid)
