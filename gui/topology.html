@@ -72,6 +72,27 @@
   .links-list{margin-top:6px;font-size:11.5px;color:var(--dim)}
   .links-list div{padding:3px 0;border-top:1px solid var(--rule)}
   .links-list b{color:var(--ink);font-weight:600}
+  /* node actions + config viewer + maintenance */
+  .panel-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}
+  .btn{background:#16212c;color:var(--ink);border:1px solid var(--rule);border-radius:6px;
+       padding:5px 10px;font:inherit;font-size:11.5px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)}
+  .btn.warn{border-color:#8a5a30;color:#f0b070}
+  .btn.warn:hover{background:#241606}
+  .btn.on{background:#3a1a0e;border-color:#f0a040;color:#ffce88}
+  .cfgbox{margin-top:14px}
+  .cfg-meta{color:var(--dim);font-size:10.5px;margin:4px 0 6px}
+  .cfg-meta b{color:var(--ink)}
+  .cfg-meta a{color:var(--leaf);cursor:pointer}
+  pre.cfg{background:#070c11;border:1px solid var(--rule);border-radius:6px;padding:10px 12px;
+          margin:0;max-height:300px;overflow:auto;font-size:11px;line-height:1.5;
+          color:#cfe0f0;white-space:pre}
+  .node.bypassed rect,.node.bypassed circle{stroke:#ff6a6a;stroke-width:2.6;stroke-dasharray:4 3}
+  .node.bypassed text{fill:#ff9a9a}
+  .maint{font-size:11.5px;color:#f0a060}
+  .maint b{color:#ffd090;font-weight:600}
+  .draintag{color:#f0a060;font-size:10px;border:1px solid #7a4a20;border-radius:4px;
+            padding:1px 6px;margin-left:6px;vertical-align:1px}
   .legend{display:flex;gap:16px;align-items:center;margin-top:14px;font-size:11px;color:var(--dim)}
   .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
   .controls{display:flex;gap:8px;align-items:center}
@@ -126,6 +147,7 @@
 <header>
   <h1>MRC <b>SRv6</b> Fabric</h1>
   <span class="sub" id="fabricName">loading…</span>
+  <span class="maint" id="maint"></span>
   <div class="spacer"></div>
   <span class="stat" id="counts"></span>
   <div class="controls">
@@ -133,6 +155,7 @@
       <label for="file">load fabric_vars.json</label>
       <input type="file" id="file" accept=".json">
     </span>
+    <button id="dlcfg" title="Download every node config as a .tar.gz">⬇ configs</button>
     <button id="fit">Fit</button>
   </div>
 </header>
@@ -311,6 +334,7 @@ function render(data){
   EDGES=edges;
   window._fit=()=>fit(svg);
   fit(svg);
+  renderBypass();     // re-mark bypassed nodes after a fresh render
   rebuildPaths();
 }
 
@@ -365,15 +389,65 @@ function showInfo(name,nodes){
   if(nd.loopback) kv.push(["loopback",nd.loopback]);
   if(nd.srv6&&nd.srv6.locator) kv.push(["locator",nd.srv6.locator]);
   if(nd.kind) kv.push(["kind",nd.kind]);
+  const bypassed=BYPASS.has(name);
+  const nlinks=(DATA.links||[]).filter(l=>l.a.split(":")[0]===name||l.b.split(":")[0]===name).length;
   const p=document.getElementById("panel"); p.className="";
   p.innerHTML=
     `<div class="card">
-       <div class="name">${name}</div>
+       <div class="name">${name}${bypassed?'<span class="draintag">bypassed</span>':''}</div>
        <span class="pill ${nd.role}">${nd.role}</span>
        <div class="kv">${kv.map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join("")}</div>
+       <div class="panel-actions">
+         <button class="btn ${bypassed?'on':'warn'}" id="bypassBtn">${bypassed?'● Restore node':'⏻ Bypass (drain)'}</button>
+       </div>
      </div>
-     <h2>Links (${links?(DATA.links||[]).filter(l=>l.a.split(":")[0]===name||l.b.split(":")[0]===name).length:0})</h2>
-     <div class="links-list">${links||'<div style="color:var(--dim)">none</div>'}</div>`;
+     <h2>Links (${nlinks})</h2>
+     <div class="links-list">${links||'<div style="color:var(--dim)">none</div>'}</div>
+     <div class="cfgbox">
+       <h2>Config</h2>
+       <div class="cfg-meta" id="cfgMeta">loading…</div>
+       <pre class="cfg" id="cfgPre" style="display:none"></pre>
+     </div>`;
+  const bb=document.getElementById("bypassBtn");
+  if(bb) bb.addEventListener("click",()=>toggleBypass(name));
+  loadConfig(name);
+}
+
+// ---- feature 5: maintenance bypass (drain traffic off a node) ----
+let BYPASS=new Set();
+function renderBypass(){
+  Object.entries(byName).forEach(([n,g])=>g.classList.toggle("bypassed",BYPASS.has(n)));
+  const m=document.getElementById("maint");
+  if(m){ const a=[...BYPASS]; m.innerHTML=a.length?`⚠ maintenance drain: <b>${a.join(", ")}</b>`:""; }
+}
+function toggleBypass(name){
+  const on=!BYPASS.has(name);
+  fetch("/api/bypass",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({node:name,on})})
+    .then(r=>r.json()).then(d=>{ BYPASS=new Set(d.nodes||[]); renderBypass();
+      if(pinned===name) showInfo(name,(DATA&&DATA.nodes)||{}); })
+    .catch(()=>{ const m=document.getElementById("cfgMeta"); if(m) m.textContent="bypass needs the live backend (static server?)"; });
+}
+
+// ---- feature 2: per-node config viewer (+ per-node download) ----
+function loadConfig(name){
+  const meta=document.getElementById("cfgMeta"), pre=document.getElementById("cfgPre");
+  if(!meta||!pre) return;
+  fetch("/api/config?node="+encodeURIComponent(name),{cache:"no-store"})
+    .then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{
+      meta.innerHTML=`<b>${d.kind}</b> · <a id="cfgDl">download</a>`;
+      pre.textContent=d.text; pre.style.display="block";
+      const dl=document.getElementById("cfgDl");
+      if(dl) dl.addEventListener("click",()=>{
+        const ext=(d.kind||"").indexOf("json")>=0?".json":".conf";
+        const b=new Blob([d.text],{type:"text/plain"}), u=URL.createObjectURL(b);
+        const a=document.createElement("a"); a.href=u; a.download=name+ext; a.click();
+        URL.revokeObjectURL(u);
+      });
+    })
+    .catch(e=>{ meta.textContent = e===404 ? "no config on file for this node"
+                                           : "config unavailable (static server / file://)"; });
 }
 
 // ---------- paths table (test-probe health) ----------
@@ -546,7 +620,8 @@ function ago(ts){ const s=Math.max(0,Math.round(Date.now()/1000-ts)); return s<2
 async function pollMesh(){
   try{
     const r=await fetch('/api/mesh',{cache:'no-store'});
-    if(r.ok){ MESH=await r.json(); backendOk=true; }
+    if(r.ok){ MESH=await r.json(); backendOk=true;
+      BYPASS=new Set((MESH&&MESH.bypass)||[]); renderBypass(); }
     else backendOk=false;
   }catch(e){ backendOk=false; }   // static server / file:// — keep inventory view
   rebuildPaths();
@@ -571,6 +646,7 @@ function fit(svg){
   svg.setAttribute("height",vb.height*s);
 }
 document.getElementById("fit").addEventListener("click",()=>window._fit&&window._fit());
+document.getElementById("dlcfg").addEventListener("click",()=>{ location.href="/api/configs.tar.gz"; });
 window.addEventListener("resize",()=>window._fit&&window._fit());
 boot();
 pollMesh();                         // live probe health (no-op when no backend)

@@ -31,7 +31,7 @@ Usage:
   python3 gui/server.py [--port 8080] [--root .] [--vars fabric_vars.json]
 """
 
-import argparse, json, os, threading, time
+import argparse, io, json, os, tarfile, threading, time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -39,6 +39,7 @@ from urllib.parse import urlparse, parse_qs
 # ---- live state ------------------------------------------------------------
 _LOCK = threading.Lock()
 _REPORTS = {}          # host -> {"ts","received_at","peers":[...],"weigher":{...}}
+_BYPASS = set()        # node names an operator has drained for maintenance
 _STOP = threading.Event()
 
 # ---- fabric_vars.json (reloaded on mtime change) ---------------------------
@@ -95,10 +96,19 @@ def decap_sid_for(fab, src):
     return None
 
 
+def path_nodes(p):
+    """The fabric nodes a path traverses (spine + both leaves), for maintenance
+    drain: bypassing any of them drains the path."""
+    return {n for n in (p.get("spine"), p.get("src_leaf"), p.get("dst_leaf")) if n}
+
 def plan_for(fab, src):
     """The per-path probe plan for one source host: every path whose src is this
-    host, shaped for the NIC's /api/mesh-plan consumer."""
+    host, shaped for the NIC's /api/mesh-plan consumer. `drained` marks a path
+    that transits an operator-bypassed node — the NIC keeps probing it but steers
+    data traffic off it."""
     out = []
+    with _LOCK:
+        bypass = set(_BYPASS)
     for p in (fab.get("paths") or []):
         if p.get("src") != src:
             continue
@@ -107,6 +117,7 @@ def plan_for(fab, src):
             "spine": p.get("spine"), "path_id": p["path_id"],
             "fwmark": p["fwmark"], "probe_sid": p["usid"], "usid": p["usid"],
             "plane": p.get("plane"),   # which underlay plane this path egresses (dual-plane)
+            "drained": bool(bypass & path_nodes(p)),
         })
     return out
 
@@ -126,6 +137,63 @@ def underlays_for(fab, src):
         if itf.get("name") and itf.get("gateway"):
             out[str(pl)] = {"iface": itf["name"], "gateway": itf["gateway"]}
     return out
+
+# ---- node config (view + download) -----------------------------------------
+# Node names come from fabric_vars, so a request can only ever name a real node
+# (whitelist) — never an arbitrary path. Configs are read from the repo the GUI
+# already serves read-only: frr/<node>/frr.conf for switches, mrc-nic/<node>.json
+# for the GPU virtual NICs, with the SONiC config/<node>/ tree as a fallback.
+def nodes_index(fab):
+    """[{name, role, plane, has_config}] for every fabric node, for the picker."""
+    out = []
+    for name, nd in (fab.get("nodes") or {}).items():
+        out.append({"name": name, "role": nd.get("role"),
+                    "plane": nd.get("plane"), "index": nd.get("index")})
+    out.sort(key=lambda n: (n.get("role") or "", n.get("plane") or 0, n.get("index") or 0))
+    return out
+
+def _config_candidates(root, name, role):
+    if role == "gpu":
+        return [("mrc-nic profile (json)", os.path.join(root, "mrc-nic", f"{name}.json"))]
+    return [("frr.conf", os.path.join(root, "frr", name, "frr.conf")),
+            ("config_db.json", os.path.join(root, "config", name, "config_db.json")),
+            ("frr.conf", os.path.join(root, "config", name, "frr.conf"))]
+
+def node_config(fab, root, name):
+    """(kind, text) for a node's config, or (None, None) if the node is unknown
+    (not in fabric_vars) or no config file exists."""
+    nd = (fab.get("nodes") or {}).get(name)
+    if nd is None:
+        return None, None
+    for kind, p in _config_candidates(root, name, nd.get("role")):
+        try:
+            with open(p) as f:
+                return kind, f.read()
+        except OSError:
+            continue
+    return None, None
+
+def configs_tgz_bytes(root):
+    """A .tar.gz of every text config the fabric ships: the frr/ and SONiC
+    config/ trees, the per-GPU mrc-nic profiles, and the topology descriptors.
+    The mrc-nic binary is skipped (only *.json profiles are included)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for sub in ("frr", "config"):
+            d = os.path.join(root, sub)
+            if os.path.isdir(d):
+                tar.add(d, arcname=sub)
+        nicdir = os.path.join(root, "mrc-nic")
+        if os.path.isdir(nicdir):
+            for fn in sorted(os.listdir(nicdir)):
+                if fn.endswith(".json"):
+                    tar.add(os.path.join(nicdir, fn), arcname=os.path.join("mrc-nic", fn))
+        for fn in ("fabric_vars.json", "srv6lab.clab.yml", "address_plan.json",
+                   "fabric_address_map.txt"):
+            fp = os.path.join(root, fn)
+            if os.path.isfile(fp):
+                tar.add(fp, arcname=fn)
+    return buf.getvalue()
 
 # ---- health join -----------------------------------------------------------
 def _sample_index():
@@ -153,6 +221,8 @@ def mesh_view(fab):
     """Every path joined to its latest reported probe health. The full path list
     always renders (from fabric_vars); health is null until a NIC reports it."""
     samples, denied, srcinfo = _sample_index()
+    with _LOCK:
+        bypass = set(_BYPASS)
     now = time.time()
     paths = []
     for p in (fab.get("paths") or []):
@@ -173,14 +243,17 @@ def mesh_view(fab):
                 "err": s.get("err"),
                 "age_s": rep_age,
             }
-        paths.append({**p, "health": health})
+        drained = bool(bypass & path_nodes(p))
+        paths.append({**p, "health": health, "drained": drained})
     return {"updated": now, "name": fab.get("name"), "shape": fab.get("shape"),
-            "sources": srcinfo, "n_reporting": len(srcinfo), "paths": paths}
+            "sources": srcinfo, "n_reporting": len(srcinfo),
+            "bypass": sorted(bypass), "paths": paths}
 
 # ---- HTTP ------------------------------------------------------------------
 class Handler(SimpleHTTPRequestHandler):
     server_version = "mrc-gui/1.0"
     vars_path = "fabric_vars.json"     # set per-process below
+    root_dir = "."                     # served web root (repo); set per-process below
 
     def log_message(self, fmt, *args):
         # quiet the per-request noise; keep it to one tidy line
@@ -207,6 +280,19 @@ class Handler(SimpleHTTPRequestHandler):
         except ValueError:
             return {}
 
+    def _send_tgz(self):
+        data = configs_tgz_bytes(self.root_dir)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Disposition",
+                         "attachment; filename=mrc-fabric-configs.tar.gz")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     def _fab(self):
         return load_fabric(self.vars_path) or {}
 
@@ -219,11 +305,27 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/mesh-plan":
             src = (parse_qs(u.query).get("src") or [""])[0]
             fab = self._fab()
+            with _LOCK:
+                bypass = sorted(_BYPASS)
             return self._send_json({"src": src, "decap_sid": decap_sid_for(fab, src),
                                     "underlays": underlays_for(fab, src),
+                                    "bypass": bypass,
                                     "paths": plan_for(fab, src)})
         if path == "/api/mesh":
             return self._send_json(mesh_view(self._fab()))
+        if path == "/api/nodes":
+            return self._send_json({"nodes": nodes_index(self._fab())})
+        if path == "/api/config":
+            node = (parse_qs(u.query).get("node") or [""])[0]
+            kind, text = node_config(self._fab(), self.root_dir, node)
+            if text is None:
+                return self._send_json({"error": "no config for node", "node": node}, code=404)
+            return self._send_json({"node": node, "kind": kind, "text": text})
+        if path == "/api/configs.tar.gz":
+            return self._send_tgz()
+        if path == "/api/bypass":
+            with _LOCK:
+                return self._send_json({"nodes": sorted(_BYPASS)})
         if path == "/api/reports":           # debug: raw posted health
             with _LOCK:
                 return self._send_json(_REPORTS)
@@ -252,6 +354,23 @@ class Handler(SimpleHTTPRequestHandler):
                                       "peers": body.get("peers") or [],
                                       "weigher": body.get("weigher") or {}}
             return self._send_json({"ok": True})
+        if path == "/api/bypass":
+            # Maintenance drain: mark node(s) so NICs steer traffic around them.
+            # Accepts {"node": "<name>", "on": true|false} to toggle one, or
+            # {"nodes": [...]} to set the whole list. Only real fabric nodes are
+            # accepted (validated against fabric_vars).
+            valid = set((self._fab().get("nodes") or {}).keys())
+            with _LOCK:
+                if "nodes" in body and isinstance(body["nodes"], list):
+                    _BYPASS.clear()
+                    _BYPASS.update(n for n in body["nodes"] if n in valid)
+                elif body.get("node") in valid:
+                    if body.get("on", True):
+                        _BYPASS.add(body["node"])
+                    else:
+                        _BYPASS.discard(body["node"])
+                nodes = sorted(_BYPASS)
+            return self._send_json({"ok": True, "nodes": nodes})
         # NIC also posts these to a controller; accept and drop so it doesn't error.
         if path in ("/api/metrics", "/api/ev-stats", "/api/probe-tx",
                     "/api/jobs/status"):
@@ -292,6 +411,7 @@ def main():
 
     root = os.path.abspath(a.root)
     Handler.vars_path = a.vars or os.path.join(root, "fabric_vars.json")
+    Handler.root_dir = root
     fab = load_fabric(Handler.vars_path)
     npaths = len((fab or {}).get("paths") or [])
     print(f"[gui] root={root}")
