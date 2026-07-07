@@ -640,13 +640,18 @@ function renderFormula(name){
       const homeLeaf=Math.floor((sg-1)/K)+1, local=((sg-1)%K)+1;
       const der=d.derived||[];
       const nEV=der.reduce((a,b)=>a+((b.active_evs||[]).length),0);
+      // drain state travels with the mesh-plan; a carrier is drained if its spine
+      // node OR its whole plane is bypassed (still programmed + probed, just no data).
+      const bypN=new Set(d.bypass||[]), bypP=new Set((d.bypass_planes||[]).map(Number));
+      const isDr=e=>bypN.has(e.spine)||bypP.has(Number(e.plane));
+      const nDr=der.reduce((a,b)=>a+(b.active_evs||[]).filter(isDr).length,0);
       const rows=[
         ["tenant",d.tenant],["decap SID",d.decap_sid||'—'],["gateway",d.gateway||'—'],
         ["block",f.block],
         ["this GPU",`gpu${sg} → home-leaf ${homeLeaf}, local ${local}`],
         ["shape",`${f.planes} plane · ${f.spines} spine · ${K} GPU/leaf · ${f.gpus} GPU`],
         ["peers",f.peers?('['+f.peers.map(p=>'gpu'+p).join(', ')+']'):('full mesh ('+(f.gpus-1)+')')],
-        ["derives",`${nEV} carriers → ${der.length} peer(s)`],
+        ["derives",`${nEV} carriers → ${der.length} peer(s)`+(nDr?` · <span style="color:#f0a060">${nDr} drained</span>`:'')],
       ];
       let html='<div class="kv">'+rows.map(([k,v])=>
         `<div class="k">${k}</div><div class="v" style="font-family:monospace;word-break:break-all">${v}</div>`).join("")+'</div>';
@@ -655,10 +660,13 @@ function renderFormula(name){
           '<table style="width:100%;font-size:11px;border-collapse:collapse">';
         let shown=0;
         for(const b of der){ for(const e of (b.active_evs||[])){ if(shown++>=6) break;
-          html+=`<tr><td style="color:#8fb0d0;padding-right:6px">${b.flow.dst}</td>`+
-            `<td style="color:var(--dim);padding-right:6px">${e.path_id}</td>`+
+          const dr=isDr(e);
+          html+=`<tr style="${dr?'opacity:.55':''}"><td style="color:#8fb0d0;padding-right:6px">${b.flow.dst}</td>`+
+            `<td style="color:var(--dim);padding-right:6px">${e.path_id}${dr?' <span class="draintag">drained</span>':''}</td>`+
             `<td style="color:#8fd0b0;font-family:monospace">${e.usid}</td></tr>`; } if(shown>=6) break; }
         html+='</table>'+(nEV>6?`<div style="color:var(--dim);font-size:11px;margin-top:3px">… ${nEV-6} more in the probe table</div>`:'');
+        if(nDr) html+='<div style="color:var(--dim);font-size:10.5px;margin-top:4px">drained = a bypassed spine/plane; '+
+          'the carrier stays programmed &amp; probed but carries no data traffic.</div>';
       }
       box.innerHTML=html;
     }).catch(()=>{ box.innerHTML='<span style="color:var(--dim)">needs the live backend</span>'; });
