@@ -289,6 +289,21 @@ def partner_map(cfg, n):
             for r, pk in edges.items()}
 
 
+def groups_map(groups, hosts):
+    """Explicit collectives: each group is all-to-all internally; GPUs in no group
+    get NO partners (isolated — no carriers, no probing). `hosts` = valid names.
+    Use a 2-GPU group to make just those two talk (e.g. [["gpu1","gpu4"]])."""
+    valid = set(hosts)
+    cmap = {g: [] for g in hosts}                 # present-but-isolated by default
+    for grp in (groups or []):
+        members = [m for m in (grp or []) if m in valid]
+        for a in members:
+            peers = {b for b in members if b != a}
+            have = {e["peer"] for e in cmap[a]}
+            cmap[a].extend({"peer": b, "kind": "grp"} for b in sorted(peers - have))
+    return cmap
+
+
 def collectives_stats(cmap, n):
     """Summary for the GUI: peers/GPU and reduction vs the full mesh."""
     per = [len(v) for v in cmap.values()]
@@ -604,7 +619,13 @@ class Handler(SimpleHTTPRequestHandler):
         u = urlparse(self.path)
         path = u.path
         if path == "/api/topology":
-            return self._send_json({"hosts": gpu_hosts(self._fab())})
+            src = (parse_qs(u.query).get("src") or [""])[0]
+            hosts = gpu_hosts(self._fab())
+            _cfg, cmap = _collectives_now()
+            if src and cmap:   # scope discovery to this host's collective partners
+                partners = {e["peer"] for e in cmap.get(src, [])}
+                hosts = [h for h in hosts if h.get("name") in partners]
+            return self._send_json({"hosts": hosts})
         if path == "/api/mesh-plan":
             src = (parse_qs(u.query).get("src") or [""])[0]
             fab = self._fab()
@@ -747,11 +768,19 @@ class Handler(SimpleHTTPRequestHandler):
             #   {"clear": true}                 back to full mesh
             # NICs re-pull /api/mesh-plan (~2s) and reprogram + reprobe just
             # their partners. Validated against the fabric's GPU count.
-            n = len(gpu_hosts(self._fab()))
+            hosts = [h["name"] for h in gpu_hosts(self._fab())]
+            n = len(hosts)
             if body.get("clear"):
                 with _LOCK:
                     _COLLECTIVES["config"] = None; _COLLECTIVES["map"] = {}
                 return self._send_json({"ok": True, "cleared": True})
+            if isinstance(body.get("groups"), list):
+                # explicit partner groups (all-to-all within each; others isolated)
+                cmap = groups_map(body["groups"], hosts)
+                with _LOCK:
+                    _COLLECTIVES["config"] = {"groups": body["groups"]}; _COLLECTIVES["map"] = cmap
+                return self._send_json({"ok": True, "config": {"groups": body["groups"]},
+                                        "map": cmap, "stats": collectives_stats(cmap, n)})
             cfg = {k: int(body.get(k, 1) or 1) for k in ("tp", "dp", "pp", "ep")}
             if cfg["tp"] * cfg["dp"] * cfg["pp"] != n:
                 return self._send_json(

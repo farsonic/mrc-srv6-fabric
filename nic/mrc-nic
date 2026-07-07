@@ -1338,11 +1338,13 @@ class MeshHealth(threading.Thread):
         self._last_plan = time.time()
 
     def _refresh_peers(self):
-        # cheap: only re-pull topology every ~30s
-        if time.time() - self._last_topo < 30 and self.peers:
+        # re-pull topology every ~10s. Pass src so the controller can scope the
+        # peer list to this host's collective partners (an isolated GPU then sees
+        # no peers and goes fully silent instead of ICMP-probing the whole fabric).
+        if time.time() - self._last_topo < 10 and self.peers:
             return
         try:
-            with urlreq.urlopen(f"{self.controller}/api/topology", timeout=4) as r:
+            with urlreq.urlopen(f"{self.controller}/api/topology?src={self.host}", timeout=4) as r:
                 topo = json.loads(r.read())
         except Exception:
             return
@@ -1634,6 +1636,17 @@ class MeshHealth(threading.Thread):
                               + (f"; errors: {', '.join(e for e in errs if e)}" if errs else ""),
                               file=sys.stderr)
                         first = False
+                elif self.state is not None:
+                    # isolated (no partners / empty plan): publish an empty sweep so
+                    # `status`, the state file and the GUI don't show STALE health
+                    # from before this GPU lost all its collective partners.
+                    self.state.update("mesh", last_sweep_at=time.time(),
+                                      per_path=False, peers_total=0, peers_up=0, samples=[])
+                    self.state.set("ev_weights", {})
+                    try:
+                        self._post([], weigher=None)
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"[mesh] sweep error (continuing): {e}", file=sys.stderr)
             # Wait MESH_PERIOD before the next TWAMP sweep, but in 1s chunks so a
