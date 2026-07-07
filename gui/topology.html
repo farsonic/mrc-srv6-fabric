@@ -187,19 +187,25 @@
   .hdrag:hover,.hdrag.drag{background:var(--accent);opacity:1}
   body.resizing{cursor:col-resize;user-select:none}
   body.resizing *{pointer-events:none}
-  /* hover link-detail: interfaces + IPv6 on each link, floats over topology */
-  .linkdetail{position:absolute;left:14px;bottom:14px;max-width:min(72%,780px);max-height:44%;
-    overflow:auto;background:rgba(9,15,21,.97);border:1px solid var(--rule);border-radius:8px;
-    box-shadow:0 12px 34px rgba(0,0,0,.5);padding:8px 10px;display:none;z-index:6}
-  .linkdetail.show{display:block}
-  .linkdetail .ld-title{font-size:11px;letter-spacing:.08em;text-transform:uppercase;
-    color:var(--dim);margin:0 0 6px 2px}
-  .linkdetail table{border-collapse:collapse;font-size:11px;width:100%}
-  .linkdetail th{color:var(--dim);font-weight:600;text-align:left;padding:2px 9px;white-space:nowrap}
-  .linkdetail td{padding:2px 9px;white-space:nowrap}
-  .linkdetail td.if{color:var(--leaf)} .linkdetail td.ip{color:#bcd0e4;font-variant-numeric:tabular-nums}
-  .linkdetail td.nd b{color:var(--ink)} .linkdetail .arrow{color:var(--dim);text-align:center}
-  .linkdetail tr.hop td{border-top:1px solid #14202b}
+  /* hover detail: link info + SRv6 carrier progression, floats over topology */
+  .hoverdetail{position:absolute;left:14px;bottom:14px;max-width:calc(100% - 28px);
+    display:none;gap:10px;align-items:flex-end;flex-wrap:wrap;z-index:6}
+  .hoverdetail.show{display:flex}
+  .linkdetail,.carrierdetail{max-height:46vh;overflow:auto;background:rgba(9,15,21,.97);
+    border:1px solid var(--rule);border-radius:8px;box-shadow:0 12px 34px rgba(0,0,0,.5);padding:8px 10px}
+  .carrierdetail{display:none}
+  .ld-title{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:0 0 6px 2px}
+  .hoverdetail table{border-collapse:collapse;font-size:11px;width:100%}
+  .hoverdetail th{color:var(--dim);font-weight:600;text-align:left;padding:2px 9px;white-space:nowrap}
+  .hoverdetail td{padding:2px 9px;white-space:nowrap}
+  .hoverdetail td.if{color:var(--leaf)} .hoverdetail td.ip{color:#bcd0e4;font-variant-numeric:tabular-nums}
+  .hoverdetail td.nd b{color:var(--ink)} .hoverdetail .arrow{color:var(--dim);text-align:center}
+  .hoverdetail tr.hop td{border-top:1px solid #14202b}
+  /* carrier progression box */
+  .carrierdetail td.act{color:var(--dim)} .carrierdetail td.da{color:#8fd0b0;font-variant-numeric:tabular-nums}
+  .carrierdetail tr.shift td{background:#241606}
+  .carrierdetail tr.shift td.act{color:var(--spine)}
+  .carrierdetail tr.decap td.act{color:var(--gpu)} .carrierdetail td.da .zz{color:#5a6b7a}
 </style>
 <link rel="stylesheet" href="/gui/vendor/xterm.css">
 <script src="/gui/vendor/xterm.js"></script>
@@ -228,7 +234,10 @@
   <div class="stage" id="stage">
     <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
   </div>
-  <div class="linkdetail" id="linkDetail"></div>
+  <div class="hoverdetail" id="hoverDetail">
+    <div class="linkdetail" id="linkDetail"></div>
+    <div class="carrierdetail" id="carrierDetail"></div>
+  </div>
   <div class="vdrag" id="vdrag" title="drag to resize the inspector"></div>
   <aside id="aside">
     <h2>Inspector</h2>
@@ -704,11 +713,67 @@ function pathLinks(rec){
   for(let i=0;i+1<hops.length;i++){ const lk=findLink(hops[i],hops[i+1]); if(lk) out.push(lk); }
   return out;
 }
+// ---- SRv6 uSID carrier progression (how the outer DA shifts hop-by-hop) ----
+function v6expand(a){                 // "fcbb:bb00:1101:e002:9002:1::" -> 8 ints
+  a=(a||'').split('/')[0];
+  let head,tail;
+  if(a.indexOf('::')>=0){ const p=a.split('::'); head=p[0]; tail=p[1]; }
+  else { head=a; tail=null; }
+  const hh=head?head.split(':').filter(x=>x!==''):[];
+  const tt=(tail!==null&&tail!=='')?tail.split(':').filter(x=>x!==''):[];
+  const mid=Math.max(0,8-hh.length-tt.length);
+  const parts=[...hh,...Array(mid).fill('0'),...tt];
+  while(parts.length<8) parts.push('0');
+  return parts.slice(0,8).map(x=>parseInt(x||'0',16));
+}
+function v6compress(hx){               // 8 ints -> compressed string, marking the ::
+  const s=hx.map(x=>x.toString(16));
+  let bi=-1,bl=0,i=0;                  // longest run of zeros
+  while(i<8){ if(s[i]==='0'){ let j=i; while(j<8&&s[j]==='0') j++; if(j-i>bl){bl=j-i;bi=i;} i=j; } else i++; }
+  if(bl<2) return s.join(':');
+  return (s.slice(0,bi).join(':')||'')+'::'+(s.slice(bi+bl).join(':')||'');
+}
+function usidShift(carrier){           // consume one 32-bit uSID after the 32-bit block
+  const h=v6expand(carrier);
+  return v6compress([h[0],h[1],h[4],h[5],h[6],h[7],0,0]);
+}
+// The carrier's outer DA at each node of the path, and the SRv6 action there.
+function carrierProgression(rec){
+  const c=rec.usid;
+  if(!rec.spine){                      // same-leaf: single uSID (dst decap block), no shift
+    return [
+      {node:rec.src,      act:'encap · push SRH', da:c},
+      {node:rec.src_leaf, act:'transit',          da:c},
+      {node:rec.dst,      act:'End.DT6 · decap',  da:null, decap:true},
+    ];
+  }
+  const shifted=usidShift(c);
+  return [
+    {node:rec.src,      act:'encap · push SRH',      da:c},
+    {node:rec.src_leaf, act:'transit',               da:c},
+    {node:rec.spine,    act:'End.X · uSID shift',    da:shifted, shift:true},
+    {node:rec.dst_leaf, act:'transit',               da:shifted},
+    {node:rec.dst,      act:'End.DT6 · decap',       da:null, decap:true},
+  ];
+}
+function showCarrierDetail(rec){
+  const box=document.getElementById('carrierDetail'); if(!box) return;
+  if(!rec||!rec.usid){ box.style.display='none'; return; }
+  const rows=carrierProgression(rec).map(h=>{
+    const da = h.da==null ? '<span class="zz">inner packet → '+rec.dst+'</span>' : h.da;
+    return `<tr class="${h.shift?'shift':(h.decap?'decap':'')}"><td class="nd"><b>${h.node}</b></td>`+
+           `<td class="act">${h.act}</td><td class="da">${da}</td></tr>`;
+  }).join('');
+  box.innerHTML=`<div class="ld-title">SRv6 carrier · outer DA per hop</div><table>`+
+    `<tr><th>node</th><th>action</th><th>outer destination (carrier uSID)</th></tr>`+rows+`</table>`;
+  box.style.display='block';
+}
 let ldTimer=null;
-function showLinkDetail(title,links){
+function showLinkDetail(title,links,rec){
   clearTimeout(ldTimer);
-  const box=document.getElementById('linkDetail'); if(!box) return;
-  if(!links||!links.length){ box.classList.remove('show'); return; }
+  const wrap=document.getElementById('hoverDetail'), box=document.getElementById('linkDetail');
+  if(!wrap||!box) return;
+  if(!links||!links.length){ wrap.classList.remove('show'); return; }
   const rows=links.map(l=>
     `<tr class="hop"><td class="nd"><b>${l.aNode}</b></td><td class="if">${l.aIf||'·'}</td>`+
     `<td class="ip">${ifAddr(l.aNode,l.aIf)||'·'}</td><td class="arrow">↔</td>`+
@@ -717,12 +782,13 @@ function showLinkDetail(title,links){
   box.innerHTML=`<div class="ld-title">${title}</div><table>`+
     `<tr><th>node</th><th>if</th><th>IPv6</th><th></th><th>node</th><th>if</th><th>IPv6</th></tr>`+
     rows+`</table>`;
-  box.classList.add('show');
+  showCarrierDetail(rec);              // path hover -> carrier box; node hover (no rec) -> hidden
+  wrap.classList.add('show');
 }
 function scheduleHideLD(){ clearTimeout(ldTimer);
-  ldTimer=setTimeout(()=>{ const b=document.getElementById('linkDetail'); if(b) b.classList.remove('show'); },400); }
+  ldTimer=setTimeout(()=>{ const b=document.getElementById('hoverDetail'); if(b) b.classList.remove('show'); },400); }
 function hideLinkDetail(){ clearTimeout(ldTimer);
-  const b=document.getElementById('linkDetail'); if(b) b.classList.remove('show'); }
+  const b=document.getElementById('hoverDetail'); if(b) b.classList.remove('show'); }
 function highlightPath(rec){
   if(!EDGES) return;
   const seq=pathHops(rec), want=new Set(), nodes=new Set(seq);
@@ -846,13 +912,13 @@ function pathTitle(rec){
 function wireRow(tr,rec,key){
   if(key===selPathKey) tr.classList.add('sel');
   tr.addEventListener('mouseenter',()=>{ if(!selPathKey) highlightPath(rec);
-    showLinkDetail(pathTitle(rec), pathLinks(rec)); });
+    showLinkDetail(pathTitle(rec), pathLinks(rec), rec); });
   tr.addEventListener('mouseleave',()=>{ if(!selPathKey) clearPathHi(); scheduleHideLD(); });
   tr.addEventListener('click',()=>{
-    if(selPathKey===key){ selPathKey=null; tr.classList.remove('sel'); clearPathHi(); hideLinkDetail(true); }
+    if(selPathKey===key){ selPathKey=null; tr.classList.remove('sel'); clearPathHi(); hideLinkDetail(); }
     else{ selPathKey=key;
       document.querySelectorAll('#pathsTable tr.sel').forEach(r=>r.classList.remove('sel'));
-      tr.classList.add('sel'); highlightPath(rec); showLinkDetail(pathTitle(rec), pathLinks(rec)); }
+      tr.classList.add('sel'); highlightPath(rec); showLinkDetail(pathTitle(rec), pathLinks(rec), rec); }
   });
 }
 
@@ -923,9 +989,9 @@ document.getElementById("runBtn").addEventListener("click",runCmd);
 document.getElementById("runInput").addEventListener("keydown",e=>{ if(e.key==="Enter") runCmd(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&
   document.getElementById("consoleModal").classList.contains("open")) closeConsole(); });
-// keep the link-detail panel open while the cursor is over it (so it's readable/scrollable)
+// keep the hover-detail panels open while the cursor is over them (readable/scrollable)
 (function(){
-  const box=document.getElementById("linkDetail");
+  const box=document.getElementById("hoverDetail");
   box.addEventListener("mouseenter",()=>clearTimeout(ldTimer));
   box.addEventListener("mouseleave",hideLinkDetail);
 })();
