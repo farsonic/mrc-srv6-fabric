@@ -115,7 +115,7 @@ ansible-playbook site-frr.yml \
 | `gpus_per_leaf` | GPUs attached to each leaf | `2`, `8` |
 | `leaves` | number of leaf switches | `2` |
 | `spines` | number of spine switches | `2` |
-| `planes` | number of parallel fabric planes | `1` (default), `2` |
+| `planes` | number of parallel (isolated) fabric planes | `1` (default), `2`, `4` |
 | `spec_mode` | `true` = NIC decap; `false` = leaf decap | `true` |
 | `gpu_image` | GPU host container image | `debian:bookworm` |
 | `switch_image` | FRR switch image | `quay.io/frrouting/frr:10.6.1` |
@@ -140,6 +140,54 @@ ansible-playbook site-frr.yml \
   -e gpus_per_leaf=8 -e leaves=8 -e spines=4 \
   -e spec_mode=true -e gpu_image=debian:bookworm
 ```
+
+### Single-, dual-, and four-plane fabrics
+
+The number of **isolated planes** is just `-e planes=N` — each GPU gets one NIC
+per plane, and each plane is its own leaf-spine CLOS. Everything else identical;
+`spec_mode=true` + `debian:bookworm` gives the full NIC-decap / dual-plane path
+set, GUI, console, and Edgeshark. Run each from `ansible/`, one topology at a
+time (`containerlab destroy` before switching plane count — see
+[Tear the lab down](#tear-the-lab-down)).
+
+**Single plane** — 4 GPUs (1 NIC each), 2 leaves + 2 spines, 20 paths:
+
+```bash
+ansible-playbook site-frr.yml \
+  -e planes=1 -e leaves=2 -e spines=2 -e gpus_per_leaf=2 \
+  -e spec_mode=true -e gpu_image=debian:bookworm \
+  -e do_gui=true -e gui_console=true -e do_edgeshark=true
+```
+
+**Two planes** — 4 GPUs (2 NICs each), 4 leaves + 4 spines, 40 paths:
+
+```bash
+ansible-playbook site-frr.yml \
+  -e planes=2 -e leaves=2 -e spines=2 -e gpus_per_leaf=2 \
+  -e spec_mode=true -e gpu_image=debian:bookworm \
+  -e do_gui=true -e gui_console=true -e do_edgeshark=true
+```
+
+**Four planes** — 4 GPUs (4 NICs each), 8 leaves + 8 spines, 80 paths:
+
+```bash
+ansible-playbook site-frr.yml \
+  -e planes=4 -e leaves=2 -e spines=2 -e gpus_per_leaf=2 \
+  -e spec_mode=true -e gpu_image=debian:bookworm \
+  -e do_gui=true -e gui_console=true -e do_edgeshark=true
+```
+
+| planes | GPUs | NICs/GPU | switches (leaf+spine) | test-probe paths |
+|--------|------|----------|-----------------------|------------------|
+| 1 | 4 | 1 | 4 | 20 |
+| 2 | 4 | 2 | 8 | 40 |
+| 4 | 4 | 4 | 16 | 80 |
+
+(Total GPUs = `leaves × gpus_per_leaf`; NICs per GPU = `planes`; switches =
+`(leaves + spines) × planes`.) After it comes up: GUI at
+`http://<host>:8080/gui/topology.html`, Edgeshark at `http://<host>:5001`. First
+boot on `debian:bookworm` installs tooling per GPU, so give the paths table a
+minute or two to fill.
 
 > **First boot on `debian:bookworm` is slower** — each GPU host installs
 > `iproute2`/`python3` on first start. Subsequent operations are fast.
@@ -355,18 +403,29 @@ can read the container netns).
 
 ## Tear the lab down
 
+`containerlab destroy` removes the fabric nodes (gpu/leaf/spine); the GUI and
+Edgeshark are separate **host** containers, so tear those down too:
+
 ```bash
 cd <repo-root>
-sudo containerlab destroy -t srv6lab.clab.yml --cleanup
-docker network rm srv6lab-mgmt 2>/dev/null || true
+sudo containerlab destroy -t srv6lab.clab.yml --cleanup   # fabric nodes + lab dir
+docker rm -f mrc-gui 2>/dev/null || true                  # topology GUI (if do_gui)
+docker compose -p edgeshark down 2>/dev/null || true      # Edgeshark (if do_edgeshark)
+docker network rm srv6lab-mgmt 2>/dev/null || true        # mgmt net, if it lingers
 ```
 
-`--cleanup` removes the lab directory and the per-node state. The
-`docker network rm` clears the management network if it lingers.
+`--cleanup` removes the lab directory and per-node state. Alternatively, let the
+playbook tear the extras down — re-run it with them disabled:
 
-To redeploy after editing the generator or NIC, destroy first, then run the
-`ansible-playbook` command again — the NIC binary is bind-mounted, so a redeploy
-(container recreate) is required to pick up a new build.
+```bash
+cd ansible
+ansible-playbook site-frr.yml -e do_gui=false -e do_edgeshark=false
+```
+
+**Switching plane count / redeploying:** destroy first, then run the
+`ansible-playbook` command again — only one topology (`srv6lab.clab.yml`) exists
+at a time, and the NIC binary is bind-mounted, so a container recreate is
+required to pick up a new build.
 
 ---
 
