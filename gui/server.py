@@ -32,10 +32,18 @@ Usage:
 """
 
 import argparse, base64, hashlib, http.client, io, json, os, select, socket, \
-       struct, tarfile, threading, time
+       struct, sys, tarfile, threading, time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+# shared uSID formula (repo root, next to gui/) — used to show each GPU the exact
+# carriers its descriptor expands to. Optional: absent on non-compute fabrics.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    import mrc_usid as _MRC_USID
+except Exception:
+    _MRC_USID = None
 
 # ---- optional Docker access (console feature, opt-in) ----------------------
 # The GUI reaches the node containers through the Docker Engine API over the
@@ -322,22 +330,31 @@ def groups_map(groups, hosts):
     {"members":[...],"pattern":"ring"}."""
     valid = set(hosts)
     cmap = {g: [] for g in hosts}                 # present-but-isolated by default
-    for grp in (groups or []):
+    for gi, grp in enumerate(groups or []):
         if isinstance(grp, dict):
             members = [m for m in (grp.get("members") or []) if m in valid]
             pattern = (grp.get("pattern") or "mesh").lower()
+            name = str(grp.get("name") or "").strip() or f"grp{gi + 1}"
         else:
-            members, pattern = [m for m in (grp or []) if m in valid], "mesh"
+            members, pattern, name = [m for m in (grp or []) if m in valid], "mesh", f"grp{gi + 1}"
         if pattern not in _PATTERNS:
             pattern = "mesh"
         for pair in _group_pairs(members, pattern):
             a, b = tuple(pair) if len(pair) == 2 else (None, None)
             for x, y in ((a, b), (b, a)):
                 if x and y and y not in {e["peer"] for e in cmap[x]}:
-                    cmap[x].append({"peer": y, "kind": pattern})
+                    cmap[x].append({"peer": y, "kind": pattern, "group": name})
     for g in cmap:
         cmap[g].sort(key=lambda e: e["peer"])
     return cmap
+
+
+def path_collective(cmap, src, dst):
+    """The named collective a (src,dst) path belongs to, if any."""
+    for e in cmap.get(src, []):
+        if e.get("peer") == dst:
+            return {"group": e.get("group"), "pattern": e.get("kind")}
+    return None
 
 
 def collectives_stats(cmap, n):
@@ -577,6 +594,7 @@ def mesh_view(fab):
     always renders (from fabric_vars); health is null until a NIC reports it."""
     samples, denied, srcinfo = _sample_index()
     bn, bp = _bypass_now()
+    _ccfg, cmap = _collectives_now()
     now = time.time()
     paths = []
     for p in (fab.get("paths") or []):
@@ -598,10 +616,14 @@ def mesh_view(fab):
                 "err": s.get("err"),
                 "age_s": rep_age,
             }
-        paths.append({**p, "health": health, "drained": is_drained(p, bn, bp)})
+        coll = path_collective(cmap, p["src"], p["dst"]) if cmap else None
+        paths.append({**p, "health": health, "drained": is_drained(p, bn, bp),
+                      "collective": (coll or {}).get("group"),
+                      "collective_pattern": (coll or {}).get("pattern")})
     return {"updated": now, "name": fab.get("name"), "shape": fab.get("shape"),
             "sources": srcinfo, "n_reporting": len(srcinfo),
-            "bypass": sorted(bn), "bypass_planes": sorted(bp), "paths": paths}
+            "bypass": sorted(bn), "bypass_planes": sorted(bp),
+            "collectives_active": bool(cmap), "paths": paths}
 
 # ---- HTTP ------------------------------------------------------------------
 class Handler(SimpleHTTPRequestHandler):
@@ -680,12 +702,20 @@ class Handler(SimpleHTTPRequestHandler):
                 if partners is not None:
                     # restrict the NIC's carriers + probing to the collective peers
                     fabblk["peers"] = sorted({int(p[3:]) for p in partners if p.startswith("gpu")})
-                return self._send_json({
+                resp = {
                     "src": src, "computed": True, "fabric": fabblk,
                     "tenant": desc.get("tenant"), "gateway": desc.get("gateway"),
                     "decap_sid": desc.get("decap_sid"),
                     "underlays": underlays_for(fab, src),
-                    "bypass": sorted(bn), "bypass_planes": sorted(bp)})
+                    "bypass": sorted(bn), "bypass_planes": sorted(bp)}
+                # expand=1: also return the carriers the formula derives from this
+                # descriptor (so the GUI can show inputs -> outputs for a GPU).
+                if (parse_qs(u.query).get("expand") or [""])[0] and _MRC_USID:
+                    try:
+                        resp["derived"] = _MRC_USID.expand({"fabric": fabblk})
+                    except Exception as e:
+                        resp["derived_error"] = str(e)
+                return self._send_json(resp)
             paths = plan_for(fab, src)
             if partners is not None:
                 pset = set(partners)

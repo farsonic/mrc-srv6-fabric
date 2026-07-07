@@ -407,13 +407,26 @@ pattern**, instead of a single rank-derived layout. Click GPUs → pick a patter
 Member order matters for ring/chain/star.
 
 ```bash
-# two independent jobs on one fabric: a mesh pair and a 4-GPU ring
+# two independent, NAMED jobs on one fabric: a mesh pair and a 4-GPU ring
 curl -X POST http://<host>:8080/api/collectives -d '{"groups":[
-  {"members":["gpu1","gpu2"],"pattern":"mesh"},
-  {"members":["gpu5","gpu6","gpu7","gpu8"],"pattern":"ring"}]}'
+  {"name":"tp-pair","members":["gpu1","gpu2"],"pattern":"mesh"},
+  {"name":"dp-ring","members":["gpu5","gpu6","gpu7","gpu8"],"pattern":"ring"}]}'
 
 # just two GPUs talking, nothing else
 curl -X POST http://<host>:8080/api/collectives -d '{"groups":[["gpu1","gpu4"]]}'
+```
+
+Each group can be **named** (GUI has a name field; auto `grp1`, `grp2` otherwise).
+The name shows as a **collective column in the probe table**, so you can see which
+job each path belongs to alongside its live health.
+
+**Per-GPU formula view.** Click any GPU in the GUI to see, in the inspector, the
+exact **descriptor fed into the formula** (block, planes/spines, GPUs-per-leaf,
+this GPU's home-leaf + local index, peer set) and the **carriers it derives** —
+inputs → outputs for that node. The API backs it directly:
+
+```bash
+curl -s "http://<host>:8080/api/mesh-plan?src=gpu1&expand=1"   # descriptor + derived carriers
 ```
 
 ---

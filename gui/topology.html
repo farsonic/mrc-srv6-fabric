@@ -178,6 +178,12 @@
   #collResult .kpp,#collResult .kchain{color:#5aa0f0}#collResult .kep,#collResult .kstar{color:#c98ff0}#collResult .kgrp{color:#5aa0f0}
   #collPattern{background:#0b1219;border:1px solid var(--rule);border-radius:6px;color:var(--ink);font-size:12.5px;padding:6px 8px}
   #collGroups .g .pat{font-size:11px;color:var(--dim);border:1px solid var(--rule);border-radius:10px;padding:1px 8px}
+  .colltag{font-size:10.5px;padding:1px 8px;border:1px solid var(--rule);border-radius:10px;white-space:nowrap}
+  .colltag.kmesh,.colltag.ktp{color:#8fd0b0;border-color:#2a5c4a}
+  .colltag.kring,.colltag.kdp{color:#f0a830;border-color:#6b4a1a}
+  .colltag.kchain,.colltag.kpp{color:#5aa0f0;border-color:#264a6b}
+  .colltag.kstar,.colltag.kep{color:#c98ff0;border-color:#4a2a6b}
+  .colltag.kgrp{color:#8fb0d0}
   .collsep{border-top:1px solid var(--rule);margin:16px 0 0;padding-top:14px}
   .chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
   .chips .chip{background:#0b1219;border:1px solid var(--rule);border-radius:14px;padding:4px 12px;
@@ -350,6 +356,8 @@
         </div>
         <div class="chips" id="collChips"></div>
         <div style="display:flex;gap:10px;align-items:center;margin:8px 0;flex-wrap:wrap">
+          <input id="collName" placeholder="name (optional)" autocomplete="off"
+                 style="background:#0b1219;border:1px solid var(--rule);border-radius:6px;color:var(--ink);font-size:12.5px;padding:6px 9px;width:130px">
           <select id="collPattern" title="how this group's GPUs communicate">
             <option value="mesh">all-to-all (TP/EP)</option>
             <option value="ring">ring (DP all-reduce)</option>
@@ -597,6 +605,8 @@ function showInfo(name,nodes){
      </div>
      <h2>Links (${nlinks})</h2>
      <div class="links-list">${links||'<div style="color:var(--dim)">none</div>'}</div>
+     ${nd.role==="gpu"?`<div class="cfgbox"><h2>SRv6 formula — inputs → carriers</h2>
+       <div id="formulaBox" style="font-size:12px;color:var(--dim)">loading…</div></div>`:""}
      <div class="cfgbox">
        <h2>Config</h2>
        <div class="cfg-meta" id="cfgMeta">loading…</div>
@@ -607,6 +617,42 @@ function showInfo(name,nodes){
   const cb=document.getElementById("consoleBtn");
   if(cb) cb.addEventListener("click",()=>openConsole(name));
   loadConfig(name);
+  if(nd.role==="gpu") renderFormula(name);
+}
+// what mrc_usid.expand is fed for this GPU (the descriptor) + what it derives
+function renderFormula(name){
+  const box=document.getElementById("formulaBox"); if(!box) return;
+  fetch("/api/mesh-plan?src="+encodeURIComponent(name)+"&expand=1",{cache:"no-store"})
+    .then(r=>r.json()).then(d=>{
+      if(!d.computed||!d.fabric){
+        box.innerHTML='<span style="color:var(--dim)">enumerated profile (not compute-carriers) — '+
+          'deploy with <code>compute_carriers=true</code> to derive carriers by formula</span>'; return; }
+      const f=d.fabric, K=f.gpus_per_leaf, sg=f.src_gpu;
+      const homeLeaf=Math.floor((sg-1)/K)+1, local=((sg-1)%K)+1;
+      const der=d.derived||[];
+      const nEV=der.reduce((a,b)=>a+((b.active_evs||[]).length),0);
+      const rows=[
+        ["tenant",d.tenant],["decap SID",d.decap_sid||'—'],["gateway",d.gateway||'—'],
+        ["block",f.block],
+        ["this GPU",`gpu${sg} → home-leaf ${homeLeaf}, local ${local}`],
+        ["shape",`${f.planes} plane · ${f.spines} spine · ${K} GPU/leaf · ${f.gpus} GPU`],
+        ["peers",f.peers?('['+f.peers.map(p=>'gpu'+p).join(', ')+']'):('full mesh ('+(f.gpus-1)+')')],
+        ["derives",`${nEV} carriers → ${der.length} peer(s)`],
+      ];
+      let html='<div class="kv">'+rows.map(([k,v])=>
+        `<div class="k">${k}</div><div class="v" style="font-family:monospace;word-break:break-all">${v}</div>`).join("")+'</div>';
+      if(der.length){
+        html+='<div style="margin:8px 0 3px;color:var(--dim)">carriers (formula output):</div>'+
+          '<table style="width:100%;font-size:11px;border-collapse:collapse">';
+        let shown=0;
+        for(const b of der){ for(const e of (b.active_evs||[])){ if(shown++>=6) break;
+          html+=`<tr><td style="color:#8fb0d0;padding-right:6px">${b.flow.dst}</td>`+
+            `<td style="color:var(--dim);padding-right:6px">${e.path_id}</td>`+
+            `<td style="color:#8fd0b0;font-family:monospace">${e.usid}</td></tr>`; } if(shown>=6) break; }
+        html+='</table>'+(nEV>6?`<div style="color:var(--dim);font-size:11px;margin-top:3px">… ${nEV-6} more in the probe table</div>`:'');
+      }
+      box.innerHTML=html;
+    }).catch(()=>{ box.innerHTML='<span style="color:var(--dim)">needs the live backend</span>'; });
 }
 
 // ---- feature 4: node console (interactive terminal + quick-run) ----
@@ -911,6 +957,18 @@ function healthIndex(){
   if(src) src.forEach(p=>{ H[p.src+'|'+p.dst+'|'+p.path_id]=p.health||null; });
   return H;
 }
+// index the named collective a (src,dst) path belongs to, from MESH
+let PATHCOLL={};
+function collIndex(){
+  const C={}; const s=(MESH&&MESH.paths)?MESH.paths:null;
+  if(s) s.forEach(p=>{ if(p.collective) C[p.src+'|'+p.dst]={name:p.collective,pat:p.collective_pattern}; });
+  return C;
+}
+function collCell(a,b){
+  const c=PATHCOLL[a+'|'+b]||PATHCOLL[b+'|'+a];
+  return c ? `<td><span class="colltag k${c.pat||'grp'}" title="collective ${c.name} · ${c.pat||''}">${c.name}</span></td>`
+           : `<td><span class="miss">·</span></td>`;
+}
 
 function rebuildPaths(){
   const base=(DATA&&DATA.paths)||[];
@@ -927,6 +985,7 @@ function rebuildPaths(){
   }
   tbl.style.display=''; empty.style.display='none';
   const H=healthIndex();
+  PATHCOLL=collIndex();
   const sym=document.getElementById('symToggle').checked;
   sym?renderSym(base,H,thead,tb):renderDirected(base,H,thead,tb);
   updateMeshStat();
@@ -951,10 +1010,10 @@ function statusCell(s){ return `<span class="dot ${s.cls}"></span><span class="s
 
 function renderSym(base,H,thead,tb){
   thead.innerHTML=
-    '<tr><th>path</th><th>plane</th><th>via / carrier uSID</th>'+
+    '<tr><th>path</th><th>collective</th><th>plane</th><th>via / carrier uSID</th>'+
     '<th class="grp" colspan="3">→ forward</th><th class="grp" colspan="3">← return</th>'+
     '<th class="grp" colspan="2">jitter · reorder</th><th>status</th></tr>'+
-    '<tr><th></th><th></th><th></th>'+
+    '<tr><th></th><th></th><th></th><th></th>'+
     '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
     '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
     '<th class="num dir">jit ms</th><th class="num">reord</th><th></th></tr>';
@@ -978,6 +1037,7 @@ function renderSym(base,H,thead,tb){
     const tr=document.createElement('tr');
     tr.innerHTML=
       `<td class="path"><b>${shortName(g.A)}</b> ↔ <b>${shortName(g.B)}</b></td>`+
+      collCell(g.A,g.B)+
       `<td><span class="pl">${g.plane}</span></td>`+
       `<td>${viaCell(rec)}</td>`+
       hCell(hf)+hCell(hr)+
@@ -990,7 +1050,7 @@ function renderSym(base,H,thead,tb){
 
 function renderDirected(base,H,thead,tb){
   thead.innerHTML=
-    '<tr><th>flow</th><th>plane</th><th>via / carrier uSID</th>'+
+    '<tr><th>flow</th><th>collective</th><th>plane</th><th>via / carrier uSID</th>'+
     '<th class="num dir">rtt ms</th><th class="num">loss%</th><th class="num">jitter</th>'+
     '<th class="num dir" title="one-way delay: outbound (pinned path) / inbound (return)">1-way ob/ib</th>'+
     '<th class="num">reord</th>'+
@@ -1003,6 +1063,7 @@ function renderDirected(base,H,thead,tb){
     const tr=document.createElement('tr');
     tr.innerHTML=
       `<td class="path"><b>${shortName(rec.src)}</b> → <b>${shortName(rec.dst)}</b></td>`+
+      collCell(rec.src,rec.dst)+
       `<td><span class="pl">${rec.plane}</span></td>`+
       `<td>${viaCell(rec)}</td>`+
       `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td>`+
@@ -1160,7 +1221,7 @@ function renderPending(){
   const box=document.getElementById("collGroups"); if(!box) return; box.innerHTML="";
   collPending.forEach((grp,i)=>{ const d=document.createElement("div"); d.className="g";
     const seq=(grp.pattern==="mesh")?grp.members.join(" · "):grp.members.join(" → ");
-    d.innerHTML=`<b>group ${i+1}</b> <span class="pat">${PATLABEL[grp.pattern]||grp.pattern}</span>`+
+    d.innerHTML=`<b>${grp.name||('group '+(i+1))}</b> <span class="pat">${PATLABEL[grp.pattern]||grp.pattern}</span>`+
       ` <span style="color:#bcd9ff">${seq}</span><span class="rm" title="remove">×</span>`;
     d.querySelector(".rm").addEventListener("click",()=>{ collPending.splice(i,1); renderPending(); });
     box.appendChild(d); });
@@ -1168,11 +1229,13 @@ function renderPending(){
 function collAddGroup(){
   if(collSel.size<1){ collGrpState("click some GPUs first",false); return; }
   const pattern=document.getElementById("collPattern").value;
+  const name=(document.getElementById("collName").value||"").trim();
   // preserve click order for ring/chain/star; sort only mesh (order-agnostic)
   let members=[...collSel];
   if(pattern==="mesh") members.sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
-  collPending.push({members,pattern});
-  collSel.clear(); renderChips(); renderPending();
+  collPending.push({members,pattern,name});
+  collSel.clear(); document.getElementById("collName").value="";
+  renderChips(); renderPending();
   collGrpState(`${collPending.length} group(s) staged — click Apply`);
 }
 function applyCollGroups(){
