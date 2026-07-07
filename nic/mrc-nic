@@ -27,7 +27,7 @@ import argparse, json, os, re, signal, socket, struct, subprocess, sys, tempfile
 from urllib import request as urlreq, error as urlerr
 
 DEFAULT_IFACE   = "mrc0"
-MRC_NIC_BUILD   = "2026-07-07-g23-drain-visible"  # bump on every change; printed at startup
+MRC_NIC_BUILD   = "2026-07-07-g25-drain-correct"  # bump on every change; printed at startup
 DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
 METRICS_PERIOD  = 1.0
 RECONNECT_BASE  = 1.0
@@ -788,6 +788,11 @@ class JobRunner:
 
 # ---- mesh health -----------------------------------------------------------
 MESH_PERIOD   = float(os.environ.get("MRC_MESH_PERIOD", "5.0"))   # seconds between sweeps
+# How often the NIC re-pulls the mesh-plan. Also the ceiling on how fast a
+# controller-driven maintenance drain/restore (bypass) reflects on this NIC, so
+# keep it short — the plan is tiny and re-pulling is a no-op for the dataplane
+# when the fwmark set is unchanged (it only refreshes the drained-path flags).
+PLAN_REFRESH  = float(os.environ.get("MRC_PLAN_REFRESH", "5.0"))
 MESH_COUNT    = int(os.environ.get("MRC_MESH_COUNT", "5"))        # echoes per peer per sweep
 MESH_INTERVAL = float(os.environ.get("MRC_MESH_INTERVAL", "0.2")) # spacing between echoes
 
@@ -1054,6 +1059,9 @@ class MeshHealth(threading.Thread):
         self._last_active_ids = []
         self._last_id_to_ev = {}
         self._last_balance = None
+        self._last_full_active = []      # pre-drain active set, for off-sweep drain
+        self._last_active_evs = []       # cached EV dicts (for per-EV drain zeroing)
+        self._last_drained = frozenset() # drain set at last publish (fast-react trigger)
         # --- closed-loop auto-deny (MRC #1) state --------------------------
         self._ad_bad  = {}        # path_id -> consecutive bad-sweep count
         self._ad_good = {}        # path_id -> consecutive good-sweep count
@@ -1159,7 +1167,16 @@ class MeshHealth(threading.Thread):
         spray = [pid for pid in active_ids if pid not in self.auto_denied]
         return spray or list(active_ids)   # never return empty (blackhole guard)
 
-    def _publish_weights(self, weights, active_ids, id_to_ev):
+    def _drained_ev_set(self, active_evs):
+        """The set of EV entropies whose path transits a drained (bypassed) node.
+        Per-EV (not per-path_id) so a spine path_id shared by two peers drains
+        both of their EVs, not just the one the id_to_ev map happens to keep."""
+        return {e.get("entropy") for e in (active_evs or [])
+                if (e.get("path") in self.drained_ids
+                    or e.get("spine") in self.drained_ids)
+                and isinstance(e.get("entropy"), int)}
+
+    def _publish_weights(self, weights, active_ids, id_to_ev, drained_evs=None):
         """Map path weights -> per-EV weights, write ev_weights + weigher snapshot
         to the state file. Returns the weigher_snap (for the mesh-health POST)."""
         ev_weights = {}
@@ -1176,6 +1193,11 @@ class MeshHealth(threading.Thread):
                 ev = id_to_ev.get(pid)
                 if ev is not None:
                     ev_weights[str(ev)] = 0.0
+        # maintenance drain (#5): explicit 0 so the app/probe DROPS these EVs — a
+        # missing weight would fall back to a full share. Per-EV, so both peers on
+        # a shared spine path_id are drained.
+        for ev in (drained_evs or ()):
+            ev_weights[str(ev)] = 0.0
         if self.state is not None:
             self.state.set("ev_weights", ev_weights)
         snap = self.weigher.snapshot()
@@ -1186,6 +1208,7 @@ class MeshHealth(threading.Thread):
             # closed-loop auto-deny (#1) + per-path health (#2) so the controller
             # and dashboard can show path health and which paths the agent denied.
             "auto_denied": sorted(self.auto_denied),
+            "drained": sorted(self.drained_ids),
             "path_health": list(self.path_health),
             "signal": snap.get("signal"),
             "cfg": snap.get("cfg"),
@@ -1207,15 +1230,24 @@ class MeshHealth(threading.Thread):
             cfg = prof.get("weigher_cfg") or {}
             self.weigher.set_cfg(cfg)
             bal = self.weigher.cfg.get("balance")
-            if bal == self._last_balance:
-                return                      # nothing changed; sweep handles steady state
+            drained = frozenset(self.drained_ids)
+            # react to a balance/cfg toggle OR a maintenance drain/restore, so both
+            # take effect in ~1s off-sweep instead of waiting for the next TWAMP sweep.
+            if bal == self._last_balance and drained == self._last_drained:
+                return
             self._last_balance = bal
-            active_ids = self._last_active_ids
-            if not active_ids:
+            self._last_drained = drained
+            full = self._last_full_active or self._last_active_ids
+            if not full:
                 return                      # no cached topology yet; wait for a sweep
-            # recompute from CACHED cost (no fresh TWAMP needed) and republish
-            weights = self.weigher.recompute(active_ids)
-            self._publish_weights(weights, active_ids, self._last_id_to_ev)
+            spray = [i for i in full if i not in self.drained_ids
+                     and i not in self.auto_denied]
+            spray = spray or list(full)     # never blackhole the last path
+            # recompute from CACHED cost (no fresh TWAMP needed) and republish, with
+            # the drained EVs zeroed just like the full sweep does.
+            weights = self.weigher.recompute(spray)
+            self._publish_weights(weights, full, self._last_id_to_ev,
+                                  self._drained_ev_set(self._last_active_evs))
         except Exception as e:
             print(f"[weigh] fast-rebalance error (continuing): {e!r}", file=sys.stderr)
 
@@ -1225,7 +1257,7 @@ class MeshHealth(threading.Thread):
         meaningful in SRv6 mode; on any error we just fall back to plain ping."""
         if self.dp is None:
             return
-        if time.time() - self._last_plan < 30 and self.plan:
+        if time.time() - self._last_plan < PLAN_REFRESH and self.plan:
             return
         try:
             with urlreq.urlopen(f"{self.controller}/api/mesh-plan?src={self.host}", timeout=4) as r:
@@ -1530,9 +1562,16 @@ class MeshHealth(threading.Thread):
                                 kept = [i for i in spray_ids if i not in self.drained_ids]
                                 spray_ids = kept or spray_ids
                             weights = self.weigher.update(samples, spray_ids)
+                            # every EV whose path transits a drained node, zeroed in
+                            # the published weights (keyed per-EV, so BOTH peers on a
+                            # shared spine path_id are drained, not just one).
+                            drained_evs = self._drained_ev_set(active_evs)
                             self._last_active_ids = spray_ids    # cache for fast republish
+                            self._last_full_active = list(active_ids)
                             self._last_id_to_ev   = dict(id_to_ev)
-                            weigher_snap = self._publish_weights(weights, active_ids, id_to_ev)
+                            self._last_active_evs  = list(active_evs)
+                            weigher_snap = self._publish_weights(weights, active_ids,
+                                                                 id_to_ev, drained_evs)
                         elif self.state is not None:
                             self.state.set("ev_weights", {})
                     except Exception as we:
@@ -1560,14 +1599,15 @@ class MeshHealth(threading.Thread):
             except Exception as e:
                 print(f"[mesh] sweep error (continuing): {e}", file=sys.stderr)
             # Wait MESH_PERIOD before the next TWAMP sweep, but in 1s chunks so a
-            # balance/cfg toggle is applied within ~1s (off-sweep) from cached
-            # costs — the operator sees 'even spray' take effect immediately, not
-            # on the next 5s sweep boundary.
+            # balance/cfg toggle OR a maintenance drain is applied within ~1s
+            # (off-sweep) — the operator sees it take effect immediately, not on
+            # the next sweep boundary (a sweep of a full mesh can take >10s).
             waited = 0.0
             while waited < MESH_PERIOD and not self.stop.is_set():
                 self.stop.wait(1.0)
                 waited += 1.0
-                self._maybe_fast_rebalance()
+                self._refresh_plan()          # re-pull drain state on PLAN_REFRESH cadence
+                self._maybe_fast_rebalance()   # apply drain/balance change now
 
     def _post(self, samples, weigher=None):
         payload = {"host": self.host, "ts": time.time(), "peers": samples}
