@@ -491,6 +491,37 @@ The planner prints full-mesh vs sparse side by side. Examples: 10,000 GPUs
 drops ~38 GB → ~80 MB. That’s the difference between the theoretical mesh and the
 per-connection EV set MRC actually keeps.
 
+### Computed carriers — `--compute-carriers` (formula, not table)
+
+The planner *reports* the reduction; `--compute-carriers` on the generator
+*builds* it. Because every address is position-encoded, a GPU's whole EV set is
+**derivable** from a formula rather than enumerated:
+
+```
+carrier (spec, cross-leaf) = block : <spine RPII> : e000+leaf : 9LLL : GGGG : 0 : 0
+    RPII(role,plane,idx) = role·0x1000 + plane·0x100 + idx   (spine=1, leaf=2)
+    9LLL = 0x9000 + dst_leaf     GGGG = dst_local_gpu_index
+```
+
+In this mode each `mrc-nic/<gpu>.json` is a **compact fabric descriptor** (~800
+bytes: block + shape + this GPU's index) instead of the fully-enumerated table.
+The shared [`mrc_usid.py`](mrc_usid.py) `expand()` reconstructs the *identical*
+carriers at NIC load — verified byte-for-byte against the materialised output — so
+runtime behaviour is unchanged: multi-plane transit, per-spine paths, live
+probing, and maintenance **drain** all still work (the computed EVs carry the same
+`spine`/`plane` labels drain matches on). On disk it's **O(1) per GPU** instead of
+O(GPUs²·planes·spines) — 10,000-GPU NIC state drops from ~TB to a few MB.
+
+```bash
+ansible-playbook site-frr.yml -e planes=4 -e leaves=... -e spec_mode=true \
+  -e gpu_image=debian:bookworm -e compute_carriers=true      # optional: -e sparse=32 -e spray=4
+```
+
+This is the connection-oriented model from the MRC whitepaper: the edge holds a
+formula + fabric map and computes carriers, rather than storing an all-to-all
+table. `--sparse`/`--spray` compose with it to emit only a training-run's live
+peer set.
+
 ---
 
 ## Troubleshooting

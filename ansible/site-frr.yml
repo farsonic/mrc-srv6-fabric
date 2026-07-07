@@ -63,6 +63,9 @@
           {{ ('--mgmt-subnet ' ~ mgmt_subnet) if (mgmt_subnet is defined) else '' }}
           {{ '--mrc-nic' if (mrc_nic | default(false) | bool) else '' }}
           {{ '--spec-mode' if (spec_mode | default(false) | bool) else '' }}
+          {{ '--compute-carriers' if (compute_carriers | default(false) | bool) else '' }}
+          {{ ('--sparse ' ~ sparse) if (sparse | default('') | string | length > 0) else '' }}
+          {{ ('--spray ' ~ spray) if (spray | default('') | string | length > 0) else '' }}
           {{ ('--controller ' ~ mesh_controller_url) if (mesh_controller_url | default('') | length > 0) else '' }}
         chdir: "{{ proj }}"
       when: do_generate | bool

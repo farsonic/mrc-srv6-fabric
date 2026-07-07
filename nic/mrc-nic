@@ -1696,6 +1696,27 @@ def sse_subscribe(url, on_message, on_status, stop_evt):
             time.sleep(0.1)
         backoff = min(backoff * 2, RECONNECT_CAP)
 
+# ---- computed-profile expansion (mrc_usid formula) ------------------------
+_MRC_USID = None
+def _expand_fabric(doc, sparse, spray):
+    """Reconstruct the full profile blocks from a compact fabric descriptor via
+    the shared uSID formula. mrc_usid.py is staged next to this binary by the
+    generator; search a few likely locations so it loads wherever we're run."""
+    global _MRC_USID
+    if _MRC_USID is None:
+        import importlib
+        here = os.path.dirname(os.path.abspath(__file__))
+        for d in (here, "/opt", os.path.dirname(os.path.abspath(getattr(sys, "argv", ["."])[0])),
+                  os.getcwd()):
+            if d and os.path.isfile(os.path.join(d, "mrc_usid.py")) and d not in sys.path:
+                sys.path.insert(0, d)
+        try:
+            _MRC_USID = importlib.import_module("mrc_usid")
+        except ImportError as e:
+            raise ValueError(f"computed profile needs mrc_usid.py alongside the NIC: {e}")
+    return _MRC_USID.expand(doc, sparse=sparse, spray=spray)
+
+
 # ---- file profile source (standalone, no controller) ----------------------
 class FileProfileSource:
     """Standalone profile feed: reads a generator-produced profile JSON from
@@ -1725,6 +1746,13 @@ class FileProfileSource:
     def _load(self):
         with open(self.path) as f:
             doc = json.load(f)
+        # COMPUTED profile: a compact fabric descriptor instead of an enumerated EV
+        # table. Reconstruct the identical `profiles` blocks by formula (mrc_usid),
+        # so everything downstream (per-EV encap, per-plane/spine drain, probing) is
+        # unchanged — the carriers are byte-for-byte what the full table held.
+        if isinstance(doc, dict) and "fabric" in doc and "profiles" not in doc:
+            fab = doc["fabric"]
+            return _expand_fabric(doc, fab.get("sparse"), fab.get("spray"))
         if isinstance(doc, dict) and "profiles" in doc:
             return list(doc["profiles"])
         if isinstance(doc, dict):

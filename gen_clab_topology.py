@@ -32,6 +32,9 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find mrc_usid next to us
+import mrc_usid  # shared uSID-carrier formula (compute-carriers mode + NIC-side expand)
+
 
 def hx(base, *more):
     parts = [p for p in (base.split(":") + [str(m) for m in more]) if p != ""]
@@ -81,6 +84,17 @@ def main():
                          "End.DT6; each GPU has a decap uSID, its leaf plain-forwards that uSID to "
                          "the GPU port). Carriers name block:T1:T0:gpu. Implies --mrc-nic. The "
                          "proven fc00:0 leaf-decap path is the DEFAULT; this is the spec cutover.")
+    ap.add_argument("--compute-carriers", action="store_true",
+                    help="emit each GPU's profile.json as a COMPACT fabric descriptor (a formula "
+                         "+ shape) instead of the fully-enumerated EV set. The NIC reconstructs the "
+                         "identical carriers at load via mrc_usid.expand — O(1) on disk vs "
+                         "O(GPUs²·planes·spines). Same runtime behaviour (planes/spines/drain).")
+    ap.add_argument("--sparse", type=int, default=None,
+                    help="with --compute-carriers: connections (peers) per GPU (a training-run "
+                         "hot set) instead of the full mesh. The NIC expands only these.")
+    ap.add_argument("--spray", type=int, default=None,
+                    help="with --compute-carriers: cross-leaf paths (EVs) per flow per plane; "
+                         "caps the per-spine fan-out (default = all spines).")
     ap.add_argument("--frr-linux", action="store_true",
                     help="leaf/spine = plain Linux + FRR with bind-mounted frr.conf "
                          "(eth1.. naming, kernel seg6 dataplane; no SONiC/vtysh push). "
@@ -663,32 +677,38 @@ def main():
         os.makedirs(nic_dir, exist_ok=True)
         ev_base = 49001
         nic_profiles = {}
-        for sg in range(1, G + 1):
-            sgn = gname(sg)
-            sl = home_leaf(sg)
-            # this GPU's tenant address = its plane-1 GPU address (stable identity for decap)
-            tenant = gpu_addr_h(1, sg)
+
+        # The compact fabric descriptor: everything mrc_usid.expand needs to
+        # RECONSTRUCT this GPU's carriers by formula (no enumerated EV table).
+        def fabric_fields(sg):
+            return dict(
+                mode=("spec" if spec else "proven"),
+                block=sv["block"], endx_base=sv["func_endx_base"], dt6=sv["func_end_dt6"],
+                gpu_nibble=GPU_BLOCK_NIBBLE, planes=P, spines=S, gpus_per_leaf=K, gpus=G,
+                gpu_base=gp_["base"], gpu_host=gp_["gpu_host"], src_gpu=sg, ev_base=ev_base,
+                role_spine=RID["spine"], role_leaf=RID["leaf"], multi=multi,
+                hp=dict(spine=HP["spine"], leaf=HP["leaf"], gpu=HP["gpu"], plane_tag=HP["plane_tag"]),
+            )
+
+        # Fully-enumerated EV set (the classic profile). Same output mrc_usid.expand
+        # reconstructs from fabric_fields() — kept as the ground truth + default.
+        def materialize(sg):
+            sl = home_leaf(sg); sgn = gname(sg)
             profiles = []
-            ev = ev_base   # monotonic across ALL peers in this GPU's profile: each EV needs a
-                           # globally-unique fwmark/table or programming peer N+1 wipes peer N's rules.
+            ev = ev_base   # monotonic across ALL peers: each EV needs a globally-unique
+                           # fwmark/table or programming peer N+1 wipes peer N's rules.
             for dg in range(1, G + 1):
                 if dg == sg:
                     continue
-                dgn = gname(dg)
-                dl = home_leaf(dg)
-                dst_addr = gpu_addr_h(1, dg)
+                dgn = gname(dg); dl = home_leaf(dg); dst_addr = gpu_addr_h(1, dg)
                 evs = []
                 for p in range(1, P + 1):
                     if dl == sl:
-                        # same-leaf peer: no spine transit.
                         if spec:
-                            # spec: name the dst GPU's decap uSID directly. dst leaf plain-forwards
-                            # block:gpu_usid::/48 to the GPU port; the GPU End.DT6-decaps.
                             carrier = gpu_decap_sid(dg)
                             evs.append(dict(entropy=ev, usid=carrier, plane=p, spine=None,
                                             path=f"{sgn}->{dgn} same-leaf -> {dgn} decap uSID"))
                         else:
-                            # proven: deliver via the dst-leaf End.DT6 (leaf decaps).
                             dst_dt6 = nodes[lname(dl, p)]["srv6"]["end_dt6"]
                             block = ipaddress.IPv6Address(srv6_loc("leaf", p, 1)).exploded.split(":")[0:2]
                             carrier = ipaddress.IPv6Address(
@@ -697,7 +717,6 @@ def main():
                                             path=f"{sgn}->{dgn} same-leaf {lname(dl,p)} End.DT6"))
                         ev += 1
                     else:
-                        # cross-leaf: one EV per spine path (the EV-set / multi-path spray analog)
                         for s in range(1, S + 1):
                             sp = sname(s, p)
                             if spec:
@@ -706,35 +725,50 @@ def main():
                             else:
                                 carrier = mrc_carrier(p, lname(dl, p), sp)
                                 pathdesc = f"{sgn}->{dgn} via {sp} -> {lname(dl,p)}"
-                            evs.append(dict(entropy=ev, usid=carrier, plane=p, spine=sp,
-                                            path=pathdesc))
+                            evs.append(dict(entropy=ev, usid=carrier, plane=p, spine=sp, path=pathdesc))
                             ev += 1
-                profiles.append(dict(
-                    mode="srv6",
-                    flow=dict(src=sgn, dst=dgn),
-                    active_dst=dst_addr,
-                    active_evs=evs,
-                ))
-            doc = dict(
-                _comment=f"MRC virtual-NIC profile for {sgn} (tenant {tenant}). "
-                         f"Generated; one block per peer GPU, EVs = pinned uSID carriers."
-                         + (" SPEC-mode: NIC decaps its own decap_sid." if spec else ""),
-                tenant=tenant,
-                underlay="eth1",
-                gateway=gpu_gw_h(1, sg),   # this GPU's plane-1 leaf gateway — the deterministic
-                                           # nexthop for carrier-block + multipath encap routes.
-                spec_mode=spec,
-                # spec: the GPU decaps packets whose outer DA = its decap SID (block:gpu_usid::),
-                # not its tenant /128. The leaf plain-forwards that SID to the GPU. In proven mode
-                # this is None and the NIC decaps its tenant (and the leaf also has End.DT6).
-                decap_sid=(gpu_decap_sid(sg) if spec else None),
-                profiles=profiles,
-            )
+                profiles.append(dict(mode="srv6", flow=dict(src=sgn, dst=dgn),
+                                     active_dst=dst_addr, active_evs=evs))
+            return profiles
+
+        # Before trusting the formula, prove it reproduces the materialized carriers
+        # (functional fields) for GPU 1 — catches any drift vs mrc_usid.py.
+        if a.compute_carriers:
+            def _fk(bl):
+                return [(b["flow"]["dst"], b["active_dst"],
+                         tuple((e["entropy"], e["usid"], e["plane"], e["spine"]) for e in b["active_evs"]))
+                        for b in bl]
+            if _fk(materialize(1)) != _fk(mrc_usid.expand(dict(fabric=fabric_fields(1)))):
+                ap.error("internal: mrc_usid.expand disagrees with the materialized carriers "
+                         "(formula drift between gen_clab_topology.py and mrc_usid.py).")
+            print("  compute-carriers: formula verified against materialized truth (GPU 1) ✓",
+                  file=sys.stderr)
+
+        for sg in range(1, G + 1):
+            sgn = gname(sg)
+            tenant = gpu_addr_h(1, sg)     # plane-1 GPU address = stable decap identity
+            base = dict(tenant=tenant, underlay="eth1", gateway=gpu_gw_h(1, sg),
+                        spec_mode=spec, decap_sid=(gpu_decap_sid(sg) if spec else None))
+            if a.compute_carriers:
+                fab = fabric_fields(sg)
+                if a.sparse is not None: fab["sparse"] = a.sparse
+                if a.spray is not None: fab["spray"] = a.spray
+                doc = dict(_comment=f"MRC virtual-NIC profile for {sgn} (tenant {tenant}). "
+                           f"COMPUTED — carriers derived by mrc_usid.expand() from the fabric "
+                           f"descriptor; no enumerated EV table on disk." + (" SPEC-mode." if spec else ""),
+                           **base, fabric=fab)
+                n_peers = n_evs = None
+            else:
+                profiles = materialize(sg)
+                doc = dict(_comment=f"MRC virtual-NIC profile for {sgn} (tenant {tenant}). "
+                           f"Generated; one block per peer GPU, EVs = pinned uSID carriers."
+                           + (" SPEC-mode: NIC decaps its own decap_sid." if spec else ""),
+                           **base, profiles=profiles)
+                n_peers = len(profiles); n_evs = sum(len(x["active_evs"]) for x in profiles)
             with open(os.path.join(nic_dir, f"{sgn}.json"), "w") as f:
                 json.dump(doc, f, indent=2)
             nic_profiles[sgn] = dict(tenant=tenant, gateway=gpu_gw_h(1, sg),
-                                     n_peers=len(profiles),
-                                     n_evs=sum(len(x["active_evs"]) for x in profiles))
+                                     n_peers=n_peers, n_evs=n_evs)
 
         # stage the mrc-nic binary alongside the profiles so the bind-mount resolves.
         # look next to this generator (nic/mrc-nic) or in the bundle root.
@@ -755,6 +789,10 @@ def main():
             if os.path.isfile(tw_src):
                 _sh.copyfile(tw_src, os.path.join(nic_dir, "mrc-probe"))
                 os.chmod(os.path.join(nic_dir, "mrc-probe"), 0o755)
+            # stage the shared uSID formula so the NIC can expand computed profiles
+            usid_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mrc_usid.py")
+            if os.path.isfile(usid_src):
+                _sh.copyfile(usid_src, os.path.join(nic_dir, "mrc_usid.py"))
         else:
             print("WARNING: mrc-nic binary not found to stage into ./mrc-nic/ — "
                   "place it there before deploy (bind-mount expects mrc-nic/mrc-nic).",
@@ -816,6 +854,9 @@ def main():
             out.append("        - mrc-nic/mrc-nic:/opt/mrc-nic.bin:ro")
             out.append("        - mrc-nic/mrc-probe:/opt/mrc-probe.bin:ro")
             out.append("        - mrc-nic/hosts.fabric:/etc/hosts.fabric:ro")
+            if a.compute_carriers:
+                # the NIC imports this to reconstruct carriers from the descriptor
+                out.append("        - mrc-nic/mrc_usid.py:/opt/mrc_usid.py:ro")
             out.append("      exec:")
             # resolve fabric node names to their IPv6 (SRv6 underlay) instead of the
             # mgmt net — /etc/hosts is a bind mount, so rewrite it in place (keep the
@@ -845,6 +886,9 @@ def main():
             out.append("        - sh -c 'for d in /proc/sys/net/ipv6/conf/*/seg6_enabled; do echo 1 > \"$d\"; done'")
             # copy staged binary -> real in-container file (NOT a mount, so re-readable)
             out.append("        - sh -c 'install -m 0755 /opt/mrc-nic.bin /usr/local/bin/mrc-nic'")
+            if a.compute_carriers:
+                # put the uSID formula next to the NIC so `import mrc_usid` resolves
+                out.append("        - sh -c 'install -m 0644 /opt/mrc_usid.py /usr/local/bin/mrc_usid.py'")
             # the network-multitool (Alpine) image ships no python3, and minimal Debian
             # images ship neither python3 NOR iproute2. Install both at boot if missing,
             # image-agnostic (apt then apk). For large fabrics, bake these into a custom
@@ -990,9 +1034,13 @@ def main():
     info(f"  wrote: {vars_path}   (addresses + SRv6 SIDs + static routes for Ansible)")
     info(f"  wrote: {amap_path}   (human-readable position -> address)")
     if a.mrc_nic:
-        tot_ev = sum(v["n_evs"] for v in nic_profiles.values())
-        info(f"  wrote: mrc-nic/   ({len(nic_profiles)} GPU profiles, {tot_ev} total EVs, "
-             f"+ staged mrc-nic binary) — each GPU runs the standalone virtual MRC NIC")
+        if a.compute_carriers:
+            info(f"  wrote: mrc-nic/   ({len(nic_profiles)} GPU descriptors — carriers COMPUTED "
+                 f"on load by mrc_usid.expand, no EV table + staged mrc-nic binary)")
+        else:
+            tot_ev = sum(v["n_evs"] for v in nic_profiles.values())
+            info(f"  wrote: mrc-nic/   ({len(nic_profiles)} GPU profiles, {tot_ev} total EVs, "
+                 f"+ staged mrc-nic binary) — each GPU runs the standalone virtual MRC NIC")
         if spec:
             info("")
             info("  *** SPEC MODE — GPU IMAGE REQUIREMENT ***")

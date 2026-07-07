@@ -66,3 +66,16 @@ mrc_nic: true
 #         kernel, spec-mode packets reach the GPU and are dropped (no decap).
 #         Validate on the wire before trusting at scale. Toggle: -e spec_mode=true
 spec_mode: false
+
+# --- Computed carriers (formula, not enumerated table) ----------------------
+# false (default) = each GPU's profile.json is the full enumerated EV set.
+# true  = profile.json is a compact fabric descriptor; the NIC reconstructs the
+#         identical carriers at load via mrc_usid.expand(). O(1) on disk vs
+#         O(GPUs^2 * planes * spines). Same runtime (planes/spines/drain).
+#         Toggle: -e compute_carriers=true
+compute_carriers: false
+# Optional (only with compute_carriers): model a real training run instead of the
+# full mesh — sparse = connections (peers) per GPU, spray = paths per flow. Empty
+# = full mesh. e.g. -e sparse=32 -e spray=4
+sparse: ""
+spray: ""
