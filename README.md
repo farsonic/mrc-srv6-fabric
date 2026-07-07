@@ -466,11 +466,30 @@ python3 plan_fabric.py --gpus 10000 --ports-per-leaf 64 \
 from a tiny reference build) and reports the on-disk config size. It surfaces the
 real scaling walls: mgmt IPv4 `/22` (hard-fails past ~256 GPUs), the per-plane
 mgmt stride (leaf/spine collide past ~20 switches/plane when multi-plane), the
-255-per-plane index cap, and — the big one — the **all-to-all EV set**: each GPU
-carries one uSID carrier per destination GPU per plane, so profile + mesh configs
-grow **O(GPUs²·planes)** (≈ hundreds of GB at 10,000 GPUs, while the switch
-configs stay trivial). That quadratic, not the switches, is what a real
-large-scale build must sparsify.
+255-per-plane index cap, and — the big one — the **all-to-all EV set**: the
+generator materialises one uSID carrier per **(src GPU × dst GPU × plane ×
+spine)**, so profile + mesh configs grow **O(GPUs²·planes·spines)** (≈ 8 TB at
+10,000 GPUs, while the switch configs stay a few MB). That product, not the
+switches, is what dominates at scale.
+
+That all-to-all dump is a lab convenience (so the GUI can draw every path), not
+how a connection-oriented MRC edge actually holds state. Model a real training
+run instead with:
+
+- `--sparse K` — cap each GPU to `K` live connections (its ring / TP / PP / EP
+  peers), not all N. EV state becomes **linear** in GPU count.
+- `--spray N` — cap cross-leaf paths-per-flow to `N` EVs (a bounded fan-out
+  instead of one per spine).
+
+```bash
+python3 plan_fabric.py --gpus 10000 --ports-per-leaf 64 \
+  --port-speed 800 --nic-speed 200 --planes 4 --sparse 32 --spray 4 --dry-run
+```
+
+The planner prints full-mesh vs sparse side by side. Examples: 10,000 GPUs
+`--sparse 32 --spray 4` ≈ **2,500× smaller**; 1,000 GPUs `--sparse 16 --spray 2`
+drops ~38 GB → ~80 MB. That’s the difference between the theoretical mesh and the
+per-connection EV set MRC actually keeps.
 
 ---
 

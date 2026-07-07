@@ -53,7 +53,7 @@ def human(n):
         n /= 1024
 
 
-def plan(gpus, ports_per_leaf, port_speed, nic_speed, planes, oversub):
+def plan(gpus, ports_per_leaf, port_speed, nic_speed, planes, oversub, sparse=None, spray=None):
     """Return the computed fabric shape + a list of warnings."""
     warn = []
     breakout = port_speed / nic_speed
@@ -112,11 +112,21 @@ def plan(gpus, ports_per_leaf, port_speed, nic_speed, planes, oversub):
                     f"default mgmt per-plane stride (20) — leaf/spine mgmt IPs collide across "
                     f"planes. Widen mgmt.per_plane_stride (and mgmt.subnet) in address_plan.json.")
 
+    # EV state held at the edge: full mesh vs a sparse (connection-oriented) set.
+    ev_full = ev_count(actual_gpus, gpus_per_leaf, planes, spines)
+    peers = None if sparse is None else min(sparse, actual_gpus - 1)
+    ev_sparse = None
+    if sparse is not None or spray is not None:
+        ev_sparse = ev_count(actual_gpus, gpus_per_leaf, planes, spines, peers=peers, spray=spray)
+        if peers is not None and peers > actual_gpus - 1:
+            warn.append(f"--sparse {sparse} exceeds the {actual_gpus-1} available peers; using full mesh.")
+
     return dict(
         gpus=gpus, actual_gpus=actual_gpus, planes=planes, breakout=breakout,
         down=down, up=up, ports_per_leaf=ports_per_leaf, port_speed=port_speed, nic_speed=nic_speed,
         gpus_per_leaf=gpus_per_leaf, leaves=leaves, spines=spines,
         switches=switches, containers=containers, mgmt_subnet=mgmt_subnet,
+        sparse=sparse, spray=spray, peers=peers, ev_full=ev_full, ev_sparse=ev_sparse,
         # bandwidth (both directions counted once): all NIC downlinks across all planes
         total_nic_bw_tbps=actual_gpus * nic_speed * planes / 1000.0,
     ), warn
@@ -154,6 +164,19 @@ def print_plan(p, warn):
     if p["actual_gpus"] != p["gpus"]:
         print(f"  note: rounded up to {p['actual_gpus']} GPUs to fill {p['leaves']} even leaves "
               f"(asked for {p['gpus']}).")
+    print("  " + "-" * 62)
+    print(f"  EV records (full mesh) {p['ev_full']:>13,}   = GPUs² · planes · spines (all-to-all)")
+    if p["ev_sparse"] is not None:
+        levers = []
+        if p["sparse"] is not None:
+            levers.append(f"{p['peers']} peers/GPU")
+        if p["spray"] is not None:
+            levers.append(f"{min(p['spray'], p['spines'])} paths/flow")
+        red = p["ev_full"] / p["ev_sparse"] if p["ev_sparse"] else float("inf")
+        print(f"  EV records (sparse)    {p['ev_sparse']:>13,}   = {', '.join(levers)}  "
+              f"→ {red:,.0f}× smaller")
+        print("  sparse = the connection-oriented MRC model: EVs only for a GPU's live")
+        print("  training-run peers, bounded path fan-out — LINEAR in GPUs, not quadratic.")
     if warn:
         print("\n  ⚠ notes:")
         for w in warn:
@@ -212,20 +235,29 @@ def _gen(tmp, leaves, spines, gpus_per_leaf, planes):
     return b, gpu
 
 
-def ev_count(gpus, gpus_per_leaf, planes, spines):
-    """Total EV (uSID carrier) records the generator materialises.
+def ev_count(gpus, gpus_per_leaf, planes, spines, peers=None, spray=None):
+    """Total EV (uSID carrier) records the edge holds.
 
-    Each source GPU stores one EV per destination GPU, per plane, and — for
-    destinations on a DIFFERENT leaf — per spine (a distinct parallel path):
-        same-leaf dsts  (K-1)        -> planes EVs each   (spine=null)
-        cross-leaf dsts (G-K)        -> planes*spines EVs each
-    So the all-to-all set is ~ G^2 * planes * spines. This is what the profiles
-    (mrc-nic/*.json) and the probe mesh (fabric_vars.json) enumerate, and it is
-    the term that dominates config size at scale. Verified against real builds:
-    2x GPUs -> ~4x bytes, 2x spines -> ~2x bytes."""
-    same = max(0, gpus_per_leaf - 1) * planes
-    cross = max(0, gpus - gpus_per_leaf) * planes * spines
-    return gpus * (same + cross)
+    FULL MESH (peers=None, spray=None): every source GPU stores one EV per
+    destination GPU, per plane, and — for destinations on a DIFFERENT leaf — per
+    spine (a distinct parallel path):
+        same-leaf dsts  (K-1)  -> planes EVs each          (spine=null)
+        cross-leaf dsts (G-K)  -> planes*spines EVs each
+    => ~ G^2 * planes * spines. Verified real: 2x GPUs -> ~4x, 2x spines -> ~2x.
+
+    SPARSE (the connection-oriented MRC model): cap each GPU to `peers` live
+    connections (a training-run hot set — ring/TP/PP/EP partners, not all N) and
+    cap cross-leaf paths-per-flow to `spray` (keep a bounded fan-out instead of
+    one EV per spine). Peers are split same/cross-leaf in the fabric's ratio.
+    => ~ G * peers * planes * spray  (LINEAR in GPUs)."""
+    G, K, P, S = gpus, gpus_per_leaf, planes, spines
+    fan = S if spray is None else max(1, min(spray, S))     # cross-leaf paths per flow per plane
+    total_peers = max(0, G - 1)
+    npeer = total_peers if peers is None else max(0, min(peers, total_peers))
+    frac_same = ((K - 1) / total_peers) if total_peers else 0.0   # same-leaf share of the peer set
+    same = round(npeer * frac_same)
+    cross = npeer - same
+    return G * (same * P + cross * P * fan)
 
 
 def _estimate(p, tmp):
@@ -275,7 +307,7 @@ def dry_run(p):
             print(f"  ! dry-run failed: {e}")
             return
     tag = "measured" if exact else "estimated from a ~32-GPU reference + EV-count law"
-    print(f"\n  config size ({tag}):")
+    print(f"\n  config size — FULL MESH ({tag}):")
     print(f"    total on-disk configs    {human(est['total'])}")
     print(f"    ├ per-GPU EV profiles    {human(est['prof'])}   (mrc-nic/*.json)")
     print(f"    ├ probe mesh (vars.json) {human(est['mesh'])}   (GUI/mesh inventory)")
@@ -283,9 +315,31 @@ def dry_run(p):
     print(f"    └ per-switch FRR configs {human(est['other'])}")
     print(f"    EV carrier records       {est['evs']:,}   (= GPUs² · planes · spines, all-to-all)")
     print(f"    ~ per node               {human(est['total'] / max(1, p['containers']))}")
-    print("    the profile + mesh JSON enumerate one uSID carrier per (src GPU, dst GPU,")
-    print("    plane, spine) — an all-to-all × all-paths set. That product, not the switch")
-    print("    configs, is the real cost; sparsifying it (per-peer EVs) is the way down.")
+
+    if p["ev_sparse"] is not None and est["evs"]:
+        # the EV-scaling buckets (profiles + mesh) shrink by the EV ratio; the
+        # switch configs (clab.yml, FRR) are unaffected by connection sparsity.
+        f = p["ev_sparse"] / est["evs"]
+        sprof, smesh = est["prof"] * f, est["mesh"] * f
+        stotal = sprof + smesh + est["clab"] + est["other"]
+        red = est["total"] / stotal if stotal else float("inf")
+        levers = []
+        if p["sparse"] is not None:
+            levers.append(f"{p['peers']} peers/GPU")
+        if p["spray"] is not None:
+            levers.append(f"{min(p['spray'], p['spines'])} paths/flow")
+        print(f"\n  config size — SPARSE ({', '.join(levers)}):")
+        print(f"    total on-disk configs    {human(stotal)}   ({red:,.0f}× smaller)")
+        print(f"    ├ per-GPU EV profiles    {human(sprof)}")
+        print(f"    ├ probe mesh (vars.json) {human(smesh)}")
+        print(f"    └ switch configs (unchanged) {human(est['clab'] + est['other'])}")
+        print(f"    EV carrier records       {p['ev_sparse']:,}   (= GPUs · peers · planes · paths)")
+        print("    this is the connection-oriented MRC edge: EVs only for a GPU's live")
+        print("    training-run peers with a bounded path fan-out — LINEAR in GPU count.")
+    else:
+        print("    the profile + mesh JSON enumerate one uSID carrier per (src GPU, dst GPU,")
+        print("    plane, spine) — an all-to-all × all-paths set. Add --sparse K [--spray N]")
+        print("    to model a real training run's connection set (linear, not quadratic).")
     print()
 
 
@@ -298,6 +352,12 @@ def main():
     ap.add_argument("--planes", type=int, default=4)
     ap.add_argument("--oversub", type=float, default=1.0,
                     help="downlink:uplink ratio (1.0 = non-blocking, 3.0 = 3:1)")
+    ap.add_argument("--sparse", type=int, default=None,
+                    help="connections (peers) per GPU — a real training-run hot set "
+                         "instead of the all-to-all mesh (e.g. 32). Makes EV state linear.")
+    ap.add_argument("--spray", type=int, default=None,
+                    help="paths (EVs) per cross-leaf flow per plane; caps the per-spine "
+                         "fan-out (e.g. 4). Default = all spines (full spray).")
     ap.add_argument("--dry-run", action="store_true",
                     help="generate the configs and report their on-disk size")
     a = ap.parse_args()
@@ -311,11 +371,20 @@ def main():
     nspeed = a.nic_speed if a.nic_speed is not None else ask("Per-NIC throughput (Gbps, via breakout)", 200, float)
     planes = a.planes if not interactive else ask("Planes", a.planes, int)
     oversub = a.oversub if not interactive else ask("Oversubscription (down:up, 1=non-blocking)", a.oversub, float)
+    sparse, spray = a.sparse, a.spray
+    if interactive:
+        s = ask("Sparse: connections per GPU (blank = full mesh)", "", str)
+        sparse = int(s) if s.strip().isdigit() else None
+        if sparse is not None:
+            s = ask("  paths per cross-leaf flow (blank = all spines)", "", str)
+            spray = int(s) if s.strip().isdigit() else None
 
     if gpus < 1 or ports < 2 or pspeed <= 0 or nspeed <= 0 or planes < 1:
         sys.exit("error: GPUs>=1, ports>=2, speeds>0, planes>=1 required.")
+    if sparse is not None and sparse < 1:
+        sys.exit("error: --sparse must be >= 1.")
 
-    p, warn = plan(gpus, ports, pspeed, nspeed, planes, oversub)
+    p, warn = plan(gpus, ports, pspeed, nspeed, planes, oversub, sparse=sparse, spray=spray)
     print_plan(p, warn)
 
     do_dry = a.dry_run
