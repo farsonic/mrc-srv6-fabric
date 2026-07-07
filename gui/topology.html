@@ -657,9 +657,10 @@ function hCell(h){   // forward/return metric cells: rtt + loss
   return `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td><td class="num">${fmtPct(h&&h.loss_pct)}</td>`;
 }
 function viaCell(rec){
+  const dr=rec.drained?' <span class="draintag">drained</span>':'';
   return rec.spine
-    ? `<b>${shortName(rec.spine)}</b><br><span class="carrier">${rec.usid}</span>`
-    : `<span class="st-none">direct</span><br><span class="carrier">${rec.usid}</span>`;
+    ? `<b>${shortName(rec.spine)}</b>${dr}<br><span class="carrier">${rec.usid}</span>`
+    : `<span class="st-none">direct</span>${dr}<br><span class="carrier">${rec.usid}</span>`;
 }
 function statusCell(s){ return `<span class="dot ${s.cls}"></span><span class="st-${s.cls}">${s.label}</span>`; }
 

@@ -27,7 +27,7 @@ import argparse, json, os, re, signal, socket, struct, subprocess, sys, tempfile
 from urllib import request as urlreq, error as urlerr
 
 DEFAULT_IFACE   = "mrc0"
-MRC_NIC_BUILD   = "2026-07-07-g22-maint-drain"  # bump on every change; printed at startup
+MRC_NIC_BUILD   = "2026-07-07-g23-drain-visible"  # bump on every change; printed at startup
 DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
 METRICS_PERIOD  = 1.0
 RECONNECT_BASE  = 1.0
@@ -1287,6 +1287,10 @@ class MeshHealth(threading.Thread):
         # node. We keep PROBING them (so the dashboard shows when the node is
         # safe to return) but steer data traffic off them below.
         self.drained_ids = {p.get("path_id") for p in plan if p.get("drained")}
+        if self.state is not None:
+            # persist so `mrc-nic paths`/`status` (separate processes reading the
+            # state file) can flag the drained EVs, not just the live weigher.
+            self.state.set("drained", sorted(self.drained_ids))
         self._last_plan = time.time()
 
     def _refresh_peers(self):
@@ -2219,11 +2223,16 @@ def _decode_carrier(usid):
 def cmd_paths(args):
     s = _read_state(resolve_state_path(args.state))
     decode = getattr(args, "decode", False)
+    drained = set(s.get("drained") or [])
+
+    def _is_drained(e):
+        return e.get("path") in drained or e.get("spine") in drained
 
     def show_ev(e):
         sp = e.get("spine") or "same-leaf"
         usid = e.get("usid", "?")
-        print(f"       EV {e.get('entropy','?'):>5}  via {sp:<8}  {usid}")
+        tag = "  [DRAINED — maintenance]" if _is_drained(e) else ""
+        print(f"       EV {e.get('entropy','?'):>5}  via {sp:<8}  {usid}{tag}")
         if decode and usid != "?":
             block, hops = _decode_carrier(usid)
             print(f"          block {block}  +  {len(hops)} uSID(s):")
@@ -2233,7 +2242,10 @@ def cmd_paths(args):
     peers = s.get("peers")
     if isinstance(peers, dict) and peers:
         total = sum(len(v.get("active_evs", [])) for v in peers.values())
-        print(f"mode=SRV6  peers={len(peers)}  total_evs={total}")
+        ndr = sum(1 for v in peers.values()
+                  for e in v.get("active_evs", []) if _is_drained(e))
+        extra = f"  ({ndr} drained)" if ndr else ""
+        print(f"mode=SRV6  peers={len(peers)}  total_evs={total}{extra}")
         for dst in sorted(peers):
             v = peers[dst]
             flow = v.get("flow") or {}
