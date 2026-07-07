@@ -212,27 +212,45 @@ def _gen(tmp, leaves, spines, gpus_per_leaf, planes):
     return b, gpu
 
 
-def _estimate(p, tmp):
-    """Project config size from ONE tiny single-plane reference build.
+def ev_count(gpus, gpus_per_leaf, planes, spines):
+    """Total EV (uSID carrier) records the generator materialises.
 
-    The dominant term (per-GPU EV profiles + the probe mesh) grows as O(GPUs^2 *
-    planes) — each GPU carries one carrier per destination GPU per plane — so we
-    scale those buckets by (G/G_ref)^2 * planes and the switch buckets linearly by
-    the switch-node ratio. Tiny reference => fast; the quadratic law => honest."""
+    Each source GPU stores one EV per destination GPU, per plane, and — for
+    destinations on a DIFFERENT leaf — per spine (a distinct parallel path):
+        same-leaf dsts  (K-1)        -> planes EVs each   (spine=null)
+        cross-leaf dsts (G-K)        -> planes*spines EVs each
+    So the all-to-all set is ~ G^2 * planes * spines. This is what the profiles
+    (mrc-nic/*.json) and the probe mesh (fabric_vars.json) enumerate, and it is
+    the term that dominates config size at scale. Verified against real builds:
+    2x GPUs -> ~4x bytes, 2x spines -> ~2x bytes."""
+    same = max(0, gpus_per_leaf - 1) * planes
+    cross = max(0, gpus - gpus_per_leaf) * planes * spines
+    return gpus * (same + cross)
+
+
+def _estimate(p, tmp):
+    """Project config size from ONE tiny reference build + the exact EV-count law.
+
+    We build a small fabric just to MEASURE the per-EV byte cost of the profile
+    and mesh JSON, then scale by the ratio of analytically-computed EV counts
+    (which captures GPUs^2, planes AND spines exactly). Tiny reference => fast;
+    the closed-form ratio => accurate regardless of spine/plane count."""
     rl, rs = 4, min(p["spines"], 4)
     rk = min(p["gpus_per_leaf"], 8)               # keep the reference ~32 GPUs = fast
-    b, gpu_ref = _gen(tmp, rl, rs, rk, 1)
+    b, gpu_ref = _gen(tmp, rl, rs, rk, 1)         # planes=1 dodges the mgmt-stride collision
     if gpu_ref < 1:
         raise RuntimeError("reference build produced no GPU profiles")
-    qfac = (p["actual_gpus"] / gpu_ref) ** 2 * p["planes"]     # O(G^2 * planes)
+    ev_ref = ev_count(gpu_ref, rk, 1, rs)
+    ev_tgt = ev_count(p["actual_gpus"], p["gpus_per_leaf"], p["planes"], p["spines"])
+    ratio = (ev_tgt / ev_ref) if ev_ref else 0.0
     sw_ref = (rl + rs) * 1
     sw_tgt = (p["leaves"] + p["spines"]) * p["planes"]
-    linfac = sw_tgt / sw_ref
-    prof = b["prof"] * qfac
-    mesh = b["mesh"] * qfac
-    clab = b["clab"] * (((p["leaves"] + p["spines"]) * p["planes"]) / sw_ref)  # ~linear in nodes
-    other = b["other"] * linfac
-    return dict(total=prof + mesh + clab + other, prof=prof, mesh=mesh, clab=clab, other=other)
+    prof = b["prof"] * ratio                          # scales with EV count
+    mesh = b["mesh"] * ratio                          # scales with EV count
+    clab = b["clab"] * (sw_tgt + p["actual_gpus"]) / (sw_ref + gpu_ref)  # ~linear in nodes+links
+    other = b["other"] * sw_tgt / sw_ref              # ~linear in switch nodes
+    return dict(total=prof + mesh + clab + other, prof=prof, mesh=mesh, clab=clab,
+                other=other, evs=ev_tgt)
 
 
 def dry_run(p):
@@ -244,7 +262,9 @@ def dry_run(p):
                 try:
                     b, _g = _gen(tmp, p["leaves"], p["spines"], p["gpus_per_leaf"], p["planes"])
                     est = dict(total=sum(b.values()), prof=b["prof"], mesh=b["mesh"],
-                               clab=b["clab"], other=b["other"])
+                               clab=b["clab"], other=b["other"],
+                               evs=ev_count(p["actual_gpus"], p["gpus_per_leaf"],
+                                            p["planes"], p["spines"]))
                     exact = True
                 except RuntimeError:      # multi-plane mgmt-stride collision at this scale
                     shutil.rmtree(tmp, ignore_errors=True); os.mkdir(tmp)
@@ -254,17 +274,18 @@ def dry_run(p):
         except RuntimeError as e:
             print(f"  ! dry-run failed: {e}")
             return
-    tag = "measured" if exact else "estimated from a 32-GPU reference (O(GPUs²·planes) law)"
+    tag = "measured" if exact else "estimated from a ~32-GPU reference + EV-count law"
     print(f"\n  config size ({tag}):")
     print(f"    total on-disk configs    {human(est['total'])}")
-    print(f"    ├ per-GPU EV profiles    {human(est['prof'])}   (mrc-nic/*.json — 1 carrier / dest GPU / plane)")
+    print(f"    ├ per-GPU EV profiles    {human(est['prof'])}   (mrc-nic/*.json)")
     print(f"    ├ probe mesh (vars.json) {human(est['mesh'])}   (GUI/mesh inventory)")
     print(f"    ├ clab topology (.yml)   {human(est['clab'])}   (single YAML containerlab parses)")
     print(f"    └ per-switch FRR configs {human(est['other'])}")
+    print(f"    EV carrier records       {est['evs']:,}   (= GPUs² · planes · spines, all-to-all)")
     print(f"    ~ per node               {human(est['total'] / max(1, p['containers']))}")
-    if not exact:
-        print("    note: the profile + mesh terms scale QUADRATICALLY with GPU count — an")
-        print("          all-to-all EV set is the real cost at scale, not the switch configs.")
+    print("    the profile + mesh JSON enumerate one uSID carrier per (src GPU, dst GPU,")
+    print("    plane, spine) — an all-to-all × all-paths set. That product, not the switch")
+    print("    configs, is the real cost; sparsifying it (per-peer EVs) is the way down.")
     print()
 
 
