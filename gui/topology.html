@@ -199,6 +199,8 @@
   .hoverdetail th{color:var(--dim);font-weight:600;text-align:left;padding:2px 9px;white-space:nowrap}
   .hoverdetail td{padding:2px 9px;white-space:nowrap}
   .hoverdetail td.if{color:var(--leaf)} .hoverdetail td.ip{color:#bcd0e4;font-variant-numeric:tabular-nums}
+  .hoverdetail .cap{cursor:pointer;margin-left:6px;opacity:.7;user-select:none}
+  .hoverdetail .cap:hover{opacity:1}
   .hoverdetail td.nd b{color:var(--ink)} .hoverdetail .arrow{color:var(--dim);text-align:center}
   .hoverdetail tr.hop td{border-top:1px solid #14202b}
   /* carrier progression box */
@@ -774,10 +776,14 @@ function showLinkDetail(title,links,rec){
   const wrap=document.getElementById('hoverDetail'), box=document.getElementById('linkDetail');
   if(!wrap||!box) return;
   if(!links||!links.length){ wrap.classList.remove('show'); return; }
+  // per-END capture: 🦈 opens Edgeshark on THAT node's interface (either end of
+  // the link). Needs the docker socket (netns lookup) — shown only when enabled.
+  const cap=(node,ifc)=> (CONSOLE_ENABLED && ifc) ?
+    ` <span class="cap" data-node="${node}" data-if="${ifc}" title="capture ${node} ${ifc} in Edgeshark">🦈</span>` : '';
   const rows=links.map(l=>
-    `<tr class="hop"><td class="nd"><b>${l.aNode}</b></td><td class="if">${l.aIf||'·'}</td>`+
+    `<tr class="hop"><td class="nd"><b>${l.aNode}</b></td><td class="if">${l.aIf||'·'}${cap(l.aNode,l.aIf)}</td>`+
     `<td class="ip">${ifAddr(l.aNode,l.aIf)||'·'}</td><td class="arrow">↔</td>`+
-    `<td class="nd"><b>${l.bNode}</b></td><td class="if">${l.bIf||'·'}</td>`+
+    `<td class="nd"><b>${l.bNode}</b></td><td class="if">${l.bIf||'·'}${cap(l.bNode,l.bIf)}</td>`+
     `<td class="ip">${ifAddr(l.bNode,l.bIf)||'·'}</td></tr>`).join('');
   box.innerHTML=`<div class="ld-title">${title}</div><table>`+
     `<tr><th>node</th><th>if</th><th>IPv6</th><th></th><th>node</th><th>if</th><th>IPv6</th></tr>`+
@@ -789,6 +795,21 @@ function scheduleHideLD(){ clearTimeout(ldTimer);
   ldTimer=setTimeout(()=>{ const b=document.getElementById('hoverDetail'); if(b) b.classList.remove('show'); },400); }
 function hideLinkDetail(){ clearTimeout(ldTimer);
   const b=document.getElementById('hoverDetail'); if(b) b.classList.remove('show'); }
+// open Edgeshark packet capture on one end of a link (a node + interface). The
+// netns inode comes from the backend; the packetflix:// URL is handled by the
+// Edgeshark browser extension (cshargextcap), which launches Wireshark.
+function openCapture(node,iface){
+  fetch('/api/netns?node='+encodeURIComponent(node),{cache:'no-store'})
+    .then(r=>r.json().then(j=>r.ok?j:Promise.reject(j.error||('HTTP '+r.status))))
+    .then(d=>{
+      const c={netns:d.netns,"network-interfaces":[iface],name:d.container,type:"docker",prefix:""};
+      const url=`packetflix:ws://${location.hostname}:5001/capture?`+
+        `container=${encodeURIComponent(JSON.stringify(c))}&nif=${encodeURIComponent(iface)}`;
+      window.location.href=url;   // custom scheme -> Edgeshark extension, page stays
+    })
+    .catch(err=>alert('Edgeshark capture failed: '+err+
+      '\n(needs Edgeshark running + the cshargextcap browser extension)'));
+}
 function highlightPath(rec){
   if(!EDGES) return;
   const seq=pathHops(rec), want=new Set(), nodes=new Set(seq);
@@ -1006,6 +1027,11 @@ document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&
   const box=document.getElementById("hoverDetail");
   box.addEventListener("mouseenter",()=>clearTimeout(ldTimer));
   box.addEventListener("mouseleave",hideLinkDetail);
+  // delegated: click a 🦈 on either end of a link -> Edgeshark capture on that iface
+  box.addEventListener("click",e=>{
+    const cap=e.target.closest(".cap");
+    if(cap && cap.dataset.node && cap.dataset.if){ openCapture(cap.dataset.node,cap.dataset.if); }
+  });
 })();
 // resizable inspector (vertical drag) + paths panel (horizontal drag)
 (function(){

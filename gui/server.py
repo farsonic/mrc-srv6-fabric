@@ -142,6 +142,19 @@ def docker_exec(container, argv, timeout=20):
         pass
     return (rc if rc is not None else 0), text
 
+def container_netns(container):
+    """The network-namespace inode of a container — what Edgeshark/packetflix keys
+    a capture on. Read from INSIDE the container (`readlink /proc/self/ns/net` ->
+    'net:[4026532797]') via the docker socket, so no host /proc access is needed;
+    the nsfs inode is global, so it matches what Edgeshark sees. Returns int/None."""
+    rc, out = docker_exec(container, ["sh", "-lc", "readlink /proc/self/ns/net"])
+    if "[" in out and "]" in out:
+        try:
+            return int(out.split("[", 1)[1].split("]", 1)[0])
+        except ValueError:
+            pass
+    return None
+
 def docker_exec_tty(container):
     """Create an interactive TTY exec (a login shell) and hijack its stream.
     Returns (exec_id, raw_socket, initial_bytes) or (None, None, b'')."""
@@ -553,6 +566,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self.headers.get("Upgrade", "").lower() == "websocket":
             node = (parse_qs(u.query).get("node") or [""])[0]
             return self._console_ws(node)
+        if path == "/api/netns":
+            # container name + netns inode for a node, so the GUI can build an
+            # Edgeshark packetflix:// capture URL for a chosen interface.
+            if not docker_available():
+                return self._send_json({"error": "needs the docker socket "
+                                        "(deploy with -e gui_console=true)"}, code=503)
+            node = (parse_qs(u.query).get("node") or [""])[0]
+            try:
+                ctr = container_for(self._fab(), node)
+            except Exception as e:
+                return self._send_json({"error": f"docker API error: {e}"}, code=502)
+            if not ctr:
+                return self._send_json({"error": "unknown node", "node": node}, code=404)
+            netns = container_netns(ctr)
+            if not netns:
+                return self._send_json({"error": "could not read netns"}, code=502)
+            return self._send_json({"node": node, "container": ctr, "netns": netns})
         if path == "/api/reports":           # debug: raw posted health
             with _LOCK:
                 return self._send_json(_REPORTS)

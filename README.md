@@ -343,6 +343,11 @@ in the browser — install the one-time **Edgeshark browser extension**
 (`cshargextcap`) for the Wireshark handoff; the in-browser topology/interface
 view works without it.
 
+You can also launch a capture straight from the topology GUI: hover a node or a
+path, and in the link-detail table click the **🦈** on either end of a link to
+open Wireshark on that node's interface (needs `-e gui_console=true` so the GUI
+can read the container netns).
+
 > Edgeshark runs privileged host-level containers (`pid:host` + scoped caps), so
 > it is **lab-only** and off by default.
 
