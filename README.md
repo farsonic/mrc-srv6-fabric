@@ -448,6 +448,30 @@ Measured on a 64-GPU fabric (8 leaves x 8 GPUs):
 At 4096 GPUs those counts are unchanged. Adding GPUs to other leaves changes
 nothing on a given leaf or any spine.
 
+### Plan a fabric — `plan_fabric.py`
+
+Don't work out `leaves`/`spines`/`gpus_per_leaf` by hand. Tell the planner your
+GPU count, ports per leaf, port speed and per-NIC throughput (breakout cables
+split one high-speed leaf port into several NIC-facing links), and it derives the
+CLOS shape, checks the address-plan caps, and prints the exact `ansible-playbook`
+command:
+
+```bash
+python3 plan_fabric.py                       # interactive
+python3 plan_fabric.py --gpus 10000 --ports-per-leaf 64 \
+  --port-speed 800 --nic-speed 200 --planes 4 --dry-run
+```
+
+`--dry-run` generates the configs (small fabrics for real; huge ones projected
+from a tiny reference build) and reports the on-disk config size. It surfaces the
+real scaling walls: mgmt IPv4 `/22` (hard-fails past ~256 GPUs), the per-plane
+mgmt stride (leaf/spine collide past ~20 switches/plane when multi-plane), the
+255-per-plane index cap, and — the big one — the **all-to-all EV set**: each GPU
+carries one uSID carrier per destination GPU per plane, so profile + mesh configs
+grow **O(GPUs²·planes)** (≈ hundreds of GB at 10,000 GPUs, while the switch
+configs stay trivial). That quadratic, not the switches, is what a real
+large-scale build must sparsify.
+
 ---
 
 ## Troubleshooting

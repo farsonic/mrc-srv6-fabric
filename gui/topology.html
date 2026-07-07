@@ -244,7 +244,7 @@
   <aside id="aside">
     <h2>Inspector</h2>
     <div id="panel" class="empty">
-      Hover a node or a path to see its links (interfaces + IPv6).<br>Click to pin its details here.
+      Click a node or a path to see its links (interfaces + IPv6) and pin its details here.<br>Click it again to clear.
       <div class="legend">
         <span><i style="background:#f0a830"></i>spine</span>
         <span><i style="background:#3fb6d3"></i>leaf</span>
@@ -427,10 +427,16 @@ function render(data){
       if(nd.loopback)
         g.appendChild(el("text",{x:p.x,y:p.y+9,class:"sub"},loStr(nd.loopback)));
     }
-    g.addEventListener("mouseenter",()=>{ highlight(name,edges);
-      showLinkDetail(`links · ${name}`, nodeLinks(name)); });
-    g.addEventListener("mouseleave",()=>{ if(!pinned) clearHi(edges); scheduleHideLD(); });
-    g.addEventListener("click",()=>{ pinned=name; showInfo(name,nodes); highlight(name,edges); });
+    // click-only (no hover): clicking a node highlights its links + shows its
+    // detail; clicking the same node again clears. Lets you move the cursor
+    // freely without the inspector/link/carrier boxes changing under it.
+    g.addEventListener("click",()=>{
+      if(pinned===name){ clearHi(edges); hideLinkDetail(); }
+      else{ selPathKey=null;
+        document.querySelectorAll('#pathsTable tr.sel').forEach(r=>r.classList.remove('sel'));
+        pinned=name; showInfo(name,nodes); highlight(name,edges);
+        showLinkDetail(`links · ${name}`, nodeLinks(name)); }
+    });
     nodeLayer.appendChild(g);
     byName[name]=g;
   }
@@ -482,7 +488,7 @@ function clearHi(edges){
   Object.values(byName).forEach(g=>g.classList.remove("dim"));
   document.getElementById("panel").className="empty";
   document.getElementById("panel").innerHTML=
-    'Hover a node to highlight its links.<br>Click to pin its details here.';
+    'Click a node to highlight its links and pin its details here.';
 }
 
 function showInfo(name,nodes){
@@ -944,12 +950,11 @@ function pathTitle(rec){
 }
 function wireRow(tr,rec,key){
   if(key===selPathKey) tr.classList.add('sel');
-  tr.addEventListener('mouseenter',()=>{ if(!selPathKey) highlightPath(rec);
-    showLinkDetail(pathTitle(rec), pathLinks(rec), rec); });
-  tr.addEventListener('mouseleave',()=>{ if(!selPathKey) clearPathHi(); scheduleHideLD(); });
+  // click-only (no hover): clicking a path row highlights its hops + shows the
+  // link + SRv6 carrier boxes; clicking it again clears.
   tr.addEventListener('click',()=>{
     if(selPathKey===key){ selPathKey=null; tr.classList.remove('sel'); clearPathHi(); hideLinkDetail(); }
-    else{ selPathKey=key;
+    else{ selPathKey=key; pinned=null;
       document.querySelectorAll('#pathsTable tr.sel').forEach(r=>r.classList.remove('sel'));
       tr.classList.add('sel'); highlightPath(rec); showLinkDetail(pathTitle(rec), pathLinks(rec), rec); }
   });
@@ -1022,11 +1027,10 @@ document.getElementById("runBtn").addEventListener("click",runCmd);
 document.getElementById("runInput").addEventListener("keydown",e=>{ if(e.key==="Enter") runCmd(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&
   document.getElementById("consoleModal").classList.contains("open")) closeConsole(); });
-// keep the hover-detail panels open while the cursor is over them (readable/scrollable)
+// detail panels are click-driven now — they stay open until you deselect the
+// node/path (no auto-hide on mouse-leave, so you can read/scroll freely)
 (function(){
   const box=document.getElementById("hoverDetail");
-  box.addEventListener("mouseenter",()=>clearTimeout(ldTimer));
-  box.addEventListener("mouseleave",hideLinkDetail);
   // delegated: click a 🦈 on either end of a link -> Edgeshark capture on that iface
   box.addEventListener("click",e=>{
     const cap=e.target.closest(".cap");
