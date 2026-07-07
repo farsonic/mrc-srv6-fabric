@@ -328,12 +328,13 @@ curl -X POST http://<host>:8080/api/bypass -d '{"planes":[]}'          # restore
 ## Live packet capture (Edgeshark)
 
 Deploy [Siemens Edgeshark](https://github.com/siemens/edgeshark) for live
-per-link packet capture across every container in the fabric:
+per-link packet capture across every container in the fabric. It is a built-in
+option of the playbook (compose stack in `ansible/files/edgeshark-compose.yml`,
+auto-detecting `docker compose` v2 or the classic `docker-compose`):
 
 ```bash
 ansible-playbook site-frr.yml -e gpus_per_leaf=2 -e leaves=2 -e spines=2 \
-  -e do_gui=true -e do_edgeshark=true
-# or standalone: docker compose -f edgeshark/docker-compose.yml -p edgeshark up -d
+  -e do_gui=true -e do_edgeshark=true          # -e edgeshark_port=5001 to change the port
 ```
 
 Open `http://<this-host>:5001` (the GUI header also links to it). Edgeshark
@@ -433,10 +434,9 @@ gui/
                        exec / websocket-console API (stdlib only)
   topology.html        the dashboard (topology, live paths, inspector, console)
   vendor/              xterm.js (vendored, MIT) for the in-browser console
-edgeshark/
-  docker-compose.yml   Siemens Edgeshark stack for live per-link capture
 ansible/
   site-frr.yml         main deploy playbook (fabric + GUI + Edgeshark)
+  files/edgeshark-compose.yml  Siemens Edgeshark stack for live per-link capture
   roles/sonic_frr/     switch (FRR) config role
   roles/gpu_host/      GPU host bootstrap (image-agnostic iproute2/python3)
   group_vars/all.yml   defaults (spec_mode, do_gui, gui_console, do_edgeshark, ...)
