@@ -25,6 +25,11 @@ edgeshark_port: 5001      # web UI port on this host
 do_gui: false             # optional topology GUI; enable with -e do_gui=true
 gui_port: 8080            # host port for the topology viewer + path-health API
 gui_image: python:3.12-slim  # tiny image used to serve the GUI (runs gui/server.py)
+# gui_console mounts the host docker socket into the GUI container so the web UI
+# can open an in-browser shell / run commands on each node (Console button).
+# SECURITY: this grants the GUI container full control of the host's Docker —
+# only enable on a trusted/lab host. Off by default. Enable with -e gui_console=true
+gui_console: false
 # Attach the NICs to the GUI backend so the paths table shows LIVE test-probe
 # health. Empty = NICs run standalone (no mesh; table shows the path inventory
 # only). Set to this host's reachable URL, e.g. http://172.20.20.1:8080

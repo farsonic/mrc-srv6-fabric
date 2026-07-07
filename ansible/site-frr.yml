@@ -254,6 +254,7 @@
           --restart unless-stopped
           -p {{ gui_port }}:8080
           -v {{ proj | realpath }}:/srv:ro
+          {{ '-v /var/run/docker.sock:/var/run/docker.sock' if (gui_console | default(false) | bool) else '' }}
           -w /srv
           {{ gui_image }}
           python3 gui/server.py --port 8080 --root /srv

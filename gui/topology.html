@@ -141,7 +141,39 @@
   .st-up{color:var(--link-hot)} .st-deg{color:#f0c050}
   .st-down{color:#ff7a7a} .st-none{color:#5a6b7a} .st-denied{color:#c08af0}
   .paths-empty{padding:18px 20px;color:var(--dim);font-size:12px;line-height:1.7}
+  /* console modal (feature 4) */
+  .modal-bg{position:fixed;inset:0;background:rgba(4,8,12,.72);z-index:40;display:none;
+            align-items:center;justify-content:center}
+  .modal-bg.open{display:flex}
+  .modal{width:min(1000px,94vw);height:min(680px,88vh);background:#0b1219;
+         border:1px solid var(--rule);border-radius:10px;display:flex;flex-direction:column;
+         box-shadow:0 24px 60px rgba(0,0,0,.6)}
+  .modal-head{display:flex;align-items:center;gap:12px;padding:11px 16px;
+              border-bottom:1px solid var(--rule)}
+  .modal-head .mname{font-weight:600;font-size:14px}
+  .modal-head .tabs{display:flex;gap:6px;margin-left:8px}
+  .modal-head .tab{background:#131e28;border:1px solid var(--rule);color:var(--dim);
+                   border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer}
+  .modal-head .tab.active{color:var(--ink);border-color:var(--accent);background:#16283a}
+  .modal-head .grow{flex:1}
+  .modal-head .x{background:none;border:none;color:var(--dim);font-size:20px;cursor:pointer;line-height:1}
+  .modal-head .x:hover{color:#fff}
+  .modal-body{flex:1;min-height:0;position:relative}
+  .pane{position:absolute;inset:0;display:none;flex-direction:column}
+  .pane.active{display:flex}
+  #termHost{flex:1;min-height:0;padding:8px 6px 6px 10px;background:#000;border-bottom-left-radius:10px;border-bottom-right-radius:10px}
+  .runbar{display:flex;gap:8px;padding:10px 12px;border-bottom:1px solid var(--rule);flex-wrap:wrap}
+  .runbar input{flex:1;min-width:180px;background:#060b10;border:1px solid var(--rule);
+                border-radius:6px;color:var(--ink);font:inherit;font-size:12px;padding:7px 10px}
+  .runbar .quick{display:flex;gap:6px;flex-wrap:wrap;width:100%}
+  .runbar .quick button{font-size:11px;padding:3px 9px}
+  pre.runout{flex:1;margin:0;overflow:auto;background:#070c11;padding:12px 14px;
+             font-size:11.5px;line-height:1.5;color:#cfe0f0;white-space:pre-wrap}
+  .conn{font-size:11px;color:var(--dim)} .conn.ok{color:var(--link-hot)} .conn.err{color:#ff7a7a}
 </style>
+<link rel="stylesheet" href="/gui/vendor/xterm.css">
+<script src="/gui/vendor/xterm.js"></script>
+<script src="/gui/vendor/xterm-addon-fit.js"></script>
 </head>
 <body>
 <header>
@@ -189,6 +221,33 @@
     <div class="paths-empty" id="pathsEmpty" style="display:none"></div>
   </div>
 </section>
+
+<div class="modal-bg" id="consoleModal">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="mname" id="mName">node</span>
+      <div class="tabs">
+        <button class="tab active" id="tabTerm" data-pane="paneTerm">⌨ Terminal</button>
+        <button class="tab" id="tabRun" data-pane="paneRun">≫ Quick run</button>
+      </div>
+      <span class="conn" id="connState"></span>
+      <span class="grow"></span>
+      <button class="x" id="mClose" title="Close (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="pane active" id="paneTerm"><div id="termHost"></div></div>
+      <div class="pane" id="paneRun">
+        <div class="runbar">
+          <input id="runInput" placeholder="command to run on this node (e.g. ip -6 route)"
+                 autocomplete="off" spellcheck="false">
+          <button class="btn" id="runBtn">Run</button>
+          <div class="quick" id="runQuick"></div>
+        </div>
+        <pre class="runout" id="runOut">Run a command to see its output.</pre>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
 const SVGNS="http://www.w3.org/2000/svg";
@@ -399,6 +458,7 @@ function showInfo(name,nodes){
        <div class="kv">${kv.map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join("")}</div>
        <div class="panel-actions">
          <button class="btn ${bypassed?'on':'warn'}" id="bypassBtn">${bypassed?'● Restore node':'⏻ Bypass (drain)'}</button>
+         ${CONSOLE_ENABLED?`<button class="btn" id="consoleBtn">⌨ Console</button>`:''}
        </div>
      </div>
      <h2>Links (${nlinks})</h2>
@@ -410,7 +470,85 @@ function showInfo(name,nodes){
      </div>`;
   const bb=document.getElementById("bypassBtn");
   if(bb) bb.addEventListener("click",()=>toggleBypass(name));
+  const cb=document.getElementById("consoleBtn");
+  if(cb) cb.addEventListener("click",()=>openConsole(name));
   loadConfig(name);
+}
+
+// ---- feature 4: node console (interactive terminal + quick-run) ----
+let CONSOLE_ENABLED=false;
+let TERM=null, FIT=null, WS=null, CONSOLE_NODE=null;
+const QUICK={
+  spine:["show ipv6 route","show running-config"],
+  leaf:["show ipv6 route","show running-config"],
+  gpu:["ip -6 route show table 100","ip -6 rule show","cat /run/mrc-agent.json | head -40"]
+};
+function fetchConsoleInfo(){
+  fetch("/api/console-info",{cache:"no-store"}).then(r=>r.json())
+    .then(d=>{ CONSOLE_ENABLED=!!d.enabled; }).catch(()=>{CONSOLE_ENABLED=false;});
+}
+function setConn(txt,cls){ const e=document.getElementById("connState");
+  if(e){ e.textContent=txt; e.className="conn"+(cls?" "+cls:""); } }
+function switchPane(id){
+  document.querySelectorAll(".modal .tab").forEach(t=>t.classList.toggle("active",t.dataset.pane===id));
+  document.querySelectorAll(".modal .pane").forEach(p=>p.classList.toggle("active",p.id===id));
+  if(id==="paneTerm"&&FIT){ setTimeout(()=>{try{FIT.fit();sendResize();TERM&&TERM.focus();}catch(e){}},30); }
+}
+function sendResize(){ if(WS&&WS.readyState===1&&TERM)
+  try{ WS.send(JSON.stringify({type:"resize",cols:TERM.cols,rows:TERM.rows})); }catch(e){} }
+function openConsole(name){
+  CONSOLE_NODE=name;
+  const role=((DATA&&DATA.nodes&&DATA.nodes[name])||{}).role||"gpu";
+  document.getElementById("mName").textContent=name+"  ·  "+role;
+  document.getElementById("consoleModal").classList.add("open");
+  // quick-run buttons for this role
+  const q=document.getElementById("runQuick"); q.innerHTML="";
+  const cmds=(QUICK[role]||[]).map(c=> role==="gpu"?c:`vtysh -c "${c}"`);
+  cmds.forEach(c=>{ const b=document.createElement("button"); b.className="btn";
+    b.textContent=c.length>34?c.slice(0,32)+"…":c;
+    b.title=c; b.addEventListener("click",()=>{ document.getElementById("runInput").value=c; runCmd(); });
+    q.appendChild(b); });
+  document.getElementById("runOut").textContent="Run a command to see its output.";
+  switchPane("paneTerm");
+  startTerm(name);
+}
+function startTerm(name){
+  const host=document.getElementById("termHost"); host.innerHTML="";
+  TERM=new Terminal({fontSize:12,fontFamily:'ui-monospace,Menlo,Consolas,monospace',
+    theme:{background:"#000000"},cursorBlink:true,convertEol:false,scrollback:4000});
+  try{ FIT=new FitAddon.FitAddon(); TERM.loadAddon(FIT); }catch(e){ FIT=null; }
+  TERM.open(host); try{ FIT&&FIT.fit(); }catch(e){}
+  setConn("connecting…");
+  const proto=location.protocol==="https:"?"wss":"ws";
+  WS=new WebSocket(`${proto}://${location.host}/api/console?node=${encodeURIComponent(name)}`);
+  WS.binaryType="arraybuffer";
+  const enc=new TextEncoder();
+  WS.onopen=()=>{ setConn("● connected","ok"); sendResize(); TERM.focus(); };
+  WS.onmessage=ev=>{ if(typeof ev.data==="string") TERM.write(ev.data);
+    else TERM.write(new Uint8Array(ev.data)); };
+  WS.onclose=()=>{ setConn("● disconnected","err"); TERM&&TERM.write("\r\n[console closed]\r\n"); };
+  WS.onerror=()=>setConn("● error","err");
+  TERM.onData(d=>{ if(WS&&WS.readyState===1) WS.send(enc.encode(d)); });
+  window.addEventListener("resize",consoleResize);
+}
+function consoleResize(){ if(FIT&&document.getElementById("consoleModal").classList.contains("open")){
+  try{ FIT.fit(); sendResize(); }catch(e){} } }
+function closeConsole(){
+  document.getElementById("consoleModal").classList.remove("open");
+  window.removeEventListener("resize",consoleResize);
+  try{ WS&&WS.close(); }catch(e){} WS=null;
+  try{ TERM&&TERM.dispose(); }catch(e){} TERM=null; FIT=null; CONSOLE_NODE=null;
+}
+function runCmd(){
+  const inp=document.getElementById("runInput"), out=document.getElementById("runOut");
+  const cmd=inp.value.trim(); if(!cmd||!CONSOLE_NODE) return;
+  out.textContent="running…";
+  fetch("/api/exec",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({node:CONSOLE_NODE,cmd})})
+    .then(r=>r.json())
+    .then(d=>{ out.textContent = d.error ? ("error: "+d.error)
+      : ((d.out||"").replace(/\s+$/,"") + `\n\n[exit ${d.rc}]`); })
+    .catch(e=>{ out.textContent="request failed: "+e; });
 }
 
 // ---- feature 5: maintenance bypass (drain traffic off a node) ----
@@ -648,6 +786,14 @@ function fit(svg){
 document.getElementById("fit").addEventListener("click",()=>window._fit&&window._fit());
 document.getElementById("dlcfg").addEventListener("click",()=>{ location.href="/api/configs.tar.gz"; });
 window.addEventListener("resize",()=>window._fit&&window._fit());
+// console modal wiring (feature 4)
+fetchConsoleInfo();
+document.getElementById("mClose").addEventListener("click",closeConsole);
+document.querySelectorAll(".modal .tab").forEach(t=>t.addEventListener("click",()=>switchPane(t.dataset.pane)));
+document.getElementById("runBtn").addEventListener("click",runCmd);
+document.getElementById("runInput").addEventListener("keydown",e=>{ if(e.key==="Enter") runCmd(); });
+document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&
+  document.getElementById("consoleModal").classList.contains("open")) closeConsole(); });
 boot();
 pollMesh();                         // live probe health (no-op when no backend)
 setInterval(pollMesh,3000);

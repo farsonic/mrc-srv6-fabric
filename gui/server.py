@@ -31,10 +31,197 @@ Usage:
   python3 gui/server.py [--port 8080] [--root .] [--vars fabric_vars.json]
 """
 
-import argparse, io, json, os, tarfile, threading, time
+import argparse, base64, hashlib, http.client, io, json, os, select, socket, \
+       struct, tarfile, threading, time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+# ---- optional Docker access (console feature, opt-in) ----------------------
+# The GUI reaches the node containers through the Docker Engine API over the
+# mounted socket — no docker CLI needed in the image. Off unless the socket is
+# present (operator mounts it explicitly), so the default GUI stays unprivileged.
+DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
+_DOCKER_API = "v1.43"
+_CTR_CACHE = {}        # node -> container name (resolved once)
+_CTR_LOCK = threading.Lock()
+
+def docker_available():
+    try:
+        return os.path.exists(DOCKER_SOCK)
+    except OSError:
+        return False
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """http.client speaking to the Docker Engine API over its unix socket."""
+    def __init__(self, timeout=15):
+        super().__init__("localhost", timeout=timeout)
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(DOCKER_SOCK)
+        self.sock = s
+
+def _docker_json(method, path, body=None, timeout=15):
+    c = _UnixHTTPConnection(timeout=timeout)
+    data = json.dumps(body).encode() if body is not None else None
+    c.request(method, f"/{_DOCKER_API}{path}", body=data,
+              headers={"Content-Type": "application/json", "Host": "docker"})
+    r = c.getresponse()
+    raw = r.read()
+    c.close()
+    return r.status, (json.loads(raw) if raw else None)
+
+def container_for(fab, node):
+    """The running container name for a fabric node (clab names it
+    clab-<lab>-<node>). Only nodes present in fabric_vars are resolvable."""
+    if node not in (fab.get("nodes") or {}):
+        return None
+    with _CTR_LOCK:
+        if node in _CTR_CACHE:
+            return _CTR_CACHE[node]
+    try:
+        st, arr = _docker_json("GET", "/containers/json?all=1")
+    except Exception:
+        return None
+    if st != 200 or not arr:
+        return None
+    hit = None
+    for ctr in arr:
+        for nm in (ctr.get("Names") or []):
+            nm = nm.lstrip("/")
+            if nm == node or nm.endswith("-" + node):
+                hit = nm
+                break
+        if hit:
+            break
+    if hit:
+        with _CTR_LOCK:
+            _CTR_CACHE[node] = hit
+    return hit
+
+def _demux(raw):
+    """Flatten Docker's multiplexed (non-TTY) exec stream: repeated frames of an
+    8-byte header [stream, 0,0,0, size(4, big-endian)] followed by `size` bytes."""
+    out = []
+    i, n = 0, len(raw)
+    while i + 8 <= n:
+        size = struct.unpack(">I", raw[i + 4:i + 8])[0]
+        out.append(raw[i + 8:i + 8 + size])
+        i += 8 + size
+    if i < n:                      # tolerate a non-framed tail (older daemons)
+        out.append(raw[i:])
+    return b"".join(out)
+
+def docker_exec(container, argv, timeout=20):
+    """Run argv in a container, non-interactively; return (rc, text)."""
+    st, ex = _docker_json("POST", f"/containers/{container}/exec",
+                          {"AttachStdout": True, "AttachStderr": True,
+                           "Tty": False, "Cmd": argv}, timeout=timeout)
+    if st not in (200, 201) or not ex or "Id" not in ex:
+        return 1, f"exec create failed (HTTP {st})"
+    eid = ex["Id"]
+    c = _UnixHTTPConnection(timeout=timeout)
+    c.request("POST", f"/{_DOCKER_API}/exec/{eid}/start",
+              body=json.dumps({"Detach": False, "Tty": False}).encode(),
+              headers={"Content-Type": "application/json", "Host": "docker"})
+    r = c.getresponse()
+    raw = r.read()
+    c.close()
+    text = _demux(raw).decode("utf-8", "replace")
+    rc = None
+    try:
+        _, info = _docker_json("GET", f"/exec/{eid}/json")
+        rc = (info or {}).get("ExitCode")
+    except Exception:
+        pass
+    return (rc if rc is not None else 0), text
+
+def docker_exec_tty(container):
+    """Create an interactive TTY exec (a login shell) and hijack its stream.
+    Returns (exec_id, raw_socket, initial_bytes) or (None, None, b'')."""
+    st, ex = _docker_json("POST", f"/containers/{container}/exec",
+                          {"AttachStdin": True, "AttachStdout": True,
+                           "AttachStderr": True, "Tty": True,
+                           "Cmd": ["/bin/sh", "-lc",
+                                   "if command -v bash >/dev/null 2>&1; then exec bash; "
+                                   "else exec sh; fi"]})
+    if st not in (200, 201) or not ex or "Id" not in ex:
+        return None, None, b""
+    eid = ex["Id"]
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(DOCKER_SOCK)
+    body = json.dumps({"Detach": False, "Tty": True}).encode()
+    req = (f"POST /{_DOCKER_API}/exec/{eid}/start HTTP/1.1\r\nHost: docker\r\n"
+           "Content-Type: application/json\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n"
+           f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+    s.sendall(req)
+    buf = b""
+    while b"\r\n\r\n" not in buf:            # consume the 101 response headers
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    _, _, rest = buf.partition(b"\r\n\r\n")   # any TTY bytes already delivered
+    return eid, s, rest
+
+# ---- minimal WebSocket (RFC6455) over the stdlib http.server socket --------
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def ws_accept_key(key):
+    return base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+
+def ws_send(sock, data, opcode=0x2):
+    if isinstance(data, str):
+        data = data.encode()
+    hdr = bytearray([0x80 | opcode])
+    n = len(data)
+    if n < 126:
+        hdr.append(n)
+    elif n < 65536:
+        hdr.append(126); hdr += struct.pack(">H", n)
+    else:
+        hdr.append(127); hdr += struct.pack(">Q", n)
+    try:
+        sock.sendall(bytes(hdr) + data)
+    except OSError:
+        pass
+
+class _WSReader:
+    """Accumulates bytes and yields (opcode, payload) for each complete client
+    frame (client->server frames are always masked)."""
+    def __init__(self):
+        self.buf = bytearray()
+    def feed(self, data):
+        self.buf += data
+    def frames(self):
+        while True:
+            if len(self.buf) < 2:
+                return
+            b0, b1 = self.buf[0], self.buf[1]
+            op = b0 & 0x0f
+            masked = b1 & 0x80
+            ln = b1 & 0x7f
+            idx = 2
+            if ln == 126:
+                if len(self.buf) < 4:
+                    return
+                ln = struct.unpack(">H", self.buf[2:4])[0]; idx = 4
+            elif ln == 127:
+                if len(self.buf) < 10:
+                    return
+                ln = struct.unpack(">Q", self.buf[2:10])[0]; idx = 10
+            if masked:
+                if len(self.buf) < idx + 4:
+                    return
+                mask = self.buf[idx:idx + 4]; idx += 4
+            if len(self.buf) < idx + ln:
+                return
+            payload = bytes(self.buf[idx:idx + ln])
+            if masked:
+                payload = bytes(payload[i] ^ mask[i % 4] for i in range(ln))
+            del self.buf[:idx + ln]
+            yield op, payload
 
 # ---- live state ------------------------------------------------------------
 _LOCK = threading.Lock()
@@ -326,6 +513,12 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/bypass":
             with _LOCK:
                 return self._send_json({"nodes": sorted(_BYPASS)})
+        if path == "/api/console-info":
+            return self._send_json({"enabled": docker_available()})
+        if path == "/api/console" and \
+                self.headers.get("Upgrade", "").lower() == "websocket":
+            node = (parse_qs(u.query).get("node") or [""])[0]
+            return self._console_ws(node)
         if path == "/api/reports":           # debug: raw posted health
             with _LOCK:
                 return self._send_json(_REPORTS)
@@ -371,11 +564,104 @@ class Handler(SimpleHTTPRequestHandler):
                         _BYPASS.discard(body["node"])
                 nodes = sorted(_BYPASS)
             return self._send_json({"ok": True, "nodes": nodes})
+        if path == "/api/exec":
+            if not docker_available():
+                return self._send_json({"error": "console disabled (mrc-gui has no "
+                                        "docker socket)"}, code=503)
+            fab = self._fab()
+            node = body.get("node") or ""
+            cmd = (body.get("cmd") or "").strip()
+            ctr = container_for(fab, node)
+            if not ctr:
+                return self._send_json({"error": "unknown node", "node": node}, code=404)
+            if not cmd:
+                return self._send_json({"error": "empty command"}, code=400)
+            try:
+                rc, out = docker_exec(ctr, ["sh", "-lc", cmd])
+            except Exception as e:
+                return self._send_json({"error": f"exec failed: {e}"}, code=502)
+            if len(out) > 200_000:            # cap runaway output
+                out = out[:200_000] + "\n… (truncated)"
+            return self._send_json({"node": node, "container": ctr, "rc": rc, "out": out})
         # NIC also posts these to a controller; accept and drop so it doesn't error.
         if path in ("/api/metrics", "/api/ev-stats", "/api/probe-tx",
                     "/api/jobs/status"):
             return self._send_json({"ok": True})
         return self._send_json({"error": "not found"}, code=404)
+
+    def _console_ws(self, node):
+        """Bridge a browser WebSocket to an interactive `docker exec` TTY on the
+        node's container. The GUI (xterm.js) sends binary keystroke frames and
+        JSON text frames for {type:'resize',cols,rows}; we stream the TTY output
+        back as binary frames. Requires the docker socket (console opt-in)."""
+        self.close_connection = True
+        if not docker_available():
+            return self._send_json({"error": "console disabled"}, code=503)
+        ctr = container_for(self._fab(), node)
+        if not ctr:
+            return self._send_json({"error": "unknown node", "node": node}, code=404)
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            return self._send_json({"error": "bad websocket handshake"}, code=400)
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", ws_accept_key(key))
+        self.end_headers()
+        cli = self.connection
+        try:
+            eid, dsock, initial = docker_exec_tty(ctr)
+        except Exception as e:
+            ws_send(cli, f"\r\n[console] exec failed: {e}\r\n".encode(), 0x1)
+            return
+        if not dsock:
+            ws_send(cli, b"\r\n[console] could not open a shell on this node\r\n", 0x1)
+            return
+        if initial:
+            ws_send(cli, initial, 0x2)
+        self._bridge(cli, dsock, eid)
+
+    def _bridge(self, cli, dsock, eid):
+        reader = _WSReader()
+        try:
+            while True:
+                r, _, _ = select.select([cli, dsock], [], [], 45)
+                if not r:
+                    ws_send(cli, b"", 0x9)          # idle ping keepalive
+                    continue
+                if dsock in r:
+                    out = dsock.recv(65536)
+                    if not out:
+                        break
+                    ws_send(cli, out, 0x2)
+                if cli in r:
+                    data = cli.recv(65536)
+                    if not data:
+                        break
+                    reader.feed(data)
+                    for op, payload in reader.frames():
+                        if op == 0x8:              # client close
+                            raise ConnectionError
+                        elif op == 0x9:            # ping -> pong
+                            ws_send(cli, payload, 0xA)
+                        elif op == 0x1:            # text control (resize)
+                            try:
+                                m = json.loads(payload or b"{}")
+                                if m.get("type") == "resize":
+                                    _docker_json("POST", f"/exec/{eid}/resize"
+                                                 f"?h={int(m['rows'])}&w={int(m['cols'])}")
+                            except Exception:
+                                pass
+                        elif op == 0x2:            # keystrokes -> TTY
+                            dsock.sendall(payload)
+        except (OSError, ConnectionError, ValueError):
+            pass
+        finally:
+            for s in (dsock, cli):
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
     def _sse(self):
         """Keepalive-only event stream. An attached NIC subscribes here for live
