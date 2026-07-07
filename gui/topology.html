@@ -140,9 +140,10 @@
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:0;margin-right:6px}
   .dot.up{background:var(--link-hot)} .dot.deg{background:#f0c050}
   .dot.down{background:#ff7a7a} .dot.none{background:#3a4a5a}
-  .dot.denied{background:#c08af0}
+  .dot.denied{background:#c08af0} .dot.drained{background:#f0a060}
   .st-up{color:var(--link-hot)} .st-deg{color:#f0c050}
   .st-down{color:#ff7a7a} .st-none{color:#5a6b7a} .st-denied{color:#c08af0}
+  .st-drained{color:#f0a060}
   .paths-empty{padding:18px 20px;color:var(--dim);font-size:12px;line-height:1.7}
   /* console modal (feature 4) */
   .modal-bg{position:fixed;inset:0;background:rgba(4,8,12,.72);z-index:40;display:none;
@@ -629,8 +630,11 @@ function dirStatus(h){
   return {cls:'up',label:'up'};
 }
 // worst of two directions (none ranks last so a measured side wins)
-const STRANK={down:4,denied:3,deg:2,up:1,none:0};
+const STRANK={down:4,denied:3,drained:3,deg:2,up:1,none:0};
 function worst(a,b){ return STRANK[a.cls]>=STRANK[b.cls]?a:b; }
+// a drained (maintenance-bypassed) path reads as "drained", not up — the probe
+// still runs (rtt/loss columns stay live) but traffic is steered off it.
+const DRAINED_ST={cls:'drained',label:'drained'};
 
 // the carrier hops a path takes, for SVG highlighting
 function pathHops(rec){
@@ -714,7 +718,8 @@ function renderSym(base,H,thead,tb){
   for(const g of rows){
     const rec=g.fwd||g.ret;
     const hf=H[g.A+'|'+g.B+'|'+rec.path_id], hr=H[g.B+'|'+g.A+'|'+rec.path_id];
-    const sf=dirStatus(hf), sr=dirStatus(hr), s=worst(sf,sr);
+    const sf=dirStatus(hf), sr=dirStatus(hr);
+    const s=rec.drained?DRAINED_ST:worst(sf,sr);
     const tr=document.createElement('tr');
     tr.innerHTML=
       `<td class="path"><b>${shortName(g.A)}</b> ↔ <b>${shortName(g.B)}</b></td>`+
@@ -736,7 +741,7 @@ function renderDirected(base,H,thead,tb){
     natCmp(x.src,y.src)||natCmp(x.dst,y.dst)||x.plane-y.plane||natCmp(x.path_id,y.path_id));
   for(const rec of rows){
     const h=H[rec.src+'|'+rec.dst+'|'+rec.path_id];
-    const s=dirStatus(h);
+    const s=rec.drained?DRAINED_ST:dirStatus(h);
     const tr=document.createElement('tr');
     tr.innerHTML=
       `<td class="path"><b>${shortName(rec.src)}</b> → <b>${shortName(rec.dst)}</b></td>`+
@@ -774,11 +779,17 @@ function updateMeshStat(){
     return;
   }
   const ps=MESH&&MESH.paths?MESH.paths:[];
-  let up=0,meas=0,down=0;
-  ps.forEach(p=>{ if(p.health){ meas++; if(p.health.up&&!(p.health.loss_pct>=100)) up++; else down++; } });
+  let up=0,meas=0,down=0,drained=0;
+  ps.forEach(p=>{
+    if(p.health) meas++;
+    if(p.drained){ drained++; return; }          // drained is neither up nor down
+    if(p.health){ if(p.health.up&&!(p.health.loss_pct>=100)) up++; else down++; }
+  });
+  const active=base.length-drained;
   const nics=MESH&&MESH.sources?Object.keys(MESH.sources).length:0;
-  el.innerHTML=`<b>${up}</b>/${base.length} paths up · <b>${down}</b> down · `+
-    `<b>${meas}</b> measured · <b>${nics}</b> NIC${nics===1?'':'s'} reporting`+
+  el.innerHTML=`<b>${up}</b>/${active} paths up · <b>${down}</b> down`+
+    (drained?` · <b style="color:#f0a060">${drained}</b> drained`:'')+
+    ` · <b>${meas}</b> measured · <b>${nics}</b> NIC${nics===1?'':'s'} reporting`+
     (MESH&&MESH.updated?` · updated ${ago(MESH.updated)}`:'');
 }
 function ago(ts){ const s=Math.max(0,Math.round(Date.now()/1000-ts)); return s<2?'just now':s+'s ago'; }

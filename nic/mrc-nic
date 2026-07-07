@@ -27,7 +27,7 @@ import argparse, json, os, re, signal, socket, struct, subprocess, sys, tempfile
 from urllib import request as urlreq, error as urlerr
 
 DEFAULT_IFACE   = "mrc0"
-MRC_NIC_BUILD   = "2026-07-07-g27-drain-safety"  # bump on every change; printed at startup
+MRC_NIC_BUILD   = "2026-07-07-g29-drain-status"  # bump on every change; printed at startup
 DEFAULT_STATE   = "/run/mrc-agent.json"        # falls back to /tmp/mrc-agent.json if /run unwritable
 METRICS_PERIOD  = 1.0
 RECONNECT_BASE  = 1.0
@@ -2076,6 +2076,11 @@ def _query_kernel_route(dst):
 
 def render_status(s):
     a = s["agent"]; c = s["controller"]; p = s.get("profile") or {}; k = s["kernel"]; m = s["counters"]
+    drained = set(s.get("drained") or [])   # path_ids steered off for maintenance
+    def _is_drained(x):
+        # EV profile entries key the path as "path"; mesh samples as "path_id".
+        return (x.get("path") in drained or x.get("path_id") in drained
+                or x.get("spine") in drained)
     badge, label = _ctrl_badge(c.get("status", "?"))
     lines = []
     lines.append(f"╭─ {a['iface']} · MRC virtual NIC ──────────────────────── state UP ─╮")
@@ -2106,7 +2111,9 @@ def render_status(s):
                 for e in evs:
                     full = by_usid.get(e["usid"], {})
                     pid  = full.get("id", "via-?")
-                    lines.append(f"    [✓] {pid:<18} EV {e['entropy']:>5}    {e['usid']}")
+                    dr = _is_drained(e)
+                    lines.append(f"    [{'~' if dr else '✓'}] {pid:<18} EV {e['entropy']:>5}"
+                                 f"    {e['usid']}{'   [DRAINED — maintenance]' if dr else ''}")
             else:
                 lines.append("    (no active EVs)")
         elif mode in ("udp", "stev"):
@@ -2150,12 +2157,21 @@ def render_status(s):
     mesh = s.get("mesh") or {}
     lines.append("")
     if mesh.get("last_sweep_at"):
-        lines.append(f"  MESH HEALTH  {mesh.get('peers_up',0)}/{mesh.get('peers_total',0)} peers up "
-                     f"· swept {_age(mesh.get('last_sweep_at'))}")
-        for sm in mesh.get("samples", []):
+        smx = mesh.get("samples", [])
+        n_dr = sum(1 for sm in smx if _is_drained(sm))
+        n_up = sum(1 for sm in smx if sm.get("up") and not _is_drained(sm))
+        hdr = f"  MESH HEALTH  {n_up}/{len(smx)} paths up"
+        if n_dr:
+            hdr += f" · {n_dr} drained"
+        lines.append(hdr + f" · swept {_age(mesh.get('last_sweep_at'))}")
+        for sm in smx:
             tag = (" via " + sm["spine"]) if sm.get("spine") else ""
-            if sm.get("up"):
-                rtt = sm.get("rtt_avg")
+            rtt = sm.get("rtt_avg")
+            if _is_drained(sm):
+                # drained for maintenance — still probed (rtt/loss shown), traffic off it
+                lines.append(f"    [~] {sm['peer']:<8}{tag:<16} DRAINED  loss {sm.get('loss_pct',0):>5.1f}%"
+                             + (f"   rtt {rtt:.2f} ms" if rtt is not None else ""))
+            elif sm.get("up"):
                 lines.append(f"    [✓] {sm['peer']:<8}{tag:<16} loss {sm.get('loss_pct',0):>5.1f}%"
                              + (f"   rtt {rtt:.2f} ms" if rtt is not None else ""))
             else:
