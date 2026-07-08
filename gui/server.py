@@ -403,6 +403,141 @@ def peer_ports_down(hosts):
             out[h] = dp
     return out
 
+
+# ---- fault localization (Clustermapper T0/T1: WHICH link/switch/NIC) --------
+def localize_faults(fab):
+    """Turn the down-path list into the underlying failed component. SRv6 paths
+    are deterministic, so a set of down paths implicates a specific NIC port,
+    spine/switch, or leaf<->spine link — the spec's 'immediately localize precisely
+    which link or switch has a problem'. Returns a ranked list of faults."""
+    view = mesh_view(fab)
+    meas = [p for p in view["paths"] if p.get("health") and not p.get("drained")]
+    down = [p for p in meas if not p["health"]["up"]]
+    if not down:
+        return []
+    def key(p): return (p["src"], p["dst"], p["path_id"], p.get("plane"))
+    faults, explained = [], set()
+
+    # 1) NIC port — definitive from the agent-reported port map (gpu, plane down)
+    for host, rec in _ports_now().items():
+        for plk, up in (rec.get("ports") or {}).items():
+            if up:
+                continue
+            pl = int(plk)
+            aff = [p for p in down if (p["src"] == host or p["dst"] == host) and p.get("plane") == pl]
+            faults.append({"where": f"{host} · plane {pl}", "kind": "nic-port",
+                           "detail": f"{host}'s plane-{pl} NIC port is down (agent-reported)",
+                           "nodes": [host], "affected": len(aff)})
+            explained |= {key(p) for p in aff}
+
+    by_spine = {}
+    for p in meas:
+        if p.get("spine"):
+            by_spine.setdefault(p["spine"], []).append(p)
+
+    # 2) whole spine/switch — every measured path via S is down
+    for S, ps in by_spine.items():
+        d = [p for p in ps if not p["health"]["up"]]
+        if ps and len(d) == len(ps):
+            faults.append({"where": S, "kind": "spine",
+                           "detail": f"every measured path via {S} is down — spine/switch fault",
+                           "nodes": [S], "affected": len(d)})
+            explained |= {key(p) for p in d}
+
+    # 3) leaf<->spine link — S is otherwise healthy, but all paths touching one
+    #    leaf-end of S are down (the T0<->T1 link localization)
+    for S, ps in by_spine.items():
+        if ps and all(not p["health"]["up"] for p in ps):
+            continue                                  # already spine-level
+        byleaf = {}
+        for p in ps:
+            for lf in (p.get("src_leaf"), p.get("dst_leaf")):
+                if lf:
+                    byleaf.setdefault(lf, []).append(p)
+        for lf, lps in byleaf.items():
+            d = [p for p in lps if not p["health"]["up"]]
+            if lps and len(d) == len(lps) and any(key(p) not in explained for p in d):
+                faults.append({"where": f"{lf} ↔ {S}", "kind": "leaf-spine-link",
+                               "detail": f"paths using the {lf}↔{S} link are down while {S} is "
+                                         f"otherwise healthy — link fault",
+                               "nodes": [lf, S], "affected": len(d)})
+                explained |= {key(p) for p in d}
+
+    # 4) leftover down paths we couldn't pin to one component
+    rest = [p for p in down if key(p) not in explained]
+    if rest:
+        faults.append({"where": "unlocalized", "kind": "other",
+                       "detail": f"{len(rest)} down path(s) not attributable to a single component",
+                       "nodes": [], "affected": len(rest)})
+    faults.sort(key=lambda f: -f["affected"])
+    return faults
+
+
+def collective_readiness(fab, members):
+    """Pre-flight a collective (or the whole fabric): are all member NIC ports up
+    and all inter-member paths measured & healthy? The spec's 'at job startup we
+    ensure all nodes have all NIC ports operational'. Returns GO/NO-GO + blockers."""
+    view = mesh_view(fab)
+    mset = set(members)
+    blockers = []
+    now = time.time()
+    for h in members:                                   # port readiness
+        dp = down_planes(h, now)
+        if dp:
+            blockers.append({"kind": "nic-port", "detail": f"{h} plane {','.join(map(str, dp))} down"})
+        elif h not in _PORTS:
+            blockers.append({"kind": "no-report", "detail": f"{h} has not reported port status yet"})
+    npaths = ndown = nmeas = 0                           # path readiness (member↔member)
+    for p in view["paths"]:
+        if p["src"] in mset and p["dst"] in mset and not p.get("drained"):
+            npaths += 1
+            if p.get("health"):
+                nmeas += 1
+                if not p["health"]["up"]:
+                    ndown += 1
+    if ndown:
+        blockers.append({"kind": "path-down", "detail": f"{ndown} member↔member path(s) down"})
+    return {"members": sorted(members), "go": not blockers, "blockers": blockers,
+            "paths_total": npaths, "paths_measured": nmeas, "paths_down": ndown}
+
+
+# ---- history ring buffer (fabric health over time) -------------------------
+_HISTORY = []          # list of {t, up, down, measured, loss_avg, loss_max, rtt_avg, rtt_max, reporting}
+_HIST_MAX = 360        # samples kept (~30 min at 5s)
+
+def _history_sample(vars_path):
+    fab = load_fabric(vars_path) or {}
+    view = mesh_view(fab)
+    up = dn = meas = 0
+    losses, rtts = [], []
+    for p in view["paths"]:
+        h = p.get("health")
+        if not h or p.get("drained"):
+            continue
+        meas += 1
+        up += 1 if h["up"] else 0
+        dn += 0 if h["up"] else 1
+        if h.get("loss_pct") is not None:
+            losses.append(h["loss_pct"])
+        if h.get("up") and h.get("rtt_avg") is not None:
+            rtts.append(h["rtt_avg"])
+    def avg(x): return round(sum(x) / len(x), 3) if x else None
+    return {"t": round(time.time(), 1), "up": up, "down": dn, "measured": meas,
+            "loss_avg": avg(losses), "loss_max": round(max(losses), 2) if losses else None,
+            "rtt_avg": avg(rtts), "rtt_max": round(max(rtts), 3) if rtts else None,
+            "reporting": view.get("n_reporting", 0)}
+
+def _history_loop(vars_path):
+    while not _STOP.wait(5.0):
+        try:
+            s = _history_sample(vars_path)
+            with _LOCK:
+                _HISTORY.append(s)
+                if len(_HISTORY) > _HIST_MAX:
+                    del _HISTORY[:len(_HISTORY) - _HIST_MAX]
+        except Exception:
+            pass
+
 # ---- fabric_vars.json (reloaded on mtime change) ---------------------------
 _FAB = {"path": None, "mtime": 0.0, "data": None}
 
@@ -617,8 +752,13 @@ def _sample_index():
                 tot += 1; up += 1 if s.get("up") else 0
             for h in ((rep.get("weigher") or {}).get("path_health") or []):
                 denied[(host, h.get("peer"), h.get("path_id"))] = bool(h.get("denied"))
+            wg = rep.get("weigher") or {}
             srcinfo[host] = {"age_s": round(age, 1), "peers_up": up, "peers_total": tot,
-                             "ts": rep.get("ts")}
+                             "ts": rep.get("ts"),
+                             # the REAL adaptive-spray weights the NIC applies, per
+                             # path_id — this IS the traffic distribution (health-driven).
+                             "weights": wg.get("path_weight") or {},
+                             "costs": wg.get("path_cost") or {}}
     return samples, denied, srcinfo
 
 def mesh_view(fab):
@@ -653,8 +793,12 @@ def mesh_view(fab):
         dst = p["dst"]
         if dst not in dpc:
             dpc[dst] = down_planes(dst, now)
+        si = srcinfo.get(p["src"], {})
+        w = (si.get("weights") or {}).get(p["path_id"])
+        c = (si.get("costs") or {}).get(p["path_id"])
         paths.append({**p, "health": health, "drained": is_drained(p, bn, bp),
                       "port_down": p.get("plane") in dpc[dst],
+                      "weight": w, "cost": c,      # real adaptive-spray share + cost
                       "collective": (coll or {}).get("group"),
                       "collective_pattern": (coll or {}).get("pattern")})
     return {"updated": now, "name": fab.get("name"), "shape": fab.get("shape"),
@@ -784,6 +928,17 @@ class Handler(SimpleHTTPRequestHandler):
                           "down": down_planes(h, now),
                           "age_s": round(now - (rec.get("ts") or now), 1)}
             return self._send_json({"ports": out})
+        if path == "/api/faults":
+            return self._send_json({"faults": localize_faults(self._fab())})
+        if path == "/api/history":
+            with _LOCK:
+                return self._send_json({"history": list(_HISTORY)})
+        if path == "/api/readiness":
+            fab = self._fab()
+            q = parse_qs(u.query).get("members") or [""]
+            members = [m for m in q[0].split(",") if m] or \
+                      [h["name"] for h in gpu_hosts(fab)]
+            return self._send_json(collective_readiness(fab, members))
         if path == "/api/nodes":
             return self._send_json({"nodes": nodes_index(self._fab())})
         if path == "/api/config":
@@ -1068,6 +1223,7 @@ def main():
         print("[gui] NOTE: no paths[] in fabric_vars.json — regenerate with the current "
               "gen_clab_topology.py so the paths table has data.")
 
+    threading.Thread(target=_history_loop, args=(Handler.vars_path,), daemon=True).start()
     handler = partial(Handler, directory=root)
     httpd = ThreadingHTTPServer((a.bind, a.port), handler)
     httpd.daemon_threads = True
