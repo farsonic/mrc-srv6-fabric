@@ -430,6 +430,28 @@ def localize_faults(fab):
                            "nodes": [host], "affected": len(aff)})
             explained |= {key(p) for p in aff}
 
+    # 1b) NIC port from the PATH pattern — catches impairment where the link is
+    #     'up' but traffic is dropped (e.g. netem loss, which the oper-state map
+    #     misses): every path touching a GPU on ONE plane is down while that GPU
+    #     is healthy on another plane.
+    gpus = {p["src"] for p in meas} | {p["dst"] for p in meas}
+    planes = {p.get("plane") for p in meas if p.get("plane")}
+    for g in sorted(gpus):
+        gp = [p for p in meas if p["src"] == g or p["dst"] == g]
+        for pl in sorted(planes):
+            onpl = [p for p in gp if p.get("plane") == pl]
+            if onpl and all(not p["health"]["up"] for p in onpl) \
+               and any(p["health"]["up"] for p in gp if p.get("plane") != pl):
+                if any(f["kind"] == "nic-port" and g in f.get("nodes", []) and f"plane {pl}" in f["where"]
+                       for f in faults):
+                    continue                          # already flagged via the map
+                d = [p for p in onpl if not p["health"]["up"]]
+                faults.append({"where": f"{g} · plane {pl}", "kind": "nic-port",
+                               "detail": f"all of {g}'s plane-{pl} paths are down while other planes "
+                                         f"are up — NIC-T0 port/link fault",
+                               "nodes": [g], "affected": len(d)})
+                explained |= {key(p) for p in d}
+
     by_spine = {}
     for p in meas:
         if p.get("spine"):

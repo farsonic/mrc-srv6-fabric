@@ -95,6 +95,14 @@
   .node.bypassed rect,.node.bypassed circle{stroke:#ff6a6a;stroke-width:2.6;stroke-dasharray:4 3}
   .node.bypassed text{fill:#ff9a9a}
   .maint{font-size:11.5px;color:#f0a060}
+  .faults{font-size:11.5px;color:#ff9a9a;display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .faults .flt{background:#2a0f0f;border:1px solid #5a2020;border-radius:5px;padding:1px 8px;cursor:pointer}
+  .faults .flt:hover{border-color:#ff9a9a}
+  .faults .fk{color:#ff6b6b;font-weight:600;text-transform:uppercase;font-size:9.5px;margin-right:5px}
+  .histwrap{display:inline-flex;align-items:center}
+  .histwrap svg{display:block}
+  .histleg{font-size:9.5px;color:var(--dim);margin-right:6px;display:inline-flex;gap:7px}
+  .histleg i{display:inline-block;width:8px;height:2px;vertical-align:middle;margin-right:2px}
   .maint b{color:#ffd090;font-weight:600}
   .draintag{color:#f0a060;font-size:10px;border:1px solid #7a4a20;border-radius:4px;
             padding:1px 6px;margin-left:6px;vertical-align:1px}
@@ -253,6 +261,7 @@
   <h1>MRC <b>SRv6</b> Fabric</h1>
   <span class="sub" id="fabricName">loading…</span>
   <span class="maint" id="maint"></span>
+  <span class="faults" id="faults"></span>
   <div class="spacer"></div>
   <span class="stat" id="counts"></span>
   <div class="controls">
@@ -297,6 +306,7 @@
     <h2>Paths — <b>test-probe</b> health</h2>
     <span class="meshstat" id="meshStat">—</span>
     <span class="grow"></span>
+    <span class="histwrap" id="histWrap" title="fabric health over time (paths up · loss · rtt)"></span>
     <label><input type="checkbox" id="symToggle" checked> symmetric pairs</label>
   </div>
   <div class="paths-scroll">
@@ -1037,6 +1047,24 @@ function portDownIndex(){
   if(s) s.forEach(p=>{ if(p.port_down){ P[p.src+'|'+p.dst+'|'+p.path_id]=true; } });
   return P;
 }
+// per-path adaptive-spray weight (the REAL, health-driven traffic share)
+let PATHWT={};
+function weightIndex(){
+  const W={}; const s=(MESH&&MESH.paths)?MESH.paths:null;
+  if(s) s.forEach(p=>{ if(p.weight!=null) W[p.src+'|'+p.dst+'|'+p.path_id]=p.weight; });
+  return W;
+}
+function shareCell(rec){
+  const w=PATHWT[rec.src+'|'+rec.dst+'|'+rec.path_id];
+  if(w==null) return `<td class="num"><span class="miss">·</span></td>`;
+  const pct=Math.round(w*100);
+  // bar width by share; colour green->amber as share drops (health-steered away)
+  const col = w>=0.22?'#6be0a0':(w>=0.1?'#f0c040':'#f0885a');
+  return `<td class="num" style="min-width:60px"><div style="display:flex;align-items:center;gap:5px;justify-content:flex-end">`+
+    `<div style="flex:1;height:6px;background:#182430;border-radius:3px;overflow:hidden;max-width:44px">`+
+    `<div style="width:${Math.min(100,pct*2)}%;height:100%;background:${col}"></div></div>`+
+    `<span style="color:${col};min-width:26px">${pct}%</span></div></td>`;
+}
 function portTag(rec){
   return PORTDOWN[rec.src+'|'+rec.dst+'|'+rec.path_id]
     ? ' <span class="draintag" style="background:#3a1010;color:#ff9a9a" title="dst NIC port down — pre-denied">port↓</span>' : '';
@@ -1059,6 +1087,7 @@ function rebuildPaths(){
   const H=healthIndex();
   PATHCOLL=collIndex();
   PORTDOWN=portDownIndex();
+  PATHWT=weightIndex();
   const sym=document.getElementById('symToggle').checked;
   sym?renderSym(base,H,thead,tb):renderDirected(base,H,thead,tb);
   updateMeshStat();
@@ -1084,10 +1113,10 @@ function statusCell(s){ return `<span class="dot ${s.cls}"></span><span class="s
 
 function renderSym(base,H,thead,tb){
   thead.innerHTML=
-    '<tr><th>path</th><th>collective</th><th>plane</th><th>via / carrier uSID</th>'+
+    '<tr><th>path</th><th>collective</th><th>plane</th><th>via / carrier uSID</th><th class="num">share</th>'+
     '<th class="grp" colspan="3">→ forward</th><th class="grp" colspan="3">← return</th>'+
     '<th class="grp" colspan="2">jitter · reorder</th><th>status</th></tr>'+
-    '<tr><th></th><th></th><th></th><th></th>'+
+    '<tr><th></th><th></th><th></th><th></th><th class="num" title="live health-driven traffic share (adaptive spray)">%traffic</th>'+
     '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
     '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
     '<th class="num dir">jit ms</th><th class="num">reord</th><th></th></tr>';
@@ -1114,6 +1143,7 @@ function renderSym(base,H,thead,tb){
       collCell(g.A,g.B)+
       `<td><span class="pl">${g.plane}</span></td>`+
       `<td>${viaCell(rec)}</td>`+
+      shareCell(rec)+
       hCell(hf)+hCell(hr)+
       `<td class="num dir">${fmtMs(worstJit(hf,hr))}</td>`+reordCell(maxReord(hf,hr))+
       `<td>${statusCell(s)}</td>`;
@@ -1125,6 +1155,7 @@ function renderSym(base,H,thead,tb){
 function renderDirected(base,H,thead,tb){
   thead.innerHTML=
     '<tr><th>flow</th><th>collective</th><th>plane</th><th>via / carrier uSID</th>'+
+    '<th class="num" title="live health-driven traffic share (adaptive spray)">share</th>'+
     '<th class="num dir">rtt ms</th><th class="num">loss%</th><th class="num">jitter</th>'+
     '<th class="num dir" title="one-way delay: outbound (pinned path) / inbound (return)">1-way ob/ib</th>'+
     '<th class="num">reord</th>'+
@@ -1140,6 +1171,7 @@ function renderDirected(base,H,thead,tb){
       collCell(rec.src,rec.dst)+
       `<td><span class="pl">${rec.plane}</span></td>`+
       `<td>${viaCell(rec)}</td>`+
+      shareCell(rec)+
       `<td class="num dir">${fmtMs(h&&h.rtt_avg)}</td>`+
       `<td class="num">${fmtPct(h&&h.loss_pct)}</td>`+
       `<td class="num">${fmtMs(h&&h.jitter)}</td>`+
@@ -1193,6 +1225,43 @@ function updateMeshStat(){
 }
 function ago(ts){ const s=Math.max(0,Math.round(Date.now()/1000-ts)); return s<2?'just now':s+'s ago'; }
 
+// ---- fault localization banner (Clustermapper: which component failed) ----
+function highlightNodes(names){
+  const set=new Set(names.filter(n=>byName[n]));
+  if(!EDGES) return;
+  EDGES.forEach(e=>{ const on=set.has(e.a)&&set.has(e.b);
+    e.el.classList.toggle('hot',on); e.el.classList.toggle('dim',!on); });
+  Object.entries(byName).forEach(([n,g])=>g.classList.toggle('dim',!set.has(n)));
+}
+function renderFaults(faults){
+  const box=document.getElementById('faults'); if(!box) return;
+  if(!faults||!faults.length){ box.innerHTML=''; return; }
+  box.innerHTML=faults.slice(0,4).map(f=>
+    `<span class="flt" data-nodes='${JSON.stringify(f.nodes||[])}' title="${(f.detail||'').replace(/'/g,'')}">`+
+    `<span class="fk">${(f.kind||'').replace(/-/g,' ')}</span>${f.where} · ${f.affected} path${f.affected===1?'':'s'}</span>`).join('');
+  box.querySelectorAll('.flt').forEach(el=>el.addEventListener('click',()=>{
+    let ns=[]; try{ ns=JSON.parse(el.dataset.nodes); }catch(e){}
+    if(ns.filter(n=>byName[n]).length){ pinned=null; highlightNodes(ns); }
+  }));
+}
+// ---- fabric-health history sparkline (paths up · loss · rtt over time) -----
+function renderHistory(hist){
+  const box=document.getElementById('histWrap'); if(!box) return;
+  if(!hist||hist.length<2){ box.innerHTML=''; return; }
+  const W=170,Hh=30,n=hist.length;
+  const up=hist.map(h=>h.measured?h.up/h.measured:1);
+  const loss=hist.map(h=>Math.min(1,(h.loss_max||0)/100));
+  const rtts=hist.map(h=>h.rtt_max||0), rmax=Math.max(0.001,...rtts);
+  const X=i=>i/(n-1)*W;
+  const path=(arr,f)=>arr.map((v,i)=>`${i?'L':'M'}${X(i).toFixed(1)},${(Hh-1-f(v)*(Hh-2)).toFixed(1)}`).join('');
+  box.innerHTML=
+    '<span class="histleg"><span><i style="background:#6be0a0"></i>up</span>'+
+    '<span><i style="background:#f0885a"></i>loss</span><span><i style="background:#5aa0f0"></i>rtt</span></span>'+
+    `<svg width="${W}" height="${Hh}" viewBox="0 0 ${W} ${Hh}">`+
+    `<path d="${path(up,v=>v)}" fill="none" stroke="#6be0a0" stroke-width="1.3"/>`+
+    `<path d="${path(loss,v=>v)}" fill="none" stroke="#f0885a" stroke-width="1.3"/>`+
+    `<path d="${path(rtts,v=>v/rmax)}" fill="none" stroke="#5aa0f0" stroke-width="1" opacity=".75"/></svg>`;
+}
 async function pollMesh(){
   try{
     const r=await fetch('/api/mesh',{cache:'no-store'});
@@ -1202,6 +1271,24 @@ async function pollMesh(){
     else backendOk=false;
   }catch(e){ backendOk=false; }   // static server / file:// — keep inventory view
   rebuildPaths();
+  applyTrafficHeat();
+  fetch('/api/faults',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(d=>renderFaults(d&&d.faults)).catch(()=>{});
+  fetch('/api/history',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(d=>renderHistory(d&&d.history)).catch(()=>{});
+}
+// topology traffic heatmap: leaf<->spine edge THICKNESS = live traffic share on
+// that spine (health-driven weigher weights). Width-only, so it coexists with the
+// hover/click hot/dim highlight colouring.
+function applyTrafficHeat(){
+  if(!EDGES||!MESH||!MESH.paths) return;
+  const spineNodes=new Set(Object.entries((DATA&&DATA.nodes)||{}).filter(([k,n])=>n.role==='spine').map(([k])=>k));
+  const agg={};   // spine -> [weights]
+  MESH.paths.forEach(p=>{ if(p.spine&&p.weight!=null){ (agg[p.spine]=agg[p.spine]||[]).push(p.weight); } });
+  const avg={}; for(const s in agg){ avg[s]=agg[s].reduce((a,b)=>a+b,0)/agg[s].length; }
+  EDGES.forEach(e=>{
+    const spine=spineNodes.has(e.a)?e.a:(spineNodes.has(e.b)?e.b:null);
+    if(spine&&avg[spine]!=null){ e.el.style.strokeWidth=(0.7+Math.min(0.5,avg[spine])*9).toFixed(1); }
+    else if(!spineNodes.has(e.a)&&!spineNodes.has(e.b)){ e.el.style.strokeWidth=''; }
+  });
 }
 document.getElementById('symToggle').addEventListener('change',rebuildPaths);
 
@@ -1253,7 +1340,17 @@ function renderColl(d){
     const ps=d.map[g].map(e=>`<span class="k${e.kind}">${e.peer}<span style="opacity:.6">·${e.kind}</span></span>`).join(", ");
     return `<div class="grp"><b>${g}</b> → ${ps||'<span style="color:var(--dim)">(none)</span>'}</div>`;
   }).join("");
+  html+='<div id="collReady" style="margin-top:10px;font-size:12px;color:var(--dim)">checking readiness…</div>';
   box.innerHTML=html;
+  // pre-flight readiness: are all participating members' ports up + paths healthy?
+  const members=names.filter(g=>(d.map[g]||[]).length);
+  fetch('/api/readiness?members='+encodeURIComponent(members.join(',')),{cache:'no-store'})
+    .then(r=>r.json()).then(rd=>{
+      const el=document.getElementById('collReady'); if(!el) return;
+      if(rd.go) el.innerHTML=`<b style="color:#6be0a0">✓ READY</b> — ${rd.paths_measured}/${rd.paths_total} member paths up, all NIC ports operational`;
+      else el.innerHTML=`<b style="color:#ff9a9a">✗ NOT READY</b> — `+
+        rd.blockers.map(b=>b.detail).join('; ');
+    }).catch(()=>{ const el=document.getElementById('collReady'); if(el) el.textContent=''; });
 }
 function applyColl(){
   const n=gpuCount();
