@@ -105,6 +105,10 @@
   .histleg i{display:inline-block;width:8px;height:2px;vertical-align:middle;margin-right:2px}
   .heatlbl{font-size:11px;color:var(--dim);display:inline-flex;align-items:center;gap:4px}
   .heatlbl input{vertical-align:-1px}
+  #impActive .impit{display:flex;align-items:center;gap:8px;background:#101a24;border:1px solid var(--rule);
+                    border-radius:6px;padding:6px 11px;margin:5px 0;font-size:13px}
+  #impActive .impit .rm{margin-left:auto;color:var(--dim);cursor:pointer;font-size:15px}
+  #impActive .impit .rm:hover{color:#f06b6b}
   .maint b{color:#ffd090;font-weight:600}
   .draintag{color:#f0a060;font-size:10px;border:1px solid #7a4a20;border-radius:4px;
             padding:1px 6px;margin-left:6px;vertical-align:1px}
@@ -273,6 +277,7 @@
     </span>
     <button id="dlcfg" title="Download every node config as a .tar.gz">⬇ configs</button>
     <button id="collBtn" title="Define collective partners (TP/DP/PP/EP) — narrows each NIC's carriers + probing">◇ Collectives</button>
+    <button id="impairBtn" title="Apply real netem loss/latency to a link (both ends)">⚡ Impair</button>
     <a id="edgeshark" class="btn-link" target="_blank" rel="noopener"
        title="Open Edgeshark — live per-link packet capture (Wireshark)">🦈 Edgeshark</a>
     <label class="heatlbl" title="thicken leaf↔spine edges by live traffic share (health-driven)">
@@ -395,6 +400,39 @@
       </div>
 
       <div id="collResult" style="font-size:13px;color:var(--ink);margin-top:14px"></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="impairModal">
+  <div class="modal" style="width:min(720px,94vw);height:auto;max-height:88vh">
+    <div class="modal-head">
+      <span class="mname">⚡ Link impairments</span>
+      <span class="grow"></span>
+      <button class="x" id="impairClose" title="Close (Esc)">×</button>
+    </div>
+    <div class="modal-body" style="display:block;padding:18px 20px;overflow:auto">
+      <p style="color:var(--dim);font-size:13px;margin:0 0 14px;line-height:1.5">
+        Apply real <b style="color:var(--ink)">netem</b> loss/latency to a fabric link. It's applied to
+        <b>both ends</b> so it impairs both directions. Impairments are wiped by a redeploy —
+        the list below live-verifies them.</p>
+      <div style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:6px">
+        <label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:220px">
+          <span style="font-size:11px;color:var(--dim)">link</span>
+          <select id="impLink" style="background:#0b1219;border:1px solid var(--rule);border-radius:6px;color:var(--ink);font-size:12.5px;padding:7px 8px"></select></label>
+        <label style="display:flex;flex-direction:column;gap:3px">
+          <span style="font-size:11px;color:var(--dim)">loss %</span>
+          <input type="number" id="impLoss" min="0" max="100" value="30" style="width:70px;background:#0b1219;border:1px solid var(--rule);border-radius:6px;color:var(--ink);font-size:14px;padding:6px 8px"></label>
+        <label style="display:flex;flex-direction:column;gap:3px">
+          <span style="font-size:11px;color:var(--dim)">delay ms</span>
+          <input type="number" id="impDelay" min="0" value="0" style="width:70px;background:#0b1219;border:1px solid var(--rule);border-radius:6px;color:var(--ink);font-size:14px;padding:6px 8px"></label>
+        <button class="btn on" id="impApply">Apply</button>
+        <span id="impState" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <div style="border-top:1px solid var(--rule);margin-top:12px;padding-top:10px">
+        <div style="color:var(--dim);font-size:12px;margin-bottom:6px">Active impairments</div>
+        <div id="impActive"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -1462,6 +1500,47 @@ document.getElementById("collApply").addEventListener("click",applyColl);
 document.getElementById("collClear").addEventListener("click",clearColl);
 document.getElementById("collAddGrp").addEventListener("click",collAddGroup);
 document.getElementById("collApplyGrps").addEventListener("click",applyCollGroups);
+// ---- link impairments (real netem via the docker socket, both ends) ----
+function impState(msg,ok){ const e=document.getElementById("impState");
+  if(e){ e.textContent=msg; e.style.color = ok===false?"#f06b6b":(ok?"#6be0a0":"var(--dim)"); } }
+function openImpair(){
+  document.getElementById("impairModal").classList.add("open");
+  fetch("/api/impair",{cache:"no-store"}).then(r=>r.json()).then(d=>{
+    impState(d.enabled?"":"needs -e gui_console=true (docker socket)",d.enabled?null:false);
+    const sel=document.getElementById("impLink");
+    sel.innerHTML=(d.links||[]).map(l=>`<option value="${l.key.replace(/"/g,'&quot;')}">${l.key}  ·  ${l.kind}</option>`).join("");
+    renderImpActive(d.active||[]);
+  }).catch(()=>impState("needs the live backend",false));
+}
+function closeImpair(){ document.getElementById("impairModal").classList.remove("open"); }
+function renderImpActive(active){
+  const box=document.getElementById("impActive"); if(!box) return;
+  if(!active.length){ box.innerHTML='<span style="color:var(--dim);font-size:12px">none — fabric is clean</span>'; return; }
+  box.innerHTML=active.map(a=>{
+    const desc=[a.loss?`${a.loss}% loss`:'',a.delay?`${a.delay}ms delay`:''].filter(Boolean).join(' · ');
+    const warn=a.present?'':' <span style="color:#f0a060">⚠ wiped (redeploy?) — re-apply</span>';
+    return `<div class="impit"><span style="color:#ff9a9a">⚡</span> <b>${a.link}</b> <span style="color:var(--dim)">${desc}</span>${warn}<span class="rm" data-link="${a.link.replace(/"/g,'&quot;')}" title="clear">×</span></div>`;
+  }).join("");
+  box.querySelectorAll(".rm").forEach(el=>el.addEventListener("click",()=>clearImpair(el.dataset.link)));
+}
+function applyImpair(){
+  const link=document.getElementById("impLink").value;
+  const loss=+document.getElementById("impLoss").value||0, delay=+document.getElementById("impDelay").value||0;
+  if(!link){ impState("no link selected",false); return; }
+  if(loss<=0&&delay<=0){ impState("set loss or delay > 0",false); return; }
+  impState("applying to both ends…");
+  fetch("/api/impair",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({link,loss,delay,on:true})})
+    .then(r=>r.json()).then(d=>{ impState(d.ok?"applied to both ends":(d.error||"failed on an end"),!!d.ok); openImpair(); })
+    .catch(()=>impState("needs the live backend",false));
+}
+function clearImpair(link){
+  impState("clearing…");
+  fetch("/api/impair",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({link,on:false})})
+    .then(r=>r.json()).then(()=>{ impState("cleared",true); openImpair(); }).catch(()=>impState("failed",false));
+}
+document.getElementById("impairBtn").addEventListener("click",openImpair);
+document.getElementById("impairClose").addEventListener("click",closeImpair);
+document.getElementById("impApply").addEventListener("click",applyImpair);
 // Edgeshark runs on the same host, port 5001 (live per-link packet capture)
 document.getElementById("edgeshark").href = location.protocol+"//"+location.hostname+":5001/";
 window.addEventListener("resize",()=>window._fit&&window._fit());
@@ -1473,7 +1552,8 @@ document.getElementById("runBtn").addEventListener("click",runCmd);
 document.getElementById("runInput").addEventListener("keydown",e=>{ if(e.key==="Enter") runCmd(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape"){
   if(document.getElementById("consoleModal").classList.contains("open")) closeConsole();
-  if(document.getElementById("collModal").classList.contains("open")) closeColl(); } });
+  if(document.getElementById("collModal").classList.contains("open")) closeColl();
+  if(document.getElementById("impairModal").classList.contains("open")) closeImpair(); } });
 // detail panels are click-driven now — they stay open until you deselect the
 // node/path (no auto-hide on mouse-leave, so you can read/scroll freely)
 (function(){

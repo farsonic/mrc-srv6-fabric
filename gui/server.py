@@ -253,6 +253,7 @@ class _WSReader:
 _LOCK = threading.Lock()
 _REPORTS = {}          # host -> {"ts","received_at","peers":[...],"weigher":{...}}
 _PORTS = {}            # host -> {"ports":{plane:up_bool},"ts"} — the Clustermapper NIC-port map
+_IMPAIR = {}           # link_key -> {"loss","delay","ends":[[node,iface],...]} — active netem
 _BYPASS = set()        # node names an operator has drained for maintenance
 _BYPASS_PLANES = set() # whole planes (ints) an operator has drained for maintenance
 _COLLECTIVES = {"config": None, "map": {}}  # active parallelism partner set (see collectives())
@@ -493,6 +494,78 @@ def localize_faults(fab):
                        "nodes": [], "affected": len(rest)})
     faults.sort(key=lambda f: -f["affected"])
     return faults
+
+
+# ---- link impairment (netem via the docker socket, applied to BOTH ends) ----
+def _link_key(a, b):
+    return " ↔ ".join(sorted([a, b]))
+
+def fabric_links(fab):
+    """[{key, ends:[(node,iface),(node,iface)], kind}] for real fabric links."""
+    nodes = fab.get("nodes") or {}
+    out = []
+    for l in (fab.get("links") or []):
+        a, b = l.get("a", ""), l.get("b", "")
+        an, _, ai = a.partition(":"); bn, _, bi = b.partition(":")
+        if not (an and ai and bn and bi):
+            continue
+        roles = {nodes.get(an, {}).get("role"), nodes.get(bn, {}).get("role")}
+        kind = ("leaf-spine" if roles == {"leaf", "spine"} else
+                "gpu-leaf" if "gpu" in roles else "other")
+        out.append({"key": _link_key(a, b), "ends": [(an, ai), (bn, bi)], "kind": kind})
+    return sorted(out, key=lambda x: x["key"])
+
+def _netem_argv(iface, loss, delay):
+    argv = ["tc", "qdisc", "replace", "dev", iface, "root", "netem"]
+    if loss and loss > 0:
+        argv += ["loss", f"{loss}%"]
+    if delay and delay > 0:
+        argv += ["delay", f"{delay}ms"]
+    return argv
+
+def _tc_has_netem(fab, node, iface):
+    try:
+        rc, out = docker_exec(container_for(fab, node), ["tc", "qdisc", "show", "dev", iface], timeout=8)
+        return "netem" in (out or "")
+    except Exception:
+        return False
+
+def apply_impairment(fab, link_key, loss, delay, on):
+    """Apply/clear netem on BOTH ends of a link. Returns per-end results."""
+    link = next((l for l in fabric_links(fab) if l["key"] == link_key), None)
+    if not link:
+        return {"ok": False, "error": f"unknown link {link_key}"}
+    clear = (not on) or (not (loss and loss > 0) and not (delay and delay > 0))
+    results = []
+    for node, iface in link["ends"]:
+        try:
+            ctr = container_for(fab, node)
+            argv = ["tc", "qdisc", "del", "dev", iface, "root"] if clear \
+                else _netem_argv(iface, loss, delay)
+            rc, out = docker_exec(ctr, argv, timeout=12)
+            ok = (rc == 0) or (clear and "RTNETLINK" in (out or ""))  # del of absent qdisc is fine
+            results.append({"node": node, "iface": iface, "ok": ok, "out": (out or "").strip()[:120]})
+        except Exception as e:
+            results.append({"node": node, "iface": iface, "ok": False, "out": str(e)})
+    with _LOCK:
+        if clear:
+            _IMPAIR.pop(link_key, None)
+        else:
+            _IMPAIR[link_key] = {"loss": loss or 0, "delay": delay or 0,
+                                 "ends": [list(e) for e in link["ends"]]}
+    return {"ok": all(r["ok"] for r in results), "cleared": clear,
+            "link": link_key, "results": results}
+
+def impairments_view(fab):
+    """Active impairments + a live verify (did a redeploy wipe the netem?)."""
+    with _LOCK:
+        items = {k: dict(v) for k, v in _IMPAIR.items()}
+    out = []
+    for k, v in sorted(items.items()):
+        present = all(_tc_has_netem(fab, n, i) for n, i in v["ends"])
+        out.append({"link": k, "loss": v["loss"], "delay": v["delay"],
+                    "ends": v["ends"], "present": present})
+    return out
 
 
 def collective_readiness(fab, members):
@@ -953,6 +1026,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json({"ports": out})
         if path == "/api/faults":
             return self._send_json({"faults": localize_faults(self._fab())})
+        if path == "/api/impair":
+            fab = self._fab()
+            return self._send_json({
+                "enabled": docker_available(),
+                "links": [{"key": l["key"], "kind": l["kind"]} for l in fabric_links(fab)],
+                "active": impairments_view(fab) if docker_available() else []})
         if path == "/api/history":
             with _LOCK:
                 return self._send_json({"history": list(_HISTORY)})
@@ -1094,6 +1173,21 @@ class Handler(SimpleHTTPRequestHandler):
                 _COLLECTIVES["config"] = cfg; _COLLECTIVES["map"] = cmap
             return self._send_json({"ok": True, "config": cfg, "map": cmap,
                                     "stats": collectives_stats(cmap, n)})
+        if path == "/api/impair":
+            # Apply/clear netem on BOTH ends of a link:
+            #   {"link":"<key>","loss":30,"delay":5,"on":true}   impair
+            #   {"link":"<key>","on":false}                      clear
+            if not docker_available():
+                return self._send_json({"error": "impairments need the docker socket "
+                                        "(deploy with -e gui_console=true)"}, code=503)
+            try:
+                loss = float(body.get("loss") or 0)
+                delay = float(body.get("delay") or 0)
+            except (TypeError, ValueError):
+                return self._send_json({"ok": False, "error": "loss/delay must be numeric"}, code=400)
+            r = apply_impairment(self._fab(), body.get("link") or "", loss, delay,
+                                 bool(body.get("on", True)))
+            return self._send_json(r, code=200 if r.get("ok") else 400)
         if path == "/api/exec":
             if not docker_available():
                 return self._send_json({"error": "console disabled (mrc-gui has no "
