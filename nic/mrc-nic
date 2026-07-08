@@ -1431,6 +1431,7 @@ class MeshHealth(threading.Thread):
                     "rtt_max": d.get("rtt_max"), "rtt_mdev": d.get("rtt_mdev"),
                     "ob_avg": d.get("ob_avg"), "ib_avg": d.get("ib_avg"),
                     "reorder": d.get("reorder"), "reorder_pct": d.get("reorder_pct"),
+                    "ecn_ce_pct": d.get("ecn_ce_pct"),   # real forward-path CE-mark rate
                     "err": None if d.get("ok") else d.get("err")}
         except Exception as e:
             return {"tx": count, "rx": 0, "loss_pct": 100.0,

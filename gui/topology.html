@@ -103,6 +103,8 @@
   .histwrap svg{display:block}
   .histleg{font-size:9.5px;color:var(--dim);margin-right:6px;display:inline-flex;gap:7px}
   .histleg i{display:inline-block;width:8px;height:2px;vertical-align:middle;margin-right:2px}
+  .heatlbl{font-size:11px;color:var(--dim);display:inline-flex;align-items:center;gap:4px}
+  .heatlbl input{vertical-align:-1px}
   .maint b{color:#ffd090;font-weight:600}
   .draintag{color:#f0a060;font-size:10px;border:1px solid #7a4a20;border-radius:4px;
             padding:1px 6px;margin-left:6px;vertical-align:1px}
@@ -273,6 +275,8 @@
     <button id="collBtn" title="Define collective partners (TP/DP/PP/EP) — narrows each NIC's carriers + probing">◇ Collectives</button>
     <a id="edgeshark" class="btn-link" target="_blank" rel="noopener"
        title="Open Edgeshark — live per-link packet capture (Wireshark)">🦈 Edgeshark</a>
+    <label class="heatlbl" title="thicken leaf↔spine edges by live traffic share (health-driven)">
+      <input type="checkbox" id="heatToggle" checked> traffic heat</label>
     <button id="fit">Fit</button>
   </div>
 </header>
@@ -625,7 +629,9 @@ function showInfo(name,nodes){
      <h2>Links (${nlinks})</h2>
      <div class="links-list">${links||'<div style="color:var(--dim)">none</div>'}</div>
      ${nd.role==="gpu"?`<div class="cfgbox"><h2>SRv6 formula — inputs → carriers</h2>
-       <div id="formulaBox" style="font-size:12px;color:var(--dim)">loading…</div></div>`:""}
+       <div id="formulaBox" style="font-size:12px;color:var(--dim)">loading…</div></div>
+       <div class="cfgbox"><h2>Reverse-EV set — return paths known-good</h2>
+       <div id="revEvBox" style="font-size:12px;color:var(--dim)"></div></div>`:""}
      <div class="cfgbox">
        <h2>Config</h2>
        <div class="cfg-meta" id="cfgMeta">loading…</div>
@@ -636,7 +642,27 @@ function showInfo(name,nodes){
   const cb=document.getElementById("consoleBtn");
   if(cb) cb.addEventListener("click",()=>openConsole(name));
   loadConfig(name);
-  if(nd.role==="gpu") renderFormula(name);
+  if(nd.role==="gpu"){ renderFormula(name); renderReverseEV(name); }
+}
+// Reverse-EV set (MRC spec): the RETURN paths (peer -> this GPU) known to be up.
+// The sender keeps a working reverse EV per plane for control packets.
+function renderReverseEV(name){
+  const box=document.getElementById("revEvBox"); if(!box) return;
+  const paths=(MESH&&MESH.paths)||null;
+  if(!paths){ box.innerHTML='<span style="color:var(--dim)">no live health yet</span>'; return; }
+  const byPeer={};  // peer -> {plane -> {up,total}}
+  paths.forEach(p=>{ if(p.dst!==name||!p.health) return;   // return direction = peer -> this GPU
+    const b=byPeer[p.src]=byPeer[p.src]||{};
+    const pl=b[p.plane]=b[p.plane]||{up:0,tot:0}; pl.tot++; if(p.health.up) pl.up++; });
+  const peers=Object.keys(byPeer).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+  if(!peers.length){ box.innerHTML='<span style="color:var(--dim)">no return-path measurements</span>'; return; }
+  box.innerHTML=peers.map(pr=>{
+    const planes=Object.keys(byPeer[pr]).sort();
+    const cells=planes.map(pl=>{ const v=byPeer[pr][pl];
+      const col=v.up===0?'#f06b6b':(v.up<v.tot?'#f0c040':'#6be0a0');
+      return `<span style="color:${col}">p${pl} ${v.up}/${v.tot}</span>`; }).join(' · ');
+    return `<div style="padding:2px 0"><b style="color:#8fb0d0">${pr}</b> → ${cells}</div>`;
+  }).join('');
 }
 // what mrc_usid.expand is fed for this GPU (the descriptor) + what it derives
 function renderFormula(name){
@@ -1100,6 +1126,12 @@ function hCell(h){   // forward/return metric cells: rtt + loss + one-way (outbo
 function reordCell(n){   // out-of-order arrivals (0 shown dim, >0 amber)
   return (n)?`<td class="num st-deg">${n}</td>`:`<td class="num"><span class="miss">·</span></td>`;
 }
+function ecnCell(h){     // real forward-path CE-mark rate (needs an ECN qdisc on the switches)
+  const v=h&&h.ecn_ce_pct;
+  if(v==null) return `<td class="num"><span class="miss">·</span></td>`;
+  return v>0 ? `<td class="num" style="color:#f0c040" title="switch marked congestion (ECN CE)">${v}%</td>`
+             : `<td class="num"><span class="miss">0</span></td>`;
+}
 function worstJit(a,b){ const j=[a&&a.jitter,b&&b.jitter].filter(v=>v!=null); return j.length?Math.max(...j):null; }
 function maxReord(a,b){ return Math.max((a&&a.reorder)||0,(b&&b.reorder)||0); }
 function viaCell(rec){
@@ -1115,11 +1147,12 @@ function renderSym(base,H,thead,tb){
   thead.innerHTML=
     '<tr><th>path</th><th>collective</th><th>plane</th><th>via / carrier uSID</th><th class="num">share</th>'+
     '<th class="grp" colspan="3">→ forward</th><th class="grp" colspan="3">← return</th>'+
-    '<th class="grp" colspan="2">jitter · reorder</th><th>status</th></tr>'+
+    '<th class="grp" colspan="3">jitter · reorder · ecn</th><th>status</th></tr>'+
     '<tr><th></th><th></th><th></th><th></th><th class="num" title="live health-driven traffic share (adaptive spray)">%traffic</th>'+
     '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
     '<th class="num dir">rtt</th><th class="num">loss%</th><th class="num">1-way</th>'+
-    '<th class="num dir">jit ms</th><th class="num">reord</th><th></th></tr>';
+    '<th class="num dir">jit ms</th><th class="num">reord</th>'+
+    '<th class="num" title="forward-path ECN CE-mark rate (real; needs an ECN qdisc on the switches)">ecn</th><th></th></tr>';
   // group by unordered pair + plane + carrier(path_id)
   const groups=new Map();
   base.forEach(rec=>{
@@ -1146,6 +1179,7 @@ function renderSym(base,H,thead,tb){
       shareCell(rec)+
       hCell(hf)+hCell(hr)+
       `<td class="num dir">${fmtMs(worstJit(hf,hr))}</td>`+reordCell(maxReord(hf,hr))+
+      ecnCell({ecn_ce_pct:Math.max((hf&&hf.ecn_ce_pct)||0,(hr&&hr.ecn_ce_pct)||0)})+
       `<td>${statusCell(s)}</td>`;
     wireRow(tr,rec,g.key);
     tb.appendChild(tr);
@@ -1159,6 +1193,7 @@ function renderDirected(base,H,thead,tb){
     '<th class="num dir">rtt ms</th><th class="num">loss%</th><th class="num">jitter</th>'+
     '<th class="num dir" title="one-way delay: outbound (pinned path) / inbound (return)">1-way ob/ib</th>'+
     '<th class="num">reord</th>'+
+    '<th class="num" title="forward-path ECN CE-mark rate (real; needs an ECN qdisc on the switches)">ecn</th>'+
     '<th class="num">age</th><th>status</th></tr>';
   const rows=[...base].sort((x,y)=>
     natCmp(x.src,y.src)||natCmp(x.dst,y.dst)||x.plane-y.plane||natCmp(x.path_id,y.path_id));
@@ -1176,7 +1211,7 @@ function renderDirected(base,H,thead,tb){
       `<td class="num">${fmtPct(h&&h.loss_pct)}</td>`+
       `<td class="num">${fmtMs(h&&h.jitter)}</td>`+
       `<td class="num dir">${fmtMs(h&&h.ob_avg)}/${fmtMs(h&&h.ib_avg)}</td>`+
-      reordCell(h&&h.reorder)+
+      reordCell(h&&h.reorder)+ecnCell(h)+
       `<td class="num">${(h&&h.age_s!=null)?h.age_s+'s':'<span class=miss>·</span>'}</td>`+
       `<td>${statusCell(s)}</td>`;
     wireRow(tr,rec,rec.src+'>'+rec.dst+'|'+rec.path_id);
@@ -1279,7 +1314,9 @@ async function pollMesh(){
 // that spine (health-driven weigher weights). Width-only, so it coexists with the
 // hover/click hot/dim highlight colouring.
 function applyTrafficHeat(){
-  if(!EDGES||!MESH||!MESH.paths) return;
+  if(!EDGES) return;
+  const on=(document.getElementById('heatToggle')||{}).checked;
+  if(!on||!MESH||!MESH.paths){ EDGES.forEach(e=>e.el.style.strokeWidth=''); return; }
   const spineNodes=new Set(Object.entries((DATA&&DATA.nodes)||{}).filter(([k,n])=>n.role==='spine').map(([k])=>k));
   const agg={};   // spine -> [weights]
   MESH.paths.forEach(p=>{ if(p.spine&&p.weight!=null){ (agg[p.spine]=agg[p.spine]||[]).push(p.weight); } });
@@ -1291,6 +1328,7 @@ function applyTrafficHeat(){
   });
 }
 document.getElementById('symToggle').addEventListener('change',rebuildPaths);
+document.getElementById('heatToggle').addEventListener('change',applyTrafficHeat);
 
 // ---------- helpers ----------
 function el(tag,attrs,text){

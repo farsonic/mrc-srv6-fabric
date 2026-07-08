@@ -40,8 +40,21 @@ already received (out-of-order arrival — a first-class MRC path signal).
 import argparse, json, socket, struct, sys, time
 
 REQ  = struct.Struct("!Id")      # seq, t1
-REP  = struct.Struct("!Iddd")    # seq, t1, t2, t3
+REP  = struct.Struct("!Iddd")    # seq, t1, t2, t3           (legacy 28B)
+REP2 = struct.Struct("!IdddB")   # + echoed forward-path ECN codepoint (29B)
 PORT = 20001
+ECT0 = 0x02                      # ECN-Capable Transport(0): switches may mark CE (0b11)
+
+def _recv_tclass(ancdata):
+    """Pull the received IPv6 traffic class from recvmsg ancillary data (needs
+    IPV6_RECVTCLASS). Returns the 8-bit TCLASS, or 0 if unavailable."""
+    for lvl, typ, cd in ancdata:
+        if lvl == socket.IPPROTO_IPV6 and typ == getattr(socket, "IPV6_TCLASS", -1) and cd:
+            try:
+                return int.from_bytes(cd[:4], sys.byteorder) & 0xff
+            except Exception:
+                return cd[0] & 0xff
+    return 0
 
 def _now():
     return time.monotonic()
@@ -62,10 +75,18 @@ def responder(bind, port):
     s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((bind, port))
+    # ask the kernel to hand us each packet's IPv6 traffic class, so we can read
+    # the ECN bits a congested switch marked on the FORWARD path and echo them.
+    try:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_RECVTCLASS, 1)
+    except (OSError, AttributeError):
+        pass
     sys.stderr.write(f"[mrc-twamp] responder on [{bind}]:{port}\n"); sys.stderr.flush()
     while True:
+        ecn = 0
         try:
-            data, addr = s.recvfrom(2048)
+            data, ancdata, _flags, addr = s.recvmsg(2048, socket.CMSG_SPACE(16))
+            ecn = _recv_tclass(ancdata) & 0x03
         except OSError:
             continue
         t2 = _now()
@@ -74,7 +95,7 @@ def responder(bind, port):
         seq, t1 = REQ.unpack(data[:REQ.size])
         t3 = _now()
         try:
-            s.sendto(REP.pack(seq, t1, t2, t3), addr)
+            s.sendto(REP2.pack(seq, t1, t2, t3, ecn), addr)   # echo forward-path ECN
         except OSError:
             pass
 
@@ -82,7 +103,7 @@ def probe(target, count, interval_ms, timeout, mark):
     host, port = parse_target(target)
     fail = lambda err: print(json.dumps(
         {"ok": False, "err": err, "tx": count, "rx": 0, "loss_pct": 100.0,
-         "reorder": 0, "reorder_pct": 0.0,
+         "reorder": 0, "reorder_pct": 0.0, "ecn_ce_pct": 0.0,
          "rtt_min": None, "rtt_avg": None, "rtt_max": None, "rtt_mdev": None,
          "ob_avg": None, "ib_avg": None}))
     try:
@@ -90,6 +111,12 @@ def probe(target, count, interval_ms, timeout, mark):
     except OSError as e:
         return fail(f"resolve {host}: {e}")
     s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    # mark our packets ECN-Capable so a congested switch (with an ECN qdisc) sets
+    # CE on the forward path; the reflector echoes what it saw.
+    try:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, ECT0)
+    except (OSError, AttributeError):
+        pass
     if mark:
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(mark))
@@ -114,6 +141,7 @@ def probe(target, count, interval_ms, timeout, mark):
     deadline = _now() + timeout
     seen = set(); rtts = []; obs = []; ibs = []
     max_seq = -1; reorder = 0        # out-of-order arrivals (a first-class MRC signal)
+    ce = 0                            # forward-path packets a switch CE-marked (ECN)
     s.settimeout(0.2)
     while len(seen) < count and _now() < deadline:
         try:
@@ -125,12 +153,17 @@ def probe(target, count, interval_ms, timeout, mark):
         except OSError:
             break
         t4 = _now()
-        if len(data) < REP.size:
+        if len(data) >= REP2.size:        # new reflector: carries the echoed ECN
+            seq, t1, t2, t3, fwd_ecn = REP2.unpack(data[:REP2.size])
+        elif len(data) >= REP.size:       # legacy reflector: no ECN echo
+            seq, t1, t2, t3 = REP.unpack(data[:REP.size]); fwd_ecn = 0
+        else:
             continue
-        seq, t1, t2, t3 = REP.unpack(data[:REP.size])
         if seq in seen:
             continue
         seen.add(seq)
+        if (fwd_ecn & 0x03) == 0x03:       # CE
+            ce += 1
         if seq < max_seq:            # arrived after a higher seq already did
             reorder += 1
         else:
@@ -144,7 +177,8 @@ def probe(target, count, interval_ms, timeout, mark):
     out = {"ok": rx > 0, "tx": count, "rx": rx,
            "loss_pct": round(100.0 * (count - rx) / count, 1) if count else 100.0,
            "reorder": reorder,
-           "reorder_pct": round(100.0 * reorder / rx, 1) if rx else 0.0}
+           "reorder_pct": round(100.0 * reorder / rx, 1) if rx else 0.0,
+           "ecn_ce_pct": round(100.0 * ce / rx, 1) if rx else 0.0}
     if rtts:
         avg = sum(rtts) / len(rtts)
         out.update(rtt_min=round(min(rtts), 3), rtt_avg=round(avg, 3),
