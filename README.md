@@ -194,6 +194,22 @@ minute or two to fill.
 
 ---
 
+## Guided demo
+
+Once the lab is up (with `-e do_gui=true -e gui_console=true`), [`demo.sh`](demo.sh)
+walks the whole system end-to-end — SRv6 source routing, per-path health, real
+netem impairment + adaptive spray, fault localization, drain, collectives, and
+scale planning — running real actions and telling you what to watch in the GUI:
+
+```bash
+open http://<host>:8080/gui/topology.html   # keep it visible
+./demo.sh                                    # Enter to advance each step
+AUTO=1 ./demo.sh                             # unattended (sleeps instead of prompts)
+```
+
+Nothing in it is simulated — every impairment is real `netem`, every metric a real
+probe measurement. It resets the fabric clean at the end.
+
 ## Use the fabric
 
 Node names follow `clab-srv6lab-<node>` (e.g. `clab-srv6lab-gpu1`,
